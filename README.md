@@ -164,6 +164,19 @@ For dataset export, tokenizer export, and docs-cache rebuild instructions, see [
 
 Evaluation will be in the RunPod environment with all packages installed. `requirements.txt` is provided as a reference if you want to self-setup.
 
+### Reproducible UV setup
+
+To match the same torch build we used for Blackwell-capable Linux runs, run:
+
+```bash
+rm -rf .venv
+uv venv .venv
+source .venv/bin/activate
+uv sync --no-install-project --locked
+```
+
+If you need a non-default torch wheel source, this repo pins `torch==2.11.0` to the PyTorch CUDA 12.8 index in `pyproject.toml`. The torch pin is Linux-only (`sys_platform == 'linux'`) so macOS users can still use the MLX path without blocking this setup.
+
 ## FAQ
 
 **What exactly counts toward the 16MB artifact size?**
