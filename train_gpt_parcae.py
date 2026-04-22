@@ -95,6 +95,7 @@ class Hyperparameters:
     lockstep_k = bool(int(os.environ.get("LOCKSTEP_K", "0")))
     monitoring = bool(int(os.environ.get("MONITORING", "1")))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "0")))
+    compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
     emb_scale = float(os.environ.get("EMB_SCALE", "1.0"))
@@ -1429,7 +1430,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.compile_muon_backend:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
