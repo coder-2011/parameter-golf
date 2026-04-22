@@ -1,0 +1,20 @@
+[project]
+name = "parameter-golf"
+version = "0.1.0"
+description = "Parameter-golf challenge training stack"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "torch",
+  "huggingface-hub",
+  "typing-extensions==4.15.0",
+  "datasets",
+  "sentencepiece",
+]
+
+[project.optional-dependencies]
+record = ["tqdm", "kernels"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
