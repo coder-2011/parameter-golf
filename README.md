@@ -156,6 +156,16 @@ VOCAB_SIZE=1024 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
+If you want a local SentencePiece 1892 setup, first build a matched tokenizer + shard export from the published docs cache:
+
+```bash
+python3 data/download_hf_docs_and_tokenize.py \
+  --output-root ./data_sp1892 \
+  --tokenizer-config ./data/tokenizer_specs.json
+```
+
+That export writes a `manifest.json` plus both `sp1024` and `sp1892` artifacts.
+
 For the local Parcae smoke/minimal run we used on this machine, use:
 
 ```bash
@@ -169,6 +179,18 @@ torchrun --standalone --nproc_per_node=1 train_gpt_parcae.py
 ```
 
 `COMPILE_MUON_BACKEND=1` keeps the compiled Muon backend enabled for this run.
+
+For the same local Parcae run shape on `sp1892`, use the matched export:
+
+```bash
+RUN_ID=parcae_minimal_sp1892 \
+DATA_PATH=./data_sp1892/datasets/fineweb10B_sp1892/ \
+TOKENIZER_PATH=./data_sp1892/tokenizers/fineweb_1892_bpe.model \
+VOCAB_SIZE=1892 \
+MAX_WALLCLOCK_SECONDS=300 \
+COMPILE_MUON_BACKEND=1 \
+torchrun --standalone --nproc_per_node=1 train_gpt_parcae.py
+```
 
 By default, `train_gpt.py` keeps its ~10 minute wallclock cap. If you want a longer run, override it explicitly, for example `MAX_WALLCLOCK_SECONDS=0`.
 

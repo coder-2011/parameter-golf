@@ -50,6 +50,13 @@ python3 data/download_hf_docs_and_tokenize.py \
   --tokenizer-config ./data/tokenizer_specs.json
 ```
 
+The checked-in tokenizer config now includes both `sp1024` and `sp1892`, so the command above will export:
+
+- `tokenizers/fineweb_1024_bpe.model`
+- `tokenizers/fineweb_1892_bpe.model`
+- `datasets/fineweb10B_sp1024/`
+- `datasets/fineweb10B_sp1892/`
+
 The sidecar `docs_selected.source_manifest.json` includes `docs_sha256`, so users can verify they are rebuilding from the exact same document list and order as the baseline export.
 
 ## Useful Knobs
