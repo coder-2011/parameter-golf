@@ -70,6 +70,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Parcae-style recurrent architecture.
@@ -685,7 +686,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, condense_ra
 
 def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
     with torch.autocast(device_type='cuda', enabled=False):
-        qk_r2 = torch.cat([q, k], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()
+        rope_dims = freqs_cis.size(-2) * 2
+        q_rope, q_pass = q[..., :rope_dims], q[..., rope_dims:]
+        k_rope, k_pass = k[..., :rope_dims], k[..., rope_dims:]
+        qk_r2 = torch.cat([q_rope, k_rope], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()
         rotated_qk_r2 = torch.stack(
             [
                 qk_r2[..., 0] * freqs_cis[..., 0] - qk_r2[..., 1] * freqs_cis[..., 1],
@@ -693,7 +697,8 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tu
             ],
             dim=-1,
         ).flatten(3)
-        return torch.split(rotated_qk_r2.type_as(q), q.shape[2], dim=2)
+        q_rot, k_rot = torch.split(rotated_qk_r2.type_as(q), q.shape[2], dim=2)
+        return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
 def has_ve(layer_idx: int, n_layer: int) -> bool:
@@ -952,6 +957,16 @@ class GPT(nn.Module):
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
+        outer_head_dim = self.outer_dim // h.num_heads
+        recurrent_head_dim = self.recurrent_dim // self.recurrent_num_heads
+        self.outer_rope_dims = h.rope_dims or outer_head_dim
+        self.recurrent_rope_dims = h.rope_dims or recurrent_head_dim
+        for name, rope_dim, head_dim in (
+            ("ROPE_DIMS", self.outer_rope_dims, outer_head_dim),
+            ("ROPE_DIMS", self.recurrent_rope_dims, recurrent_head_dim),
+        ):
+            if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2 != 0:
+                raise ValueError(f"{name} must be a positive even value <= head_dim; got {rope_dim} for head_dim={head_dim}")
 
         self.tok_emb = nn.Embedding(h.vocab_size, self.outer_dim)
         self.prelude = nn.ModuleList(
@@ -1034,12 +1049,12 @@ class GPT(nn.Module):
 
         self.register_buffer(
             'outer_freqs_cis',
-            precompute_freqs_cis(self.outer_dim // h.num_heads, self.block_size, h.rope_base),
+            precompute_freqs_cis(self.outer_rope_dims, self.block_size, h.rope_base),
             persistent=False,
         )
         self.register_buffer(
             'recurrent_freqs_cis',
-            precompute_freqs_cis(self.recurrent_dim // self.recurrent_num_heads, self.block_size, h.rope_base),
+            precompute_freqs_cis(self.recurrent_rope_dims, self.block_size, h.rope_base),
             persistent=False,
         )
         self._init_weights()
