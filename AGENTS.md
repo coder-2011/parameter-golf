@@ -5,6 +5,15 @@ Naman owns this repository.
 ## Project Objective
 `parameter-golf` is a constrained language-model challenge repo: train language models under fixed artifact and wall-clock constraints, with fixed tokenization/evaluation requirements, and optimize for validation bits-per-byte.
 
+## Codebase Criticality and Review Standard
+This is a high-criticality research codebase. Keep changes minimal, clean, explicit, and easy to review. Prefer the smallest correct implementation over extra abstraction.
+
+When adding functionality, think first and search the codebase carefully before deciding. Plan the change, check nearby patterns, and only then edit code. Writing code is the main job here, but it should be done deliberately, not reflexively.
+
+After making a code change, go back and revise it. Cut down unnecessary code, helpers, and branches right away. Prefer removing complexity immediately instead of leaving cleanup for later.
+
+Use existing challenge records and lean training repositories as reference points for optimization patterns when helpful, but do not copy complexity that the current script or experiment does not need.
+
 ## Global Safety Rules
 - Default safety: do not run `browser-use -b real --profile ...` against local Chrome profiles.
 - Local Chrome automation is allowed only when the user explicitly requests local profile usage in that same turn.
@@ -35,6 +44,8 @@ Naman owns this repository.
   - `uv sync --no-install-project`
 - Do not rely on `requirements.txt` as the root source of truth.
 - Keep imports and package usage aligned with `pyproject.toml` and `uv.lock` so everything is installable with `UV sync`.
+- Avoid manual `venv` or `pip` workflows in normal use. This repo is set up around `uv venv`, `uv sync`, `uv lock`, and `uv run`/venv execution.
+- Before adding a dependency, verify it is necessary, maintained, compatible with the pinned CUDA/PyTorch stack, and worth the artifact/environment complexity.
 
 ## Reasoning and Explanations
 - Prioritize clarity and truthfulness.
@@ -57,6 +68,9 @@ Naman owns this repository.
 - `uv sync --no-install-project` to install dependencies.
 - GPU training commands remain as in the scripts and challenge entrypoints.
 - Avoid destructive dependency file churn unless requested.
+- Use `python -m py_compile <script>.py` for fast syntax checks on edited training scripts.
+- Use focused smoke runs for training changes before longer GPU runs.
+- Use tiny synthetic inputs for shape, optimizer, serialization, and checkpoint tests when full training is unnecessary.
 
 ## Coding Style and Conventions
 - Python-first workspace.
@@ -64,11 +78,18 @@ Naman owns this repository.
 - `snake_case` for functions/variables/modules; `PascalCase` for classes.
 - Keep edits surgical and high-signal.
 - Keep comments focused on intent and contracts, not obvious behavior.
+- Keep tensor shapes explicit in names or comments when they are non-obvious.
+- Prefer short, direct helpers over abstraction-heavy wrappers.
+- Keep new code close to the subsystem it belongs to; avoid introducing broad framework layers.
 
 ## Coding Workflow / Quality Bar
 - Keep changes scoped and intentional.
 - Minimize framework churn unless directly relevant to the task.
 - Validate before PR and keep checks green before merge.
+- Add focused smoke coverage for model or trainer changes, especially when touching tensor shapes, EMA/SWA updates, optimizer behavior, quantization, checkpointing, tokenizer handling, or evaluation metrics.
+- Preserve fixed challenge contracts unless explicitly changing them: tokenizer/evaluation semantics, artifact accounting, wall-clock accounting, and train/validation split handling.
+- For optimization work, compare against a concrete baseline with matching seed, data, model size, runtime budget, and evaluation method whenever possible.
+- If a run is not comparable because a hyperparameter, dataset, artifact path, dependency, or hardware setting changed, say so explicitly.
 
 ## Git Safety
 - Safe defaults: `git status`, `git diff`, `git log`.
