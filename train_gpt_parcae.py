@@ -55,7 +55,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 500))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -114,16 +114,14 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
-    muon_wd = float(os.environ.get("MUON_WD", 0.095))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    """Newton-Schulz orthogonalization for 2D matrices."""
+    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
+    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -138,33 +136,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    """Muon optimizer with optional row normalization (MuonEq-R).
-
-    Distributes parameter updates across ranks: each rank handles its share of
-    parameters (i % world_size == rank), runs NS5, then all-reduces the flat
-    update buffer so all ranks get the full update.
-    """
-
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        nesterov: bool = True,
-        weight_decay: float = 0.0,
-        row_normalize: bool = False,
-    ):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                nesterov=nesterov,
-                weight_decay=weight_decay,
-                row_normalize=row_normalize,
-            ),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -189,8 +164,8 @@ class Muon(torch.optim.Optimizer):
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-            curr = 0
 
+            curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
@@ -201,25 +176,18 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-
-                    if group.get("row_normalize", False):
-                        row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
-                        g = g / row_norms.to(g.dtype)
-
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr:curr + p.numel()] = g.reshape(-1)
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            wd = group.get("weight_decay", 0.0)
             curr = 0
             for p in params:
-                if wd > 0.0:
-                    p.data.mul_(1.0 - lr * wd)
-                g = updates_flat[curr:curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -1468,8 +1436,12 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
+    global zeropower_via_newtonschulz5
+
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.compile_muon_backend:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1608,8 +1580,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_wd,
-        row_normalize=args.muon_row_normalize,
     )
     for group in optimizer_muon.param_groups:
         group['base_lr'] = args.matrix_lr
@@ -1748,6 +1718,7 @@ def main() -> None:
                 )
             break
 
+        torch.cuda.synchronize()
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         base_model.step = step
@@ -1778,6 +1749,7 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        torch.cuda.synchronize()
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
