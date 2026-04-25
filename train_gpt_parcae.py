@@ -1286,6 +1286,77 @@ class GatedMLP(nn.Module):
         return self.proj(self.nonlin(gate) * value)
 
 
+class TopKMoE(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int, top_k: int):
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if top_k <= 0 or top_k > num_experts:
+            raise ValueError(
+                f"top_k must be in [1, num_experts], got top_k={top_k} num_experts={num_experts}"
+            )
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList(BaseMLP(dim, hidden_dim) for _ in range(num_experts))
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])
+        route_logits = self.router(x_flat).float()
+        route_probs = F.softmax(route_logits, dim=-1)
+        _, route_indices = route_logits.topk(self.top_k, dim=-1)
+        route_weights = route_probs.gather(1, route_indices) * (self.num_experts / self.top_k)
+        route_weights = route_weights.to(dtype=x.dtype)
+        out_flat = torch.zeros_like(x_flat)
+        for slot in range(self.top_k):
+            slot_indices = route_indices[:, slot]
+            slot_weights = route_weights[:, slot]
+            for expert_idx, expert in enumerate(self.experts):
+                token_mask = slot_indices == expert_idx
+                if not bool(token_mask.any()):
+                    continue
+                expert_out = expert(x_flat[token_mask])
+                out_flat[token_mask] += expert_out * slot_weights[token_mask, None]
+        return out_flat.reshape(orig_shape)
+
+
+<<<<<<< HEAD
+=======
+class TopKMoE(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int, top_k: int):
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if top_k <= 0 or top_k > num_experts:
+            raise ValueError(f"top_k must be in [1, num_experts], got top_k={top_k} num_experts={num_experts}")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList(BaseMLP(dim, hidden_dim) for _ in range(num_experts))
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])
+        route_logits = self.router(x_flat).float()
+        route_probs = F.softmax(route_logits, dim=-1)
+        _, route_indices = route_logits.topk(self.top_k, dim=-1)
+        route_weights = route_probs.gather(1, route_indices) * (self.num_experts / self.top_k)
+        route_weights = route_weights.to(dtype=x.dtype)
+        out_flat = torch.zeros_like(x_flat)
+        for slot in range(self.top_k):
+            slot_indices = route_indices[:, slot]
+            slot_weights = route_weights[:, slot]
+            for expert_idx, expert in enumerate(self.experts):
+                token_mask = slot_indices == expert_idx
+                if not bool(token_mask.any()):
+                    continue
+                expert_out = expert(x_flat[token_mask])
+                out_flat[token_mask] += expert_out * slot_weights[token_mask, None]
+        return out_flat.reshape(orig_shape)
+
+
+>>>>>>> 2ce5e3f (fix(train): adjust top-k MOE routing weights with softmax normalization)
 class ParcaeCausalSelfAttention(nn.Module):
     def __init__(
         self,
