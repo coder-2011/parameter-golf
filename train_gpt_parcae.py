@@ -71,6 +71,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
+    outer_rope_dims = int(os.environ.get("OUTER_ROPE_DIMS", rope_dims))
+    recurrent_rope_dims = int(os.environ.get("RECURRENT_ROPE_DIMS", rope_dims))
+    recurrent_layer_rope_dims = os.environ.get("RECURRENT_LAYER_ROPE_DIMS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Parcae-style recurrent architecture.
@@ -684,9 +687,9 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, condense_ra
         return torch.stack([torch.cos(freqs)[None, :, None, :], torch.sin(freqs)[None, :, None, :]], dim=4)
 
 
-def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor, rope_dims: int) -> tuple[Tensor, Tensor]:
     with torch.autocast(device_type='cuda', enabled=False):
-        rope_dims = freqs_cis.size(-2) * 2
+        freqs_cis = freqs_cis[..., : rope_dims // 2, :]
         q_rope, q_pass = q[..., :rope_dims], q[..., rope_dims:]
         k_rope, k_pass = k[..., :rope_dims], k[..., rope_dims:]
         qk_r2 = torch.cat([q_rope, k_rope], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()
@@ -752,6 +755,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         qk_norm: bool,
         qk_bias: bool,
         clip_qkv: float | None,
+        rope_dims: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -764,6 +768,9 @@ class ParcaeCausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError('head_dim must be even for RoPE')
         self.dim = dim
+        if rope_dims <= 0 or rope_dims > self.head_dim or rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims must be a positive even value <= head_dim; got {rope_dims} for head_dim={self.head_dim}")
+        self.rope_dims = rope_dims
         self.qk_norm = qk_norm
         self.clip_qkv = clip_qkv
         self.c_q = CastedLinear(dim, num_heads * self.head_dim, bias=False)
@@ -796,7 +803,7 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = (q + q_bias).to(q.dtype)
             k = (k + k_bias).to(k.dtype)
 
-        q, k = apply_rotary_emb_complex_like(q, k, freqs_cis)
+        q, k = apply_rotary_emb_complex_like(q, k, freqs_cis, self.rope_dims)
         if self.qk_norm:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
@@ -838,6 +845,7 @@ class TransformerPreNormBlock(nn.Module):
         qk_bias: bool,
         clip_qkv: float | None,
         mlp_class_name: str,
+        rope_dims: int,
     ):
         super().__init__()
         self.norm_1 = ParcaeRMSNorm(dim)
@@ -851,6 +859,7 @@ class TransformerPreNormBlock(nn.Module):
             qk_norm=qk_norm,
             qk_bias=qk_bias,
             clip_qkv=clip_qkv,
+            rope_dims=rope_dims,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
@@ -959,11 +968,24 @@ class GPT(nn.Module):
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
         outer_head_dim = self.outer_dim // h.num_heads
         recurrent_head_dim = self.recurrent_dim // self.recurrent_num_heads
-        self.outer_rope_dims = h.rope_dims or outer_head_dim
-        self.recurrent_rope_dims = h.rope_dims or recurrent_head_dim
+        self.outer_rope_dims = h.outer_rope_dims or outer_head_dim
+        self.recurrent_rope_dims = h.recurrent_rope_dims or recurrent_head_dim
+        if h.recurrent_layer_rope_dims:
+            self.recurrent_layer_rope_dims = [int(part) for part in h.recurrent_layer_rope_dims.split(",")]
+            if len(self.recurrent_layer_rope_dims) != self.n_layers_in_recurrent_block:
+                raise ValueError(
+                    "RECURRENT_LAYER_ROPE_DIMS must provide one comma-separated value per recurrent block; "
+                    f"got {len(self.recurrent_layer_rope_dims)} for {self.n_layers_in_recurrent_block} blocks"
+                )
+        else:
+            self.recurrent_layer_rope_dims = [self.recurrent_rope_dims] * self.n_layers_in_recurrent_block
         for name, rope_dim, head_dim in (
-            ("ROPE_DIMS", self.outer_rope_dims, outer_head_dim),
-            ("ROPE_DIMS", self.recurrent_rope_dims, recurrent_head_dim),
+            ("OUTER_ROPE_DIMS", self.outer_rope_dims, outer_head_dim),
+            ("RECURRENT_ROPE_DIMS", self.recurrent_rope_dims, recurrent_head_dim),
+            *(
+                (f"RECURRENT_LAYER_ROPE_DIMS[{i}]", rope_dim, recurrent_head_dim)
+                for i, rope_dim in enumerate(self.recurrent_layer_rope_dims)
+            ),
         ):
             if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2 != 0:
                 raise ValueError(f"{name} must be a positive even value <= head_dim; got {rope_dim} for head_dim={head_dim}")
@@ -982,6 +1004,7 @@ class GPT(nn.Module):
                 qk_bias=h.qk_bias,
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
+                rope_dims=self.outer_rope_dims,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -999,6 +1022,7 @@ class GPT(nn.Module):
                 qk_bias=h.qk_bias,
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.recurrent_mlp_class_name,
+                rope_dims=self.recurrent_layer_rope_dims[i],
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -1016,6 +1040,7 @@ class GPT(nn.Module):
                 qk_bias=h.qk_bias,
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
+                rope_dims=self.outer_rope_dims,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -1054,7 +1079,7 @@ class GPT(nn.Module):
         )
         self.register_buffer(
             'recurrent_freqs_cis',
-            precompute_freqs_cis(self.recurrent_rope_dims, self.block_size, h.rope_base),
+            precompute_freqs_cis(max(self.recurrent_layer_rope_dims), self.block_size, h.rope_base),
             persistent=False,
         )
         self._init_weights()
