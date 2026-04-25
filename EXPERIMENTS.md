@@ -108,7 +108,7 @@ Protocol for these runs:
 
 Best no-loop clean result: direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1`, with exact final `val_bpb=1.74502258`.
 
-Best recurrent clean result and current recurrent working baseline: direct `python train_gpt_parcae.py` with `BIGRAM_HASH_BUCKETS=4096 BIGRAM_HASH_DIM=128 BIGRAM_HASH_HEADS=2 BIGRAM_HASH_GATE=1 USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MLP_MULT=3 TRAIN_SEQ_LEN=512 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2`, with exact final `val_bpb=1.71261107`.
+Best recurrent clean result and current recurrent working baseline: direct `python train_gpt_parcae.py` with `MODEL_DIM=256 RECURRENT_DIM=256 NUM_HEADS=4 RECURRENT_NUM_HEADS=4 N_LAYERS_IN_RECURRENT_BLOCK=2 BIGRAM_HASH_BUCKETS=4096 BIGRAM_HASH_DIM=128 BIGRAM_HASH_HEADS=2 BIGRAM_HASH_GATE=1 USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MLP_MULT=3 TRAIN_SEQ_LEN=512 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2`, with exact final `val_bpb=1.71261107`.
 
 Observed diagnostic pattern:
 
