@@ -1,0 +1,45 @@
+#!/bin/bash
+set -euo pipefail
+
+cd /workspace/parameter-golf
+
+export DATA_PATH=${DATA_PATH:-/workspace/parameter-golf/data_scylla/fineweb_scylla}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.vocab}
+export TOKENIZER_META_PATH=${TOKENIZER_META_PATH:-/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.meta.npz}
+export VOCAB_SIZE=${VOCAB_SIZE:-998}
+
+export MODEL_DIM=${MODEL_DIM:-256}
+export NUM_HEADS=${NUM_HEADS:-4}
+export NUM_KV_HEADS=${NUM_KV_HEADS:-2}
+export MLP_MULT=${MLP_MULT:-3}
+export N_LAYERS_IN_PRELUDE=${N_LAYERS_IN_PRELUDE:-1}
+export N_LAYERS_IN_RECURRENT_BLOCK=${N_LAYERS_IN_RECURRENT_BLOCK:-2}
+export N_LAYERS_IN_CODA=${N_LAYERS_IN_CODA:-1}
+export RECURRENT_DIM=${RECURRENT_DIM:-256}
+export RECURRENT_NUM_HEADS=${RECURRENT_NUM_HEADS:-4}
+export MEAN_RECURRENCE=${MEAN_RECURRENCE:-2}
+export MEAN_BACKPROP_DEPTH=${MEAN_BACKPROP_DEPTH:-1}
+
+export TRAIN_BATCH_TOKENS=${TRAIN_BATCH_TOKENS:-16384}
+export TRAIN_SEQ_LEN=${TRAIN_SEQ_LEN:-512}
+export ITERATIONS=${ITERATIONS:-1000000}
+export MAX_WALLCLOCK_SECONDS=${MAX_WALLCLOCK_SECONDS:-300}
+export WARMUP_STEPS=${WARMUP_STEPS:-500}
+export TRAIN_LOG_EVERY=${TRAIN_LOG_EVERY:-100}
+export VAL_LOSS_EVERY=${VAL_LOSS_EVERY:-0}
+
+export COMPILE_MODEL=${COMPILE_MODEL:-0}
+export COMPILE_MUON_BACKEND=${COMPILE_MUON_BACKEND:-0}
+export ROPE_DIMS=${ROPE_DIMS:-16}
+export QK_NORM=${QK_NORM:-1}
+export USE_VALUE_EMBEDDINGS=${USE_VALUE_EMBEDDINGS:-0}
+export PRELUDE_NORM=${PRELUDE_NORM:-0}
+export GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-0.0}
+
+export BIGRAM_HASH_BUCKETS=${BIGRAM_HASH_BUCKETS:-4096}
+export BIGRAM_HASH_DIM=${BIGRAM_HASH_DIM:-128}
+export BIGRAM_HASH_HEADS=${BIGRAM_HASH_HEADS:-2}
+export BIGRAM_HASH_GATE=${BIGRAM_HASH_GATE:-1}
+
+export RUN_ID=${RUN_ID:-parcae_scylla_current_best}
+exec /workspace/parameter-golf/.venv/bin/python /workspace/parameter-golf/train_gpt_parcae.py
