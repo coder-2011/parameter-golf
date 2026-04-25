@@ -1675,7 +1675,7 @@ def main() -> None:
     for name, p in named_params:
         if not p.requires_grad:
             continue
-        if name == 'tok_emb.weight':
+        if name in {'tok_emb.weight', 'bigram_hash.embed.weight'}:
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
@@ -1685,8 +1685,11 @@ def main() -> None:
             scalar_params.append(p)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    token_param_group = [{'params': [base_model.tok_emb.weight], 'lr': token_lr, 'base_lr': token_lr}]
+    if base_model.bigram_hash is not None:
+        token_param_group.append({'params': [base_model.bigram_hash.embed.weight], 'lr': token_lr, 'base_lr': token_lr})
     optimizer_tok = torch.optim.Adam(
-        [{'params': [base_model.tok_emb.weight], 'lr': token_lr, 'base_lr': token_lr}],
+        token_param_group,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1721,6 +1724,11 @@ def main() -> None:
     log0(f"attention_backend:flash_attn4_wrapper has_flash_attn:{HAS_FLASH_ATTN}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"bigram_hash:buckets:{args.bigram_hash_buckets} dim:{args.bigram_hash_dim} "
+        f"heads:{args.bigram_hash_heads} gate:{args.bigram_hash_gate} "
+        f"scale_init:{args.bigram_hash_scale_init:g}"
+    )
     log0(
         f"parcae:prelude:{args.n_layers_in_prelude} core:{args.n_layers_in_recurrent_block} coda:{args.n_layers_in_coda} "
         f"recurrent_dim:{args.recurrent_dim} recurrence:{args.mean_recurrence}/{args.mean_backprop_depth} "
