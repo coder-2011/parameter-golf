@@ -380,6 +380,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+QUANT_SCALE_EPS = 2.0 ** -24  # Smallest positive fp16 subnormal; scales are stored as fp16.
 
 def signed_quant_max(bits: int) -> int:
     if bits < 2 or bits > 8:
@@ -401,9 +402,9 @@ def fake_quant_weight_ste(weight: Tensor, bits: int) -> Tensor:
     qmax = signed_quant_max(bits)
     w32 = weight.float()
     if w32.ndim == 2:
-        scale = w32.detach().abs().amax(dim=1, keepdim=True).div(qmax).clamp_min(1.0 / qmax)
+        scale = w32.detach().abs().amax(dim=1, keepdim=True).div(qmax).clamp_min(QUANT_SCALE_EPS)
     else:
-        scale = w32.detach().abs().amax().div(qmax).clamp_min(1.0 / qmax)
+        scale = w32.detach().abs().amax().div(qmax).clamp_min(QUANT_SCALE_EPS)
     q = torch.clamp(torch.round(w32 / scale), -qmax, qmax)
     wq = (q * scale).to(dtype=weight.dtype)
     return weight + (wq - weight).detach()
@@ -420,13 +421,13 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+        scale = (clip_abs / qmax).clamp_min(QUANT_SCALE_EPS)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32).clamp_min(1.0 / qmax)
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32).clamp_min(QUANT_SCALE_EPS)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
@@ -442,7 +443,6 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "quant_payload_bytes"),
         0,
@@ -470,8 +470,6 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
 
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t, bits)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -485,23 +483,17 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
         "dtypes": dtypes,
         "passthrough": passthrough,
     }
-    if qmeta:
-        obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    return quantize_state_dict_int(state_dict, bits=8)
-
 def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
-    qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        if s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
@@ -516,9 +508,6 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
-
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
-    return dequantize_state_dict_int(obj)
 
 
 # -----------------------------
