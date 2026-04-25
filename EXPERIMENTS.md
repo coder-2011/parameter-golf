@@ -7,27 +7,28 @@ The no-loop ablation is still the best observed BPB, but it is not the active di
 
 | Field | Value |
 | --- | --- |
-| Exact final BPB | **1.76239973** |
-| Exact final loss | **2.97573812** |
-| Run log | `logs/parcae_min_5min_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.txt` |
-| Retrieval diagnostic | `logs/diag_parcae_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.json` |
+| Exact final BPB | **1.72050566** |
+| Exact final loss | **2.90500173** |
+| Run log | `logs/parcae_min_5min_recur2_seq512_mlp3_no_value_kv2_qknorm_rope16_20260425.txt` |
+| Retrieval diagnostic | not run yet |
 | Exported artifacts | Current `final_model.pt` and `final_model.int8.ptz` |
 | Launch mode | Direct `python train_gpt_parcae.py` with no one-rank DDP wrapper |
-| Key config | `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2` |
-| Steps / measured train time | 1785 steps / 300166 ms |
-| Params | 2,886,592 |
-| Total int8+zlib submission size | 3,328,383 bytes |
+| Key config | `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MLP_MULT=3 TRAIN_SEQ_LEN=512 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2` |
+| Steps / measured train time | 1702 steps / 300063 ms |
+| Params | 3,148,736 |
+| Total int8+zlib submission size | 3,540,682 bytes |
 
 Command shape used for the current best:
 
 ```bash
-RUN_ID=parcae_min_5min_best_no_ddp_no_value_kv2_qknorm_rope16_20260425 \
+RUN_ID=parcae_min_5min_recur2_seq512_mlp3_no_value_kv2_qknorm_rope16_20260425 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
 MODEL_DIM=256 \
 NUM_HEADS=4 \
 NUM_KV_HEADS=2 \
+MLP_MULT=3 \
 N_LAYERS_IN_PRELUDE=1 \
 N_LAYERS_IN_RECURRENT_BLOCK=2 \
 N_LAYERS_IN_CODA=1 \
@@ -36,7 +37,7 @@ RECURRENT_NUM_HEADS=4 \
 MEAN_RECURRENCE=2 \
 MEAN_BACKPROP_DEPTH=2 \
 TRAIN_BATCH_TOKENS=16384 \
-TRAIN_SEQ_LEN=256 \
+TRAIN_SEQ_LEN=512 \
 ITERATIONS=1000000 \
 MAX_WALLCLOCK_SECONDS=300 \
 WARMUP_STEPS=500 \
@@ -94,13 +95,14 @@ Protocol for these runs:
 | Same architecture, no recurrent loop | `logs/parcae_min_5min_no_loop_same_arch_no_value_kv2_qknorm_rope16_20260425_full.txt` | 1.74502258 | 2487 | 2,886,592 | 3,383,037 bytes | not run |
 | Recurrence 3, backprop depth 1 | `logs/parcae_min_5min_recur3_bptt1_no_value_kv2_qknorm_rope16_20260425.txt` | 1.77740456 | 1922 | 2,886,592 | 3,347,343 bytes | not run |
 | One-layer recurrent core, recurrence 4, backprop depth 2 | `logs/parcae_min_5min_core1_recur4_bptt2_no_value_kv2_qknorm_rope16_20260425_rerun.txt` | 1.78728707 | 2158 | 2,099,520 | 2,487,224 bytes | not run |
+| Recurrent 2/2 + seq512 + MLP3 | `logs/parcae_min_5min_recur2_seq512_mlp3_no_value_kv2_qknorm_rope16_20260425.txt` | 1.72050566 | 1702 | 3,148,736 | 3,540,682 bytes | not run |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 8 | `logs/parcae_min_5min_no_value_embeds_kvheads2_qknorm_rope8_20260425.txt` | 1.79321577 | 1697 | 2,886,592 | 3,314,402 bytes | `logs/diag_parcae_no_value_embeds_kvheads2_qknorm_rope8_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 32 | `logs/parcae_min_5min_no_value_embeds_kvheads2_qknorm_rope32_20260425.txt` | 1.76441375 | 1714 | 2,886,592 | 3,322,038 bytes | `logs/diag_parcae_no_value_embeds_kvheads2_qknorm_rope32_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 32, direct Python | `logs/parcae_min_5min_no_ddp_no_value_kv2_qknorm_rope32_20260425.txt` | 1.76400278 | 1723 | 2,886,592 | 3,324,306 bytes | `logs/diag_parcae_no_ddp_no_value_kv2_qknorm_rope32_20260425.json` |
 
 Best observed clean result: no-loop direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1`, with exact final `val_bpb=1.74502258`.
 
-Best recurrent clean result and current recurrent working baseline: direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2`, with exact final `val_bpb=1.76239973`.
+Best recurrent clean result and current recurrent working baseline: direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MLP_MULT=3 TRAIN_SEQ_LEN=512 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=2`, with exact final `val_bpb=1.72050566`.
 
 Observed diagnostic pattern:
 
@@ -112,4 +114,5 @@ Observed diagnostic pattern:
 - Turning off the recurrent loop while keeping the same module shape and parameter count was the biggest single gain so far: `MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1` improved exact final BPB from 1.76239973 to 1.74502258 and increased measured steps from 1785 to 2487 in the same 300-second training budget. This suggests the looped core was not paying for its extra compute at this scale; fewer effective passes trained more examples and won decisively.
 - `MEAN_RECURRENCE=3 MEAN_BACKPROP_DEPTH=1` did not recover the recurrent advantage. It improved early quality per step relative to no-loop at step 1000, but finished worse than both the recurrent `2/2` baseline and no-loop because it was still slow at 156.11 ms/step and reached only 1922 measured steps.
 - A one-layer recurrent core with `MEAN_RECURRENCE=4 MEAN_BACKPROP_DEPTH=2` was smaller and faster than the 2-layer recurrent baseline, but quality fell to 1.78728707 BPB. The smaller core reached 2158 steps at 139.02 ms/step, so the failure was not only speed; one recurrent block layer removed too much capacity.
+- Increasing context to `TRAIN_SEQ_LEN=512` and outer/coda MLP expansion to `MLP_MULT=3` was the strongest recurrent improvement so far. It raised params from 2.89M to 3.15M and slowed steps from 168.16 ms to 176.30 ms, but exact roundtrip BPB improved from 1.76239973 to 1.72050566. The model used more capacity and longer context effectively despite fewer steps.
 Attempted `NUM_KV_HEADS=4` direct Python (`logs/parcae_min_5min_no_ddp_no_value_kv4_qknorm_rope16_20260425.txt`), but the process exited before final validation after step 500. Early train loss and step time were worse than KV2, so this did not look promising enough to rerun immediately.
