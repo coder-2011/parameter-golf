@@ -6,21 +6,21 @@ This is our best Parcae model so far.
 
 | Field | Value |
 | --- | --- |
-| Exact final BPB | **1.76239973** |
-| Exact final loss | **2.97573812** |
-| Run log | `logs/parcae_min_5min_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.txt` |
-| Retrieval diagnostic | `logs/diag_parcae_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.json` |
+| Exact final BPB | **1.74502258** |
+| Exact final loss | **2.94639753** |
+| Run log | `logs/parcae_min_5min_no_loop_same_arch_no_value_kv2_qknorm_rope16_20260425_full.txt` |
+| Retrieval diagnostic | not run yet |
 | Exported artifacts | Current `final_model.pt` and `final_model.int8.ptz` |
 | Launch mode | Direct `python train_gpt_parcae.py` with no one-rank DDP wrapper |
-| Key config | `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1` |
-| Steps / measured train time | 1785 steps / 300166 ms |
+| Key config | `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1` |
+| Steps / measured train time | 2487 steps / 300055 ms |
 | Params | 2,886,592 |
-| Total int8+zlib submission size | 3,328,383 bytes |
+| Total int8+zlib submission size | 3,383,037 bytes |
 
 Command shape used for the current best:
 
 ```bash
-RUN_ID=parcae_min_5min_best_no_ddp_no_value_kv2_qknorm_rope16_20260425 \
+RUN_ID=parcae_min_5min_no_loop_same_arch_no_value_kv2_qknorm_rope16_20260425 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 VOCAB_SIZE=1024 \
@@ -32,8 +32,8 @@ N_LAYERS_IN_RECURRENT_BLOCK=2 \
 N_LAYERS_IN_CODA=1 \
 RECURRENT_DIM=256 \
 RECURRENT_NUM_HEADS=4 \
-MEAN_RECURRENCE=2 \
-MEAN_BACKPROP_DEPTH=2 \
+MEAN_RECURRENCE=1 \
+MEAN_BACKPROP_DEPTH=1 \
 TRAIN_BATCH_TOKENS=16384 \
 TRAIN_SEQ_LEN=256 \
 ITERATIONS=1000000 \
@@ -90,11 +90,12 @@ Protocol for these runs:
 | No value embeddings + outer KV heads 2 + QK norm | `logs/parcae_min_5min_no_value_embeds_kvheads2_qknorm_20260425.txt` | 1.76437800 | 1748 | 2,886,592 | 3,320,308 bytes | `logs/diag_parcae_no_value_embeds_kvheads2_qknorm_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm, direct Python | `logs/parcae_min_5min_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.txt` | 1.76239973 | 1785 | 2,886,592 | 3,328,383 bytes | `logs/diag_parcae_best_no_ddp_no_value_kv2_qknorm_rope16_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm, direct Python restore | `logs/parcae_min_5min_best_restore2_no_ddp_no_value_kv2_qknorm_rope16_20260425.txt` | 1.76515237 | 1737 | 2,886,592 | 3,322,637 bytes | not run |
+| Same architecture, no recurrent loop | `logs/parcae_min_5min_no_loop_same_arch_no_value_kv2_qknorm_rope16_20260425_full.txt` | 1.74502258 | 2487 | 2,886,592 | 3,383,037 bytes | not run |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 8 | `logs/parcae_min_5min_no_value_embeds_kvheads2_qknorm_rope8_20260425.txt` | 1.79321577 | 1697 | 2,886,592 | 3,314,402 bytes | `logs/diag_parcae_no_value_embeds_kvheads2_qknorm_rope8_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 32 | `logs/parcae_min_5min_no_value_embeds_kvheads2_qknorm_rope32_20260425.txt` | 1.76441375 | 1714 | 2,886,592 | 3,322,038 bytes | `logs/diag_parcae_no_value_embeds_kvheads2_qknorm_rope32_20260425.json` |
 | No value embeddings + outer KV heads 2 + QK norm + RoPE 32, direct Python | `logs/parcae_min_5min_no_ddp_no_value_kv2_qknorm_rope32_20260425.txt` | 1.76400278 | 1723 | 2,886,592 | 3,324,306 bytes | `logs/diag_parcae_no_ddp_no_value_kv2_qknorm_rope32_20260425.json` |
 
-Best current clean result: direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1`, with exact final `val_bpb=1.76239973`.
+Best current clean result: direct `python train_gpt_parcae.py` with `USE_VALUE_EMBEDDINGS=0 NUM_KV_HEADS=2 ROPE_DIMS=16 QK_NORM=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1`, with exact final `val_bpb=1.74502258`.
 
 Observed diagnostic pattern:
 
@@ -103,5 +104,5 @@ Observed diagnostic pattern:
 - QK norm helped with value embeddings on, hurt for no-value/KV1, but helped again for no-value/KV2.
 - Larger recurrent RoPE did not help. `RECURRENT_ROPE_DIMS=32` was the worst run, and making only `core_block.1` full-RoPE with QK norm also lost to QK norm alone. In the best no-value/KV2/QK-norm setup, `ROPE_DIMS=8` was much worse and `ROPE_DIMS=32` was close but still worse than `ROPE_DIMS=16`, including under direct Python.
 - The best run still mostly improves local/recent-context behavior rather than becoming an obvious exact-copy retrieval model. On the 64-sequence diagnostic slice, seen-last-32 loss improved from 2.4584 in the baseline to 2.3411 in the best direct-Python run, while leading-space loss improved from 4.3271 to 4.2782.
+- Turning off the recurrent loop while keeping the same module shape and parameter count was the biggest single gain so far: `MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1` improved exact final BPB from 1.76239973 to 1.74502258 and increased measured steps from 1785 to 2487 in the same 300-second training budget. This suggests the looped core was not paying for its extra compute at this scale; fewer effective passes trained more examples and won decisively.
 Attempted `NUM_KV_HEADS=4` direct Python (`logs/parcae_min_5min_no_ddp_no_value_kv4_qknorm_rope16_20260425.txt`), but the process exited before final validation after step 500. Early train loss and step time were worse than KV2, so this did not look promising enough to rerun immediately.
-
