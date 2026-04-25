@@ -44,6 +44,8 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_meta_path = os.environ.get("TOKENIZER_META_PATH", "")
+    tokenizer_meta_validate = bool(int(os.environ.get("TOKENIZER_META_VALIDATE", "0")))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -65,6 +67,16 @@ class Hyperparameters:
     qat_linear = bool(int(os.environ.get("QAT_LINEAR", "1")))
     qat_tied_output = bool(int(os.environ.get("QAT_TIED_OUTPUT", "1")))
     quant_bits = int(os.environ.get("QUANT_BITS", qat_bits if qat_bits > 0 else 8))
+    gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
+    gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 32))
+    gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
+    gptq_blocksize = int(os.environ.get("GPTQ_BLOCKSIZE", 128))
+    gptq_dampening = float(os.environ.get("GPTQ_DAMPENING", 0.01))
+    gptq_min_numel = int(os.environ.get("GPTQ_MIN_NUMEL", 65_536))
+    gptq_act_order = bool(int(os.environ.get("GPTQ_ACT_ORDER", "1")))
+    gptq_quantize_embeddings = bool(int(os.environ.get("GPTQ_QUANTIZE_EMBEDDINGS", "1")))
+    gptq_matrix_clip_sigmas = float(os.environ.get("GPTQ_MATRIX_CLIP_SIGMAS", 12.85))
+    gptq_embed_clip_sigmas = float(os.environ.get("GPTQ_EMBED_CLIP_SIGMAS", 20.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -276,6 +288,126 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+TOKENIZER_META_FORMAT_VERSION = 1
+TOKENIZER_META_SUFFIX = ".meta.npz"
+
+
+def _derive_tokenizer_meta_path(tokenizer_path: str) -> Path:
+    tokenizer = Path(tokenizer_path)
+    if tokenizer.suffix:
+        return tokenizer.with_suffix(TOKENIZER_META_SUFFIX)
+    return tokenizer.with_name(tokenizer.name + TOKENIZER_META_SUFFIX)
+
+
+def build_sentencepiece_luts_np(
+    sp: spm.SentencePieceProcessor, vocab_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        is_boundary_token_np[token_id] = False
+        if sp.is_byte(token_id):
+            base_bytes_np[token_id] = 1
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("▁"):
+            has_leading_space_np[token_id] = True
+            piece = piece[1:]
+        base_bytes_np[token_id] = len(piece.encode("utf-8"))
+    return base_bytes_np, has_leading_space_np, is_boundary_token_np
+
+
+def load_tokenizer_meta_luts_np(
+    meta_path: Path, vocab_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    def scalar(value) -> object:
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return arr.item()
+        first = arr.reshape(-1)[0]
+        return first.item() if hasattr(first, "item") else first
+
+    with np.load(meta_path, allow_pickle=False) as data:
+        format_version = int(scalar(data["format_version"]))
+        if format_version != TOKENIZER_META_FORMAT_VERSION:
+            raise ValueError(
+                f"Unsupported tokenizer meta format_version={format_version}; "
+                f"expected {TOKENIZER_META_FORMAT_VERSION}"
+            )
+        meta_vocab_size = int(scalar(data["vocab_size"]))
+        tokenizer_kind = str(scalar(data["tokenizer_kind"]))
+        source_model_name = str(scalar(data["source_model_name"]))
+        base_bytes_np = np.asarray(data["base_bytes"], dtype=np.int16)
+        has_leading_space_np = np.asarray(data["has_leading_space"], dtype=np.bool_)
+        is_boundary_token_np = np.asarray(data["is_boundary_token"], dtype=np.bool_)
+
+    table_size = max(meta_vocab_size, vocab_size)
+    if base_bytes_np.shape[0] < table_size:
+        padded_base_bytes = np.zeros((table_size,), dtype=np.int16)
+        padded_has_leading_space = np.zeros((table_size,), dtype=np.bool_)
+        padded_is_boundary = np.ones((table_size,), dtype=np.bool_)
+        padded_base_bytes[: base_bytes_np.shape[0]] = base_bytes_np
+        padded_has_leading_space[: has_leading_space_np.shape[0]] = has_leading_space_np
+        padded_is_boundary[: is_boundary_token_np.shape[0]] = is_boundary_token_np
+        base_bytes_np = padded_base_bytes
+        has_leading_space_np = padded_has_leading_space
+        is_boundary_token_np = padded_is_boundary
+
+    return base_bytes_np, has_leading_space_np, is_boundary_token_np, {
+        "format_version": format_version,
+        "tokenizer_kind": tokenizer_kind,
+        "source_model_name": source_model_name,
+        "vocab_size": meta_vocab_size,
+        "meta_path": str(meta_path),
+    }
+
+
+def load_tokenizer_luts(
+    tokenizer_path: str,
+    tokenizer_meta_path: str,
+    vocab_size: int,
+    device: torch.device,
+    *,
+    validate_meta: bool = False,
+) -> tuple[tuple[Tensor, Tensor, Tensor], dict[str, object]]:
+    meta_path = Path(tokenizer_meta_path) if tokenizer_meta_path else _derive_tokenizer_meta_path(tokenizer_path)
+    if meta_path.exists():
+        base_bytes_np, has_leading_space_np, is_boundary_token_np, metadata = load_tokenizer_meta_luts_np(
+            meta_path,
+            vocab_size,
+        )
+        if validate_meta and str(tokenizer_path).endswith(".model"):
+            sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+            sp_luts = build_sentencepiece_luts_np(sp, vocab_size)
+            if not (
+                np.array_equal(base_bytes_np, sp_luts[0])
+                and np.array_equal(has_leading_space_np, sp_luts[1])
+                and np.array_equal(is_boundary_token_np, sp_luts[2])
+            ):
+                raise ValueError(f"Tokenizer metadata mismatch for {meta_path}")
+        return (
+            torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+            torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+            torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+        ), metadata
+
+    if not str(tokenizer_path).endswith(".model"):
+        raise FileNotFoundError(f"TOKENIZER_META_PATH does not exist: {meta_path}")
+
+    sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+    return build_sentencepiece_luts(sp, vocab_size, device), {
+        "tokenizer_kind": "sentencepiece",
+        "source_model_name": str(tokenizer_path),
+        "vocab_size": int(sp.vocab_size()),
+        "meta_path": None,
+        "fallback": True,
+    }
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
@@ -510,6 +642,279 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def _is_control_tensor_name(name: str) -> bool:
+    return any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+
+
+def _is_gptq_candidate_name(name: str, quantize_embeddings: bool) -> bool:
+    if _is_control_tensor_name(name):
+        return False
+    if name == "tok_emb.weight":
+        return quantize_embeddings
+    if name.endswith(".weight"):
+        return True
+    return False
+
+
+def collect_gptq_hessians(
+    model: "GPT",
+    args: Hyperparameters,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+) -> dict[str, Tensor]:
+    # GPTQ needs an input covariance H = X^T X for each quantized linear map.
+    # We collect these with forward hooks on the trained model using fresh train-stream batches.
+    hessians: dict[str, Tensor] = {}
+    counts: dict[str, Tensor] = {}
+    hooks = []
+
+    def add_samples(name: str, x: Tensor) -> None:
+        x = x.detach()
+        if x.ndim > 2:
+            x = x.reshape(-1, x.shape[-1])
+        elif x.ndim == 1:
+            x = x.unsqueeze(0)
+        x = x.float()
+        if name not in hessians:
+            hessians[name] = torch.zeros(x.shape[1], x.shape[1], dtype=torch.float32, device=device)
+            counts[name] = torch.zeros((), dtype=torch.float64, device=device)
+        hessians[name].addmm_(x.T, x)
+        counts[name] += float(x.shape[0])
+
+    def make_input_hook(name: str):
+        def hook_fn(module: nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+            if inp:
+                add_samples(name, inp[0])
+
+        return hook_fn
+
+    def make_output_hook(name: str):
+        def hook_fn(module: nn.Module, inp: tuple[Tensor, ...], out: Tensor) -> None:
+            add_samples(name, out)
+
+        return hook_fn
+
+    for module_name, module in model.named_modules():
+        if not isinstance(module, CastedLinear):
+            continue
+        state_name = f"{module_name}.weight"
+        if (
+            module.weight.numel() > args.gptq_min_numel
+            and module.weight.ndim == 2
+            and _is_gptq_candidate_name(state_name, args.gptq_quantize_embeddings)
+        ):
+            hooks.append(module.register_forward_hook(make_input_hook(state_name)))
+
+    if (
+        args.gptq_quantize_embeddings
+        and model.tie_embeddings
+        and model.tok_emb.weight.numel() > args.gptq_min_numel
+    ):
+        hooks.append(model.final_norm.register_forward_hook(make_output_hook("tok_emb.weight")))
+
+    was_training = model.training
+    old_monitoring = model.monitoring
+    model.eval()
+    model.monitoring = False
+    loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    try:
+        with torch.inference_mode():
+            for _ in range(args.gptq_calibration_batches):
+                x, _ = loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    model.forward_logits(x)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        model.monitoring = old_monitoring
+        model.train(was_training)
+
+    if dist.is_available() and dist.is_initialized():
+        for name in sorted(hessians):
+            dist.all_reduce(hessians[name], op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts[name], op=dist.ReduceOp.SUM)
+
+    out: dict[str, Tensor] = {}
+    for name, H in hessians.items():
+        count = max(float(counts[name].item()), 1.0)
+        out[name] = (H / count).cpu()
+    return out
+
+
+def _cholesky_inverse_cholesky(H: Tensor, dampening: float) -> Tensor:
+    H = H.float().clone()
+    diag = torch.arange(H.shape[0], device=H.device)
+    diag_mean = H.diag().mean().clamp_min(QUANT_SCALE_EPS)
+    damp = float(dampening) * float(diag_mean.item())
+    for attempt in range(8):
+        try:
+            H_try = H.clone()
+            H_try[diag, diag] += damp * (10.0 ** attempt)
+            chol = torch.linalg.cholesky(H_try)
+            Hinv = torch.cholesky_inverse(chol)
+            return torch.linalg.cholesky(Hinv, upper=True)
+        except RuntimeError:
+            continue
+    H[diag, diag] += max(damp, QUANT_SCALE_EPS) * 1.0e8
+    chol = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(chol)
+    return torch.linalg.cholesky(Hinv, upper=True)
+
+
+def gptq_quantize_weight(
+    weight: Tensor,
+    H: Tensor,
+    *,
+    bits: int,
+    block_size: int,
+    dampening: float,
+    clip_sigmas: float,
+    act_order: bool,
+) -> tuple[Tensor, Tensor]:
+    qmax = signed_quant_max(bits)
+    W_orig = weight.detach().cpu().float().contiguous()
+    rows, cols = W_orig.shape
+    H = H.detach().cpu().float().contiguous()
+    if H.shape != (cols, cols):
+        raise ValueError(f"GPTQ Hessian shape {tuple(H.shape)} does not match weight columns={cols}")
+
+    dead = H.diag() == 0
+    if dead.any():
+        H[dead, dead] = 1.0
+    W_work = W_orig.clone()
+    W_work[:, dead] = 0.0
+
+    if act_order:
+        perm = torch.argsort(H.diag(), descending=True)
+        invperm = torch.argsort(perm)
+        W_work = W_work[:, perm]
+        H = H[perm][:, perm]
+    else:
+        invperm = None
+
+    Hinv = _cholesky_inverse_cholesky(H, dampening)
+    if clip_sigmas > 0.0:
+        row_clip = clip_sigmas * W_orig.std(dim=1)
+        row_clip = torch.where(row_clip > 0.0, row_clip, W_orig.abs().amax(dim=1))
+    else:
+        row_clip = W_orig.abs().amax(dim=1)
+    scale = (row_clip / qmax).clamp_min(QUANT_SCALE_EPS).to(dtype=INT8_PER_ROW_SCALE_DTYPE)
+    scale_f = scale.float()
+
+    Q = torch.zeros((rows, cols), dtype=torch.int8)
+    for i1 in range(0, cols, block_size):
+        i2 = min(i1 + block_size, cols)
+        count = i2 - i1
+        W_block = W_work[:, i1:i2].clone()
+        Hinv_block = Hinv[i1:i2, i1:i2]
+        err_block = torch.zeros((rows, count), dtype=torch.float32)
+        for j in range(count):
+            w_col = W_block[:, j]
+            d = Hinv_block[j, j].clamp_min(QUANT_SCALE_EPS)
+            q_col = torch.clamp(torch.round(w_col / scale_f), -qmax, qmax)
+            Q[:, i1 + j] = q_col.to(torch.int8)
+            err = (w_col - q_col * scale_f) / d
+            err_block[:, j] = err
+            W_block[:, j:] -= err.unsqueeze(1) * Hinv_block[j, j:].unsqueeze(0)
+        if i2 < cols:
+            W_work[:, i2:] -= err_block @ Hinv[i1:i2, i2:]
+
+    if invperm is not None:
+        Q = Q[:, invperm]
+    return Q.contiguous(), scale.contiguous()
+
+
+def quantize_state_dict_gptq_int(
+    state_dict: dict[str, Tensor],
+    hessians: dict[str, Tensor],
+    args: Hyperparameters,
+):
+    signed_quant_max(args.quant_bits)
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    methods: dict[str, str] = {}
+    stats = dict.fromkeys(
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "num_gptq_tensors",
+            "num_fallback_tensors",
+            "baseline_tensor_bytes",
+            "quant_payload_bytes",
+        ),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["quant_payload_bytes"] += tensor_nbytes(t)
+            methods[name] = "passthrough_nonfloat"
+            continue
+
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or _is_control_tensor_name(name):
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["quant_payload_bytes"] += tensor_nbytes(kept)
+            methods[name] = "passthrough_float"
+            continue
+
+        stats["num_float_tensors"] += 1
+        use_gptq = (
+            t.ndim == 2
+            and t.numel() > args.gptq_min_numel
+            and name in hessians
+            and _is_gptq_candidate_name(name, args.gptq_quantize_embeddings)
+        )
+        if use_gptq:
+            clip_sigmas = args.gptq_embed_clip_sigmas if name == "tok_emb.weight" else args.gptq_matrix_clip_sigmas
+            q, s = gptq_quantize_weight(
+                t,
+                hessians[name],
+                bits=args.quant_bits,
+                block_size=args.gptq_blocksize,
+                dampening=args.gptq_dampening,
+                clip_sigmas=clip_sigmas,
+                act_order=args.gptq_act_order,
+            )
+            stats["num_gptq_tensors"] += 1
+            methods[name] = f"gptq_int{args.quant_bits}"
+        else:
+            q, s = quantize_float_tensor(t, bits=args.quant_bits)
+            stats["num_fallback_tensors"] += 1
+            methods[name] = f"per_row_int{args.quant_bits}"
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["quant_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": f"gptq_int{args.quant_bits}_per_row_fallback_v1",
+        "bits": args.quant_bits,
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+        "methods": methods,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -600,7 +1005,7 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         weight = self.weight
         qat_bits = getattr(self, "qat_bits", 0)
-        if qat_bits > 0 and getattr(self, "qat_enabled", False):
+        if self.training and qat_bits > 0 and getattr(self, "qat_enabled", False):
             weight = fake_quant_weight_ste(weight, qat_bits)
         return F.linear(x, weight.to(x.dtype), bias)
 
@@ -1334,7 +1739,7 @@ class GPT(nn.Module):
 
         if self.tie_embeddings:
             output_weight = self.tok_emb.weight
-            if qat_enabled and self.qat_tied_output:
+            if self.training and qat_enabled and self.qat_tied_output:
                 output_weight = fake_quant_weight_ste(output_weight, self.qat_bits)
             logits_proj = F.linear(x, output_weight)
         else:
@@ -1658,6 +2063,13 @@ def main() -> None:
     signed_quant_max(args.quant_bits)
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
+    if args.gptq_enabled:
+        if args.gptq_calibration_batches <= 0:
+            raise ValueError("GPTQ_CALIBRATION_BATCHES must be positive when GPTQ_ENABLED=1")
+        if args.gptq_reserve_seconds < 0.0:
+            raise ValueError("GPTQ_RESERVE_SECONDS must be non-negative when GPTQ_ENABLED=1")
+        if args.gptq_blocksize <= 0:
+            raise ValueError("GPTQ_BLOCKSIZE must be positive when GPTQ_ENABLED=1")
     if args.compile_muon_backend:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -1728,20 +2140,35 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
+    (
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    ), tokenizer_metadata = load_tokenizer_luts(
+        args.tokenizer_path,
+        args.tokenizer_meta_path,
+        args.vocab_size,
+        device,
+        validate_meta=args.tokenizer_meta_validate,
+    )
+    if int(tokenizer_metadata["vocab_size"]) != args.vocab_size:
         raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={tokenizer_metadata['vocab_size']}"
         )
+    if tokenizer_metadata.get("tokenizer_kind") == "sentencepiece":
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
+    log0(
+        f"val_bpb:enabled tokenizer_kind={tokenizer_metadata.get('tokenizer_kind', 'unknown')} "
+        f"tokenizer_path={args.tokenizer_path} meta_path={tokenizer_metadata.get('meta_path')} "
+        f"source_model_name={tokenizer_metadata.get('source_model_name')} vocab_size={tokenizer_metadata['vocab_size']}"
     )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1849,6 +2276,12 @@ def main() -> None:
         f"linear:{args.qat_linear} tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
     )
     log0(
+        f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
+        f"reserve_seconds:{args.gptq_reserve_seconds:g} blocksize:{args.gptq_blocksize} "
+        f"dampening:{args.gptq_dampening:g} act_order:{args.gptq_act_order} "
+        f"quantize_embeddings:{args.gptq_quantize_embeddings}"
+    )
+    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
@@ -1866,6 +2299,9 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    if max_wallclock_ms is not None and args.gptq_enabled and args.gptq_reserve_seconds > 0.0:
+        max_wallclock_ms = max(max_wallclock_ms - 1000.0 * args.gptq_reserve_seconds, 0.0)
+        log0(f"gptq:reserved_wallclock:{args.gptq_reserve_seconds:.3f}s train_cap:{max_wallclock_ms:.0f}ms")
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -2023,7 +2459,26 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int(base_model.state_dict(), bits=args.quant_bits)
+    if args.gptq_enabled:
+        t_gptq = time.perf_counter()
+        log0("gptq:collecting Hessians from calibration batches")
+        hessians = collect_gptq_hessians(
+            base_model,
+            args,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+        )
+        log0(
+            f"gptq:collected {len(hessians)} Hessians "
+            f"in {1000.0 * (time.perf_counter() - t_gptq):.0f}ms"
+        )
+        quant_obj, quant_stats = quantize_state_dict_gptq_int(base_model.state_dict(), hessians, args)
+        quant_format = f"gptq_int{args.quant_bits}"
+    else:
+        quant_obj, quant_stats = quantize_state_dict_int(base_model.state_dict(), bits=args.quant_bits)
+        quant_format = f"int{args.quant_bits}"
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -2037,10 +2492,15 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["quant_payload_bytes"], 1)
         log0(
-            f"Serialized model int{args.quant_bits}+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {quant_format}+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['quant_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int{args.quant_bits}+zlib: {quant_file_bytes + code_bytes} bytes")
+        if args.gptq_enabled:
+            log0(
+                f"gptq:quantized_tensors:{quant_stats['num_gptq_tensors']} "
+                f"fallback_tensors:{quant_stats['num_fallback_tensors']}"
+            )
+        log0(f"Total submission size {quant_format}+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
@@ -2064,10 +2524,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int{args.quant_bits}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{quant_format}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int{args.quant_bits}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{quant_format}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
