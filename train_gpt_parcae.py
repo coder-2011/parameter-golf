@@ -69,6 +69,12 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
+    bigram_hash_heads = int(os.environ.get("BIGRAM_HASH_HEADS", 1))
+    bigram_hash_gate = bool(int(os.environ.get("BIGRAM_HASH_GATE", "0")))
+    bigram_hash_scale_init = float(os.environ.get("BIGRAM_HASH_SCALE_INIT", "0.05"))
+    bigram_hash_init_std = float(os.environ.get("BIGRAM_HASH_INIT_STD", "0.02"))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     outer_rope_dims = int(os.environ.get("OUTER_ROPE_DIMS", rope_dims))
@@ -647,6 +653,61 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BigramHashEmbedding(nn.Module):
+    def __init__(
+        self,
+        num_buckets: int,
+        hash_dim: int,
+        model_dim: int,
+        num_heads: int,
+        gated: bool,
+        scale_init: float,
+        init_std: float,
+    ):
+        super().__init__()
+        if num_buckets < 2:
+            raise ValueError(f"BIGRAM_HASH_BUCKETS must be >= 2, got {num_buckets}")
+        if hash_dim <= 0:
+            raise ValueError(f"BIGRAM_HASH_DIM must be positive, got {hash_dim}")
+        if num_heads <= 0:
+            raise ValueError(f"BIGRAM_HASH_HEADS must be positive, got {num_heads}")
+        self.num_buckets = num_buckets
+        self.num_heads = num_heads
+        self.embed = nn.Embedding(num_buckets * num_heads, hash_dim)
+        nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+        self.proj = CastedLinear(hash_dim, model_dim, bias=False) if hash_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.gate = CastedLinear(model_dim, model_dim, bias=True) if gated else None
+        if self.gate is not None:
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+
+    def _hash(self, token_ids: Tensor) -> Tensor:
+        tokens = token_ids.to(torch.int64)
+        mod = self.num_buckets - 1
+        base = torch.empty_like(tokens)
+        base[..., 0] = mod
+        cur = tokens[..., 1:]
+        prev = tokens[..., :-1]
+        base[..., 1:] = torch.bitwise_xor(36313 * cur, 27191 * prev).remainder(mod)
+        if self.num_heads == 1:
+            return base
+        offsets = torch.arange(self.num_heads, device=token_ids.device, dtype=base.dtype) * self.num_buckets
+        return base[..., None] + offsets
+
+    def forward(self, token_ids: Tensor, input_embeds: Tensor) -> Tensor:
+        h = self.embed(self._hash(token_ids))
+        if self.num_heads > 1:
+            h = h.sum(dim=-2) * (self.num_heads ** -0.5)
+        if self.proj is not None:
+            h = self.proj(h)
+        if self.gate is not None:
+            h = h * torch.sigmoid(self.gate(input_embeds)).to(dtype=h.dtype)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class LinearCrossEntropyLoss(nn.Module):
     def __init__(
         self,
@@ -991,6 +1052,19 @@ class GPT(nn.Module):
                 raise ValueError(f"{name} must be a positive even value <= head_dim; got {rope_dim} for head_dim={head_dim}")
 
         self.tok_emb = nn.Embedding(h.vocab_size, self.outer_dim)
+        self.bigram_hash = (
+            BigramHashEmbedding(
+                num_buckets=h.bigram_hash_buckets,
+                hash_dim=h.bigram_hash_dim,
+                model_dim=self.outer_dim,
+                num_heads=h.bigram_hash_heads,
+                gated=h.bigram_hash_gate,
+                scale_init=h.bigram_hash_scale_init,
+                init_std=h.bigram_hash_init_std,
+            )
+            if h.bigram_hash_buckets > 0
+            else None
+        )
         self.prelude = nn.ModuleList(
             TransformerPreNormBlock(
                 dim=self.outer_dim,
@@ -1131,6 +1205,8 @@ class GPT(nn.Module):
         recurrent_freqs_cis = self.recurrent_freqs_cis[:, :seq_len]
 
         input_embeds = self.tok_emb(input_ids)
+        if self.bigram_hash is not None:
+            input_embeds = input_embeds + self.bigram_hash(input_ids, input_embeds)
         if self.emb_scale != 1.0:
             input_embeds = input_embeds * self.emb_scale
         self._current_input_ids = input_ids
