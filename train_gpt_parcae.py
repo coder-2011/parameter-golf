@@ -73,10 +73,8 @@ class Hyperparameters:
     bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
     bigram_hash_heads = int(os.environ.get("BIGRAM_HASH_HEADS", 1))
     bigram_hash_gate = bool(int(os.environ.get("BIGRAM_HASH_GATE", "0")))
-    bigram_hash_gate_type = os.environ.get("BIGRAM_HASH_GATE_TYPE", "full" if bigram_hash_gate else "none")
     bigram_hash_scale_init = float(os.environ.get("BIGRAM_HASH_SCALE_INIT", "0.05"))
     bigram_hash_init_std = float(os.environ.get("BIGRAM_HASH_INIT_STD", "0.02"))
-    bigram_hash_proj_init_std = float(os.environ.get("BIGRAM_HASH_PROJ_INIT_STD", "0.0"))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     outer_rope_dims = int(os.environ.get("OUTER_ROPE_DIMS", rope_dims))
@@ -698,10 +696,9 @@ class BigramHashEmbedding(nn.Module):
         hash_dim: int,
         model_dim: int,
         num_heads: int,
-        gate_type: str,
+        gated: bool,
         scale_init: float,
         init_std: float,
-        proj_init_std: float,
     ):
         super().__init__()
         if num_buckets < 2:
@@ -710,25 +707,17 @@ class BigramHashEmbedding(nn.Module):
             raise ValueError(f"BIGRAM_HASH_DIM must be positive, got {hash_dim}")
         if num_heads <= 0:
             raise ValueError(f"BIGRAM_HASH_HEADS must be positive, got {num_heads}")
-        if gate_type not in {"none", "scalar", "per_dim", "full"}:
-            raise ValueError(f"Invalid BIGRAM_HASH_GATE_TYPE={gate_type!r}")
         self.num_buckets = num_buckets
         self.num_heads = num_heads
-        self.gate_type = gate_type
         self.embed = nn.Embedding(num_buckets * num_heads, hash_dim)
         nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
         self.proj = CastedLinear(hash_dim, model_dim, bias=False) if hash_dim != model_dim else None
         if self.proj is not None:
-            if proj_init_std > 0.0:
-                nn.init.normal_(self.proj.weight, mean=0.0, std=proj_init_std)
-            else:
-                nn.init.zeros_(self.proj.weight)
-        self.gate = CastedLinear(model_dim, model_dim, bias=True) if gate_type == "full" else None
+            nn.init.normal_(self.proj.weight, mean=0.0, std=init_std / math.sqrt(hash_dim))
+        self.gate = CastedLinear(model_dim, model_dim, bias=True) if gated else None
         if self.gate is not None:
             nn.init.zeros_(self.gate.weight)
             nn.init.zeros_(self.gate.bias)
-        self.gate_logit = nn.Parameter(torch.zeros(())) if gate_type == "scalar" else None
-        self.gate_logits = nn.Parameter(torch.zeros(model_dim)) if gate_type == "per_dim" else None
         self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
 
     def _hash(self, token_ids: Tensor) -> Tensor:
@@ -768,11 +757,7 @@ class BigramHashEmbedding(nn.Module):
             h = h.sum(dim=-2) * (self.num_heads ** -0.5)
         if self.proj is not None:
             h = self.proj(h)
-        if self.gate_type == "scalar":
-            h = h * torch.sigmoid(self.gate_logit).to(dtype=h.dtype)
-        elif self.gate_type == "per_dim":
-            h = h * torch.sigmoid(self.gate_logits).to(dtype=h.dtype)
-        elif self.gate is not None:
+        if self.gate is not None:
             h = h * torch.sigmoid(self.gate(input_embeds)).to(dtype=h.dtype)
         return h * self.scale.to(dtype=h.dtype)
 
@@ -1127,10 +1112,9 @@ class GPT(nn.Module):
                 hash_dim=h.bigram_hash_dim,
                 model_dim=self.outer_dim,
                 num_heads=h.bigram_hash_heads,
-                gate_type=h.bigram_hash_gate_type,
+                gated=h.bigram_hash_gate,
                 scale_init=h.bigram_hash_scale_init,
                 init_std=h.bigram_hash_init_std,
-                proj_init_std=h.bigram_hash_proj_init_std,
             )
             if h.bigram_hash_buckets > 0
             else None
@@ -1798,8 +1782,8 @@ def main() -> None:
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"bigram_hash:buckets:{args.bigram_hash_buckets} dim:{args.bigram_hash_dim} "
-        f"heads:{args.bigram_hash_heads} gate_type:{args.bigram_hash_gate_type} "
-        f"scale_init:{args.bigram_hash_scale_init:g} proj_init_std:{args.bigram_hash_proj_init_std:g}"
+        f"heads:{args.bigram_hash_heads} gate:{args.bigram_hash_gate} "
+        f"scale_init:{args.bigram_hash_scale_init:g}"
     )
     log0(
         f"parcae:prelude:{args.n_layers_in_prelude} core:{args.n_layers_in_recurrent_block} coda:{args.n_layers_in_coda} "
