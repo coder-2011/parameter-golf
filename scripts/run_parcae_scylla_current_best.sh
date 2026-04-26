@@ -1,7 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-cd /workspace/parameter-golf
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+cd "$REPO_ROOT"
 
 export DATA_PATH=${DATA_PATH:-/workspace/parameter-golf/data_scylla/fineweb_scylla}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.vocab}
@@ -41,6 +43,13 @@ export GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-0.0}
 export CODA_MOE_NUM_EXPERTS=${CODA_MOE_NUM_EXPERTS:-0}
 export CODA_MOE_TOP_K=${CODA_MOE_TOP_K:-1}
 export CODA_MOE_MLP_MULT=${CODA_MOE_MLP_MULT:-0}
+export DEEPSEEK_MOE_NUM_BASE_EXPERTS=${DEEPSEEK_MOE_NUM_BASE_EXPERTS:-0}
+export DEEPSEEK_MOE_EXPERT_SEGMENTS=${DEEPSEEK_MOE_EXPERT_SEGMENTS:-4}
+export DEEPSEEK_MOE_SHARED_EXPERTS=${DEEPSEEK_MOE_SHARED_EXPERTS:-1}
+export DEEPSEEK_MOE_ACTIVE_EXPERTS=${DEEPSEEK_MOE_ACTIVE_EXPERTS:-0}
+export DEEPSEEK_MOE_MLP_MULT=${DEEPSEEK_MOE_MLP_MULT:-0}
+export DEEPSEEK_MOE_BALANCE_ALPHA=${DEEPSEEK_MOE_BALANCE_ALPHA:-0.0}
+export DEEPSEEK_MOE_NORM_TOPK_PROB=${DEEPSEEK_MOE_NORM_TOPK_PROB:-1}
 export POE_NUM_EXPERTS=${POE_NUM_EXPERTS:-1}
 export POE_HEAD_LR=${POE_HEAD_LR:-0.008}
 
@@ -50,4 +59,4 @@ export BIGRAM_HASH_HEADS=${BIGRAM_HASH_HEADS:-2}
 export BIGRAM_HASH_GATE=${BIGRAM_HASH_GATE:-1}
 
 export RUN_ID=${RUN_ID:-parcae_scylla_current_best}
-exec /workspace/parameter-golf/.venv/bin/python /workspace/parameter-golf/train_gpt_parcae.py
+exec "${PYTHON:-/workspace/parameter-golf/.venv/bin/python}" "$REPO_ROOT/train_gpt_parcae.py"
