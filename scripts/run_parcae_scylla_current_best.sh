@@ -7,6 +7,9 @@ export DATA_PATH=${DATA_PATH:-/workspace/parameter-golf/data_scylla/fineweb_scyl
 export TOKENIZER_PATH=${TOKENIZER_PATH:-/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.vocab}
 export TOKENIZER_META_PATH=${TOKENIZER_META_PATH:-/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.meta.npz}
 export VOCAB_SIZE=${VOCAB_SIZE:-998}
+# TokenMonster capcode makes per-token byte metadata context-dependent. Use the
+# SP1024 reference evaluator's scored validation bytes for this seq_len=512 setup.
+export VAL_BYTE_COUNT_OVERRIDE=${VAL_BYTE_COUNT_OVERRIDE:-151080363}
 
 export MODEL_DIM=${MODEL_DIM:-256}
 export NUM_HEADS=${NUM_HEADS:-4}
