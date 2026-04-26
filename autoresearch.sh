@@ -46,6 +46,10 @@ export COMPILE_MODEL=1
 export COMPILE_MUON_BACKEND=0
 export POE_NUM_EXPERTS=1
 export GRAD_CLIP_NORM=0.3
+export EMA_ENABLED=0
+export SWA_ENABLED=1
+export SWA_START_FRAC=0.2
+export SWA_EVERY=50
 export SEED=1337
 
 # Run training
