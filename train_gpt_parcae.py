@@ -139,7 +139,7 @@ class Hyperparameters:
     parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", "-1"))
     parallel_residual_ln_scale = bool(int(os.environ.get("PARALLEL_RESIDUAL_LN_SCALE", "1")))
-    state_init = os.environ.get("STATE_INIT", "zero")
+    state_init = os.environ.get("STATE_INIT", "like-init")
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
     qk_bias = bool(int(os.environ.get("QK_BIAS", "0")))
@@ -778,7 +778,7 @@ def pack_quantized_tensor(q: Tensor, bits: int) -> Tensor:
     if bits == 8:
         return q.to(torch.int8).contiguous()
     qmax = signed_quant_max(bits)
-    flat = (q.reshape(-1).to(torch.int16).numpy() + qmax).astype(np.uint16, copy=False)
+    flat = (q.detach().cpu().reshape(-1).to(torch.int16).numpy() + qmax).astype(np.uint16, copy=False)
     shifts = np.arange(bits, dtype=np.uint16)
     bitstream = ((flat[:, None] >> shifts[None, :]) & 1).astype(np.uint8, copy=False).reshape(-1)
     return torch.from_numpy(np.packbits(bitstream, bitorder="little")).contiguous()
@@ -1226,17 +1226,24 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
+    # Each call scores one contiguous global span. We keep the previous span's
+    # final token as the next span's first input so target tokens are not skipped
+    # at rank or batch boundaries.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self._overlap_token: Tensor | None = None
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        chunk = self.stream.take(local_tokens * self.world_size + 1)
+        global_span = local_tokens * self.world_size
+        if self._overlap_token is None:
+            chunk = self.stream.take(global_span + 1)
+        else:
+            chunk = torch.cat((self._overlap_token, self.stream.take(global_span)))
+        self._overlap_token = chunk[-1:].clone()
         start = self.rank * local_tokens
         local = chunk[start : start + local_tokens + 1].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)

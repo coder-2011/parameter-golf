@@ -137,10 +137,10 @@ Larger width/depth recurrence was strongly negative: `MODEL_DIM=512 RECURRENT_DI
 
 ## 2026-04-26 Parcae audit fixes
 
-`train_gpt_parcae.py` was cleaned up after a source-level audit found correctness footguns. Defaults now use deterministic zero recurrent state, monitoring off, and value embeddings off. Legacy random state modes still work during training but evaluate as zero state so validation is deterministic. Warmup now restores Python, NumPy, CPU torch, and CUDA RNG states.
+`train_gpt_parcae.py` was cleaned up after a source-level audit found correctness footguns. Defaults now keep the prior `STATE_INIT=like-init` training behavior, with random state modes evaluating as zero state so validation is deterministic. Monitoring and value embeddings default off. Warmup now restores Python, NumPy, CPU torch, and CUDA RNG states.
 
-Correctness fixes landed: distributed train loader uses one shared overlap token instead of dropping rank-boundary targets; `QK_BIAS=1` now has separate query/KV-head bias tensors for GQA; value embeddings are small-initialized if enabled; GPTQ sigma clipping is capped by row amax; QAT covers token, bigram, PLE, and value embedding lookups; low-bit `QUANT_BITS<8` now packs payloads instead of storing int8-shaped tensors; TTT distributed gradient sync is token-weighted for uneven local batches.
+Correctness fixes landed: distributed train loader carries one overlap token across global spans so rank-boundary and batch-boundary targets are not dropped; `QK_BIAS=1` now has separate query/KV-head bias tensors for GQA; value embeddings are small-initialized if enabled; GPTQ sigma clipping is capped by row amax; QAT covers token, bigram, PLE, and value embedding lookups; low-bit `QUANT_BITS<8` now packs payloads instead of storing int8-shaped tensors; TTT distributed gradient sync is token-weighted for uneven local batches.
 
 Silent no-ops are now guarded: `XSA_LAST_N>0`, explicit `NUM_LAYERS`, and explicit `QK_GAIN_INIT` fail fast in `train_gpt_parcae.py`. Timed runs skip step-0 validation and raw `final_model.pt` save unless `SAVE_RAW_MODEL=1`.
 
-`RECURRENT_INTERMEDIATE_DIM` now defaults to `MLP_MULT * RECURRENT_DIM`; `scripts/run_parcae_scylla_current_best.sh` pins `RECURRENT_INTERMEDIATE_DIM=1024` to preserve the old 4x current-best shape.
+`RECURRENT_INTERMEDIATE_DIM` now defaults to `MLP_MULT * RECURRENT_DIM`; `scripts/run_parcae_scylla_current_best.sh` pins `RECURRENT_INTERMEDIATE_DIM=1024` and `STATE_INIT=like-init` to preserve the old current-best training shape/init while retaining deterministic validation.
