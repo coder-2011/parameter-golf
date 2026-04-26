@@ -227,6 +227,70 @@ Conclusion:
 - Remove the temporary QR/SVD backend code and `MUON_BACKEND` knob. `train_gpt_parcae.py` is back to NS5-only, with `MUON_BACKEND_STEPS` still controlling Newton-Schulz iterations.
 - Do not compare this current-local 300s sweep directly to the older `1.69172418` headline run; data token count and runtime are not fully apples-to-apples. Within current-local 300s comparisons, NS5 row norm on is around the existing baseline range and row norm off / QR are worse.
 
+### 2026-04-26 diagnostic and architecture triage
+
+This section records analysis and paper-triage notes. These are not new run results unless a log is named explicitly.
+
+BPB scoring contract:
+
+- The current repo evaluator constructs contiguous shifted targets with `x = local[:-1]` and `y = local[1:]`, computes mean token cross-entropy through `model(x, y)`, then reports `val_bpb = val_loss / ln(2) * tokens_per_byte`.
+- BPB as a compression concept can be computed from any valid joint probability assignment, but the current code path scores one next-token target per position.
+- Multi-token prediction heads would therefore be training auxiliaries unless the evaluation/compression path is rewritten to expose a valid block likelihood. Naive overlapping future-token heads cannot be counted as extra BPB credit because they double-count targets.
+
+Latent diagnostics from existing final checkpoints:
+
+| Run | State | Last-token corr | Recurrent corr | Last eff-rank frac | Recurrent eff-rank frac | Last norm | Recurrent norm | Relative residual |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sp_no_bigram` | init | 0.6718 | 0.6496 | 0.1761 | 0.1837 | 16.00 | 5.52 | 0.4065 |
+| `sp_no_bigram` | trained | 0.1266 | 0.4045 | 0.2966 | 0.3818 | 1.46 | 621.88 | 0.3939 |
+| `sp_bigram4096` | trained | 0.1500 | 0.4316 | 0.2644 | 0.4082 | 1.39 | 527.60 | 0.4215 |
+| `sp_noloop_bigram4096` | trained | 0.1753 | 0.3325 | 0.3062 | 0.3863 | 1.15 | 85.64 | 1.0000 |
+| `scylla_current` | trained | 0.1675 | 0.3842 | 0.2719 | 0.3480 | 1.37 | 140.63 | 0.4158 |
+
+Interpretation:
+
+- There is no evidence of token-collapse degeneracy: token correlations are far from `1.0` and effective rank improves after training.
+- There is strong evidence of recurrent scale pathology: recurrent-state norms grow from single digits at init to roughly `85-622`, while final hidden norms are normalized down to roughly `1.1-1.5`.
+- The recurrent update is not a no-op: relative residual is roughly `0.39-0.42` in recurrent runs.
+- Highest-priority instrumentation gap: these latent monitor metrics exist in code but are not emitted in normal logs.
+
+Output-rank check:
+
+| Run / matrix | Numerical rank | Effective rank frac | Top singular energy | `r99` |
+| --- | ---: | ---: | ---: | ---: |
+| `sp_no_bigram tok_emb.weight` | 256 | 0.384 | 0.209 | 235 |
+| `sp_bigram4096 tok_emb.weight` | 256 | 0.349 | 0.225 | 231 |
+| `sp_noloop_bigram4096 tok_emb.weight` | 256 | 0.376 | 0.192 | 229 |
+| `scylla_current tok_emb.weight` | 256 | 0.521 | 0.073 | 229 |
+| `scylla_current poe_heads.0.weight` | 256 | 0.537 | 0.071 | 229 |
+| `scylla_current combined_output_weight` | 256 | 0.520 | 0.078 | 229 |
+
+Interpretation: output matrices are full numerical rank and use most dimensions by energy. The stronger bottleneck is hidden/latent utilization and recurrent scale management, not a degenerate low-rank output head. The mathematical output rank is still capped by model width `256`.
+
+MoE status:
+
+- The tested coda-only top-1 MoE is ruled out for this setup: `logs/exp_scylla_coda_moe4_top1_full_2000.txt` finished at `1.71156502`, worse than PoE3 and dense Scylla comparisons.
+- This does not rule out all DeepSeek/Gemma-style MoE. The tested implementation was only a small coda `TopKMoE`, not a shared-expert plus routed-expert architecture with router diagnostics.
+- Do not spend the next iteration on MoE unless expert usage entropy, per-expert counts, router temperature/load-balance behavior, active params, and step time are logged.
+
+Paper and architecture applicability:
+
+| Idea | Applicability | Read |
+| --- | --- | --- |
+| Kimi / Gated Delta attention | Later recurrent-core experiment | Could improve state tracking, but current `seq_len=512` and 300s budget make long-context benefits uncertain. Try only after recurrent scale diagnostics are logged. |
+| LBLLM W(1+1)A4 | Artifact compression experiment | Useful idea for staged low-bit weight compression. First try weight-only / W(1+1) offline reconstruction or distillation; activation A4 is a later risk. |
+| TensorSLM | Secondary embedding-table compression | Most relevant to `bigram_hash.embed.weight` and `tok_emb.weight`. For `BIGRAM_HASH_BUCKETS=4096`, `tok_emb + bigram_hash.embed` is about `0.78M` params, roughly `16%` of the `4.8M` PoE3 config before int8/zlib. For 8192 buckets, it is about `1.30M` params, roughly `20%` of the `6.37M` run. Needs an offline TT/SVD reconstruction sweep because it may worsen BPB and must beat existing int8+zlib artifact storage. |
+| Gemma 4 PLE | Promising as PLE-lite | The transferable idea is controlled per-layer token conditioning. Use zero-init small-rank per-layer token signals, likely coda/core first. Do not add full Gemma-style per-layer embedding tables blindly. |
+| Gemma 4 MoE / long context | Low priority | Full Gemma MoE is much more sophisticated than our coda MoE, but local evidence says MoE is not the next lever. Sliding/global attention and p-RoPE target 128K-256K contexts, not the current seq512 path. |
+| Multi-token prediction | Possible auxiliary only | Could shape richer representations, but it is not directly scored by the current BPB evaluator. Keep main next-token CE dominant and log main CE separately from aux CE. |
+
+Current belief update:
+
+1. Fix recurrent-state scale first.
+2. Emit live latent-rank/norm/correlation diagnostics before running more architecture ideas.
+3. Try controlled token reinjection / PLE-lite before MoE.
+4. Treat compression papers as artifact-budget tools, not direct BPB improvements, unless an offline reconstructed-weight evaluation shows negligible BPB loss.
+
 ## 2026-04-25 Scylla / XSA / MoE / PoE session
 
 This section is the central record for the Scylla tokenizer/scoring work, Parcae-recipe checks, XSA analysis, coda-only MoE attempt, and Product-of-Experts output-head tuning.
