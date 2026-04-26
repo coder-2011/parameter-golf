@@ -87,6 +87,10 @@ Architecture triage:
 | Gemma 4 PLE | promising as small zero-init PLE-lite/token-conditioning, safer than raw additive reinjection |
 | Kimi/Gated Delta | possible later recurrent-core test after live latent diagnostics |
 
+## 2026-04-26 PLE-lite implementation
+
+`train_gpt_parcae.py` now has default-off PLE-lite token conditioning. Use `PLE_SCOPE=prelude|core|coda|all`, `PLE_DIM>0`, `PLE_SCALE_INIT=0.0`, and `PLE_INIT_STD=0.02`. Each selected physical layer gets a small token lookup, a projection to the stream width, and a scalar gate injected before that block. PLE modules are constructed after existing model initialization, so zero-scale enabled PLE preserved common params and gave `max_logit_diff=0.0` in a tiny deterministic check. First recommended run is coda-only with `PLE_DIM=32` on the Scylla PoE3/bigram8192 baseline.
+
 ## 2026-04-26 Validation scorer alignment
 
 `train_gpt_parcae.py::eval_val` was changed back to the same main scorer body as canonical `train_gpt.py::eval_val`: same sequence partitioning, contiguous next-token windows, bf16 autocast model loss, token-byte LUT calculation, distributed all-reduce order, and BPB formula. The only intentional extra line is `VAL_BYTE_COUNT_OVERRIDE`, applied after byte-count all-reduce for Scylla denominator control. An AST body comparison passed with that override line ignored.

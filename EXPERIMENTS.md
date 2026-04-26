@@ -81,6 +81,51 @@ Completed check:
 
 Interpretation: raw additive SwiGLU token reinjection at scale `0.1` is too disruptive. If revisited, use a much smaller scale, a learned zero-init gate, or modulation of the existing diagonal path instead of an additional raw residual injection.
 
+### PLE-lite token conditioning
+
+Implemented default-off Per-Layer Embedding style token conditioning in `train_gpt_parcae.py`.
+
+Added knobs:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `PLE_SCOPE` | `none` | Enables PLE modules in `prelude`, `core`, `coda`, or `all` |
+| `PLE_DIM` | `0` | Low-rank token lookup width; `0` disables PLE |
+| `PLE_SCALE_INIT` | `0.0` | Per-layer scalar init, zero by default for exact no-op behavior |
+| `PLE_INIT_STD` | `0.02` | Init std for PLE token lookup rows |
+
+Implementation behavior:
+
+- Each selected physical layer gets a small `vocab_size x PLE_DIM` lookup, a `PLE_DIM -> stream_dim` projection, and a scalar gate.
+- PLE is injected before the selected block: `x = x + scale * proj(ple_embed[token])`.
+- Coda/prelude PLE projects to `MODEL_DIM`; core PLE projects to `RECURRENT_DIM`.
+- PLE modules are created after existing model weight initialization, so enabling zero-scale PLE does not perturb existing initialized weights.
+- PLE lookup tables are optimized in the token Adam group; PLE projections use the matrix/Muon group; PLE scalar gates use scalar Adam.
+
+Focused checks run:
+
+- `.venv/bin/python -m py_compile train_gpt_parcae.py`
+- Default-off construction remains valid.
+- Enabled coda PLE with `PLE_DIM=8 PLE_SCALE_INIT=0` preserved common initialized parameters and produced `max_logit_diff=0.0` versus disabled PLE on a deterministic tiny CPU forward.
+- Scope wiring check produced expected layer counts: `prelude -> 1/0/0`, `core -> 0/2/0`, `coda -> 0/0/1`, `all -> 1/2/1` in a tiny config.
+- Tiny CPU backward with coda PLE produced finite loss and nonzero PLE scale gradient.
+
+Recommended first experiment:
+
+```bash
+PLE_SCOPE=coda \
+PLE_DIM=32 \
+PLE_SCALE_INIT=0.0 \
+POE_NUM_EXPERTS=3 \
+POE_HEAD_LR=0.002 \
+BIGRAM_HASH_BUCKETS=8192 \
+TTT_ENABLED=0 \
+RUN_ID=exp_scylla_poe3_ple_coda32_300 \
+bash scripts/run_parcae_scylla_current_best.sh
+```
+
+Decision rule: keep investigating only if BPB improves or if latent diagnostics show better final-hidden utilization without worsening recurrent-state scale.
+
 ### Validation scorer alignment
 
 The standard `eval_val` path in `train_gpt_parcae.py` was realigned to the canonical `train_gpt.py` scorer body.
