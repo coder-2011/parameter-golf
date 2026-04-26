@@ -3,7 +3,7 @@
 ## Objective
 Optimize the validation BPB (bits-per-byte) of `train_gpt_parcae.py` on a single RTX Pro 4500 Blackwell GPU with a ~5-minute wall-clock training budget. The real leaderboard runs on 8×H100 SXM; this session targets the best possible local score as a proxy for architecture and hyperparameter quality.
 
-We use the canonical **SP1024** dataset (vocab=1024, `data/datasets/fineweb10B_sp1024/`) to avoid `VAL_BYTE_COUNT_OVERRIDE` complexity and keep comparisons clean.
+Any tokenizer is fair game so long as BPB is calculated correctly. We default to **SP1024** for clean iteration (no byte-count override needed), but we will also explore **Scylla** and **SP1892** when the hypothesis is tokenizer-specific. The constraint is correct BPB accounting, not tokenizer choice.
 
 ## Metrics
 - **Primary**: `val_bpb` (unitless, **lower is better**) — exact roundtrip BPB from `final_int8_zlib_roundtrip_exact`
@@ -40,8 +40,18 @@ Outputs `METRIC val_bpb=...` lines to stdout. The script runs `train_gpt_parcae.
 - Must keep code reviewable and minimal per the repo's AGENTS.md guidelines.
 - Do not add heavy new dependencies.
 
+## Available Tokenizers & Data
+
+| Tokenizer | Vocab | Data path | Byte override | Best known local BPB | Notes |
+|-----------|------:|-----------|---------------|---------------------:|-------|
+| **SP1024** | 1024 | `data/datasets/fineweb10B_sp1024/` | None | **1.762** | Canonical; simplest BPB accounting |
+| **SP1892** | 1892 | `data_sp1892/datasets/fineweb10B_sp1892/` | None | — | Larger vocab; more embed params |
+| **Scylla** | 998 | `data_scylla/fineweb_scylla/` | `151080363` | **1.691** | TokenMonster; requires override |
+
+Switching tokenizers changes the embedding table size and the bytes-per-token ratio, so **never compare BPB across tokenizers directly**. Compare only within the same tokenizer family.
+
 ## Baseline Config (SP1024, 300s)
-The following config produced **val_bpb ≈ 1.762** in prior local runs:
+The following config produced **val_bpb ≈ 1.762** in prior local runs on SP1024:
 
 ```bash
 MODEL_DIM=256
@@ -55,6 +65,11 @@ N_LAYERS_IN_CODA=1
 MLP_MULT=3
 TRAIN_SEQ_LEN=512
 TRAIN_BATCH_TOKENS=16384
+ITERATIONS=1000000
+MAX_WALLCLOCK_SECONDS=300
+WARMUP_STEPS=500
+TRAIN_LOG_EVERY=100
+VAL_LOSS_EVERY=0
 MEAN_RECURRENCE=2
 MEAN_BACKPROP_DEPTH=1
 ROPE_DIMS=16
@@ -64,9 +79,10 @@ BIGRAM_HASH_BUCKETS=4096
 BIGRAM_HASH_DIM=128
 BIGRAM_HASH_HEADS=2
 BIGRAM_HASH_GATE=1
-WARMUP_STEPS=500
 COMPILE_MODEL=0
 COMPILE_MUON_BACKEND=0
+POE_NUM_EXPERTS=1
+SEED=1337
 ```
 
 ## What's Been Tried (High-Level from EXPERIMENTS.md)
