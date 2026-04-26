@@ -122,6 +122,8 @@ class Hyperparameters:
     curriculum_target = os.environ.get("CURRICULUM_TARGET", "forward")
     injection_type = os.environ.get("INJECTION_TYPE", "diagonal")
     injection_swiglu_scale = float(os.environ.get("INJECTION_SWIGLU_SCALE", "0.0"))
+    residual_mode = os.environ.get("RESIDUAL_MODE", "sequential")
+    parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
     state_init = os.environ.get("STATE_INIT", "like-init")
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
@@ -1651,8 +1653,10 @@ class TransformerPreNormBlock(nn.Module):
         clip_qkv: float | None,
         mlp_class_name: str,
         rope_dims: int,
+        parallel_residual: bool,
     ):
         super().__init__()
+        self.parallel_residual = parallel_residual
         self.norm_1 = ParcaeRMSNorm(dim)
         self.attn = ParcaeCausalSelfAttention(
             dim=dim,
@@ -1671,6 +1675,9 @@ class TransformerPreNormBlock(nn.Module):
         self.mlp = mlp_cls(dim, hidden_dim)
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
+        if self.parallel_residual:
+            x0 = x
+            return x0 + self.attn(self.norm_1(x0), freqs_cis, mask, **kwargs) + self.mlp(self.norm_2(x0))
         x = self.attn(self.norm_1(x), freqs_cis, mask, **kwargs) + x
         x = self.mlp(self.norm_2(x)) + x
         return x
@@ -1770,6 +1777,8 @@ class GPT(nn.Module):
         self.recurrent_iteration_method = h.recurrent_iteration_method
         self.sampling_scheme = h.sampling_scheme
         self.curriculum_target = h.curriculum_target
+        self.residual_mode = h.residual_mode
+        self.parallel_residual_scope = h.parallel_residual_scope
         self.lockstep_n = h.lockstep_n
         self.lockstep_k = h.lockstep_k
         self.state_init = h.state_init
@@ -1845,6 +1854,7 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
                 rope_dims=self.outer_rope_dims,
+                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -1868,6 +1878,7 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.recurrent_mlp_class_name,
                 rope_dims=self.recurrent_layer_rope_dims[i],
+                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope in {"core", "all"},
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -1886,6 +1897,7 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
                 rope_dims=self.outer_rope_dims,
+                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -2375,6 +2387,15 @@ def main() -> None:
         raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
     if args.injection_swiglu_scale < 0:
         raise ValueError(f"INJECTION_SWIGLU_SCALE must be non-negative, got {args.injection_swiglu_scale}")
+    if args.residual_mode not in {"sequential", "parallel"}:
+        raise ValueError(f"RESIDUAL_MODE must be sequential or parallel, got {args.residual_mode!r}")
+    if args.parallel_residual_scope not in {"none", "core", "all"}:
+        raise ValueError(
+            "PARALLEL_RESIDUAL_SCOPE must be none, core, or all; "
+            f"got {args.parallel_residual_scope!r}"
+        )
+    if args.residual_mode == "parallel" and args.parallel_residual_scope == "none":
+        raise ValueError("RESIDUAL_MODE=parallel requires PARALLEL_RESIDUAL_SCOPE=core or all")
     if not (0 < args.eval_stride <= args.train_seq_len):
         raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
     if args.ttt_chunk_tokens <= 0:
@@ -2596,7 +2617,8 @@ def main() -> None:
         f"parcae:prelude:{args.n_layers_in_prelude} core:{args.n_layers_in_recurrent_block} coda:{args.n_layers_in_coda} "
         f"recurrent_dim:{args.recurrent_dim} recurrence:{args.mean_recurrence}/{args.mean_backprop_depth} "
         f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
-        f"swiglu_scale:{args.injection_swiglu_scale:g}"
+        f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
+        f"parallel_residual_scope:{args.parallel_residual_scope}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
