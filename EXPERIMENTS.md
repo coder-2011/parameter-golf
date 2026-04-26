@@ -1,5 +1,69 @@
 # Experiment Notes
 
+## 2026-04-26 Parcae implementation log
+
+This section records code changes made around the current Parcae/Scylla training script. These are implementation notes, not proof of quality improvements unless a run result is listed separately.
+
+### Score-first TTT validation path
+
+Implemented an opt-in score-first test-time training path in `train_gpt_parcae.py`.
+
+Added knobs:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `TTT_ENABLED` | `0` | Enables the extra post-roundtrip TTT validation pass |
+| `EVAL_STRIDE` | `64` | Sliding-window stride for TTT scoring |
+| `TTT_CHUNK_TOKENS` | `32768` | Validation chunk size |
+| `TTT_EPOCHS` | `3` | SGD epochs after each chunk is scored |
+| `TTT_LR` | `0.005` | SGD learning rate before chunk-wise cosine decay |
+| `TTT_MOMENTUM` | `0.9` | SGD momentum |
+| `TTT_BATCH_SEQS` | `32` | Number of full sequences per TTT batch |
+| `TTT_GRAD_CLIP` | `1.0` | Gradient clip norm |
+
+Implementation behavior:
+
+- TTT runs after quantized model roundtrip load and does not change the saved artifact.
+- Validation tokens are assigned to `TTT_CHUNK_TOKENS` chunks by the first target token scored by each sliding window.
+- Each chunk is scored first under `torch.no_grad()`, then the model is trained on full `TRAIN_SEQ_LEN` sequences from that same chunk.
+- The final chunk is not trained because all validation loss has already been scored.
+- Multi-GPU TTT manually all-reduces gradients across active ranks before clipping and `optimizer.step()`.
+- TTT uses the same byte accounting and `VAL_BYTE_COUNT_OVERRIDE` path as standard validation.
+
+Focused checks run:
+
+- `python -m py_compile train_gpt_parcae.py`
+- Synthetic CUDA one-epoch TTT smoke passed.
+- Synthetic `TTT_EPOCHS=0` equivalence check matched a direct bf16 sliding-window reference exactly (`diff=0` for loss and BPB).
+
+Current caveats:
+
+- No full Scylla TTT result has been established yet.
+- Quantized-weight SGD TTT is experimental and may hurt; the previous record-submission code warned that SGD TTT on quantized weights was unfavorable in that setup.
+- Manual full-parameter gradient all-reduce is correctness-oriented but may be expensive.
+- The latest cleanup reduced duplicated expressions but added helper surface; `_validation_result` and `_token_byte_sum` are worth keeping for metric safety, while `_window_batch` is debatable if minimizing line count becomes the priority.
+
+### SwiGLU recurrent input injection
+
+Implemented an opt-in `INJECTION_TYPE=swiglu-add` recurrent adapter in `train_gpt_parcae.py`.
+
+Added knob:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `INJECTION_SWIGLU_SCALE` | `0.0` | Initial scalar multiplier for the SwiGLU input-injection branch |
+
+Implementation behavior:
+
+- The adapter projects original input embeddings to `2 * recurrent_dim`, splits into `gate` and `value`, then injects `scale * silu(gate) * value` into the recurrent state.
+- Default scale is `0.0`, so the branch is opt-in and starts as a no-op unless a run explicitly sets a nonzero scale.
+- Validation rejects negative `INJECTION_SWIGLU_SCALE`.
+
+Current caveats:
+
+- No completed result proves this injection helps.
+- The default was changed from an earlier local `0.1` to `0.0` to keep the new branch inactive by default.
+
 ## 2026-04-25 Scylla / XSA / MoE / PoE session
 
 This section is the central record for the Scylla tokenizer/scoring work, Parcae-recipe checks, XSA analysis, coda-only MoE attempt, and Product-of-Experts output-head tuning.

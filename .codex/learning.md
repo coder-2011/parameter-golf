@@ -38,8 +38,28 @@ Next best clean check: rerun `POE_NUM_EXPERTS=3 POE_HEAD_LR=0.002` alone with Sc
 
 `train_gpt_parcae.py` has an opt-in `INJECTION_TYPE=swiglu-add` path. It adds `INJECTION_SWIGLU_SCALE`-scaled `silu(gate) * value` from the original input embeddings into the recurrent state before the core blocks. `INJECTION_SWIGLU_SCALE` defaults to `0.0`, so the new injection contribution is off unless a run explicitly enables a nonzero scale. This is intended as a direct test of nonlinear token/BigramHash reinjection quality without changing the transformer block residuals.
 
-## 2026-04-25 Parcae score-first TTT implementation
+## 2026-04-26 Parcae score-first TTT implementation
 
 `train_gpt_parcae.py` has an opt-in `TTT_ENABLED=1` quantized roundtrip eval path that scores validation chunks first with sliding windows, then trains on the scored chunk via SGD. Defaults: `TTT_CHUNK_TOKENS=32768`, `TTT_EPOCHS=3`, `TTT_GRAD_CLIP=1.0`, `EVAL_STRIDE=64`.
 
-Implementation caveat: the final chunk is not trained because all of its loss has already been scored. The logits path is intentionally uncompiled for robustness; add a separate compile knob only if profiling shows it is worth the startup/runtime risk.
+Key implementation facts:
+
+| item | note |
+|---|---|
+| placement | runs only after quantized roundtrip load; it does not alter saved artifacts |
+| legality invariant | each chunk is scored before that chunk is used for SGD |
+| sliding scoring | windows score only the first window from `0`, then the `EVAL_STRIDE` tail after a context prefix |
+| distributed path | ranks split windows/sequences and manually all-reduce active gradients before clipping |
+| metric path | standard validation and TTT share byte accounting and `VAL_BYTE_COUNT_OVERRIDE` handling |
+| final chunk | skipped for training because no later validation tokens can benefit |
+| logits compile | intentionally uncompiled for robustness after synthetic smoke showed compile startup overhead |
+
+Focused checks run:
+
+- `python -m py_compile train_gpt_parcae.py`
+- Synthetic CUDA one-epoch TTT smoke passed.
+- Synthetic `TTT_EPOCHS=0` equivalence check matched a direct bf16 sliding-window reference exactly (`diff=0` for loss and BPB).
+
+Refactor caveat: cleanup extracted `_validation_result`, `_rank_bounds`, `_token_byte_sum`, `_ttt_chunk_windows`, and `_window_batch`. This reduced repeated logic and made metric handling safer, but it did not shrink line count. If minimizing code size becomes the priority, `_window_batch` is the least essential helper.
+
+Performance caveat: no full Scylla TTT run has proven this helps. Quantized-weight SGD TTT remains experimental and may hurt.
