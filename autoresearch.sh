@@ -17,13 +17,13 @@ export RUN_ID
 export DATA_PATH="./data/datasets/fineweb10B_sp1024"
 export TOKENIZER_PATH="./data/tokenizers/fineweb_1024_bpe.model"
 export VOCAB_SIZE=1024
-export MODEL_DIM=448
-export RECURRENT_DIM=448
+export MODEL_DIM=384
+export RECURRENT_DIM=384
 export NUM_HEADS=4
 export NUM_KV_HEADS=2
 export RECURRENT_NUM_HEADS=4
 export N_LAYERS_IN_PRELUDE=1
-export N_LAYERS_IN_RECURRENT_BLOCK=2
+export N_LAYERS_IN_RECURRENT_BLOCK=3
 export N_LAYERS_IN_CODA=1
 export MLP_MULT=3
 export TRAIN_SEQ_LEN=1024
