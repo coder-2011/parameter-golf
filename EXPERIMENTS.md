@@ -105,10 +105,18 @@ Implementation behavior:
 Focused checks run:
 
 - `.venv/bin/python -m py_compile train_gpt_parcae.py`
+- `git diff --check`
 - Default-off construction remains valid.
+- Invalid PLE configs fail early: enabled scope with `PLE_DIM=0`, `PLE_SCOPE=none` with positive `PLE_DIM`, and unknown scope.
 - Enabled coda PLE with `PLE_DIM=8 PLE_SCALE_INIT=0` preserved common initialized parameters and produced `max_logit_diff=0.0` versus disabled PLE on a deterministic tiny CPU forward.
 - Scope wiring check produced expected layer counts: `prelude -> 1/0/0`, `core -> 0/2/0`, `coda -> 0/0/1`, `all -> 1/2/1` in a tiny config.
-- Tiny CPU backward with coda PLE produced finite loss and nonzero PLE scale gradient.
+- Nonzero-scale coda PLE changed logits on a deterministic tiny CPU forward, proving the injection path is live.
+- Tiny CPU backward with zero-scale coda PLE produced finite loss and nonzero PLE scale gradient.
+- Tiny CPU backward with nonzero-scale coda PLE produced finite gradients for PLE lookup, projection, and scale params.
+- QAT registration includes the PLE projection `CastedLinear`.
+- Activation-checkpointed backward with all-scope PLE produced finite loss.
+- Strict state-dict roundtrip with core PLE preserved logits exactly.
+- Int8 quantize/dequantize state-dict roundtrip with all-scope PLE loaded strictly and produced finite logits; tiny expected max logit diff was `6.603635847568512e-05`.
 
 Recommended first experiment:
 
