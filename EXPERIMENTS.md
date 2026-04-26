@@ -6,13 +6,13 @@ This section is the central record for the Scylla tokenizer/scoring work, Parcae
 
 ### Current best from this session
 
-The best result from this session is the Scylla current-best recurrent stack with 3 total categorical PoE experts and a lower extra-head LR.
+The best result from this session is the Scylla recurrent stack with 3 total categorical PoE experts and the larger BigramHash cache.
 
 | Field | Value |
 | --- | --- |
-| Exact final BPB | **1.69388607** |
-| Exact final loss | **2.90802014** |
-| Run log | `logs/exp_scylla_poe3_lr0p002_full_2000.txt` |
+| Exact final BPB | **1.69172418** |
+| Exact final loss | **2.90430866** |
+| Run log | `logs/exp_scylla_poe3_lr0p002_bigram8192_2000.txt` |
 | Key delta | `POE_NUM_EXPERTS=3 POE_HEAD_LR=0.002` |
 | Base launcher | `scripts/run_parcae_scylla_current_best.sh` |
 | Scylla data | `data_scylla/fineweb_scylla` |
@@ -25,15 +25,32 @@ Current Scylla leaderboard from this session:
 
 | Rank | Variant | Exact / corrected BPB | Notes |
 | ---: | --- | ---: | --- |
-| 1 | PoE3, `POE_HEAD_LR=0.002` | **1.69388607** | Current best |
-| 2 | Dense Scylla baseline, corrected | about **1.69637493** | Log was pre-byte-override, corrected from exact val loss |
-| 3 | PoE3, `POE_HEAD_LR=0.0025` | 1.69787138 | Best of second PoE sweep |
-| 4 | PoE3, `POE_HEAD_LR=0.001` | 1.69919329 | Worse than `0.002` |
-| 5 | PoE3, `POE_HEAD_LR=0.008` | 1.69923407 | Initial PoE try, too aggressive |
-| 6 | PoE2, `POE_HEAD_LR=0.004` | 1.70085542 | Worse |
-| 7 | XSA4 corrected | about 1.70250566 | XSA implementation is correct but hurt here |
-| 8 | Eff8 prelude/coda + XSA3 | 1.70473223 | More effective layers plus XSA hurt |
-| 9 | Coda MoE4 top-1 | 1.71156502 | Worse |
+| 1 | PoE3, `POE_HEAD_LR=0.002`, `BIGRAM_HASH_BUCKETS=8192` | **1.69172418** | Current best |
+| 2 | PoE3, `POE_HEAD_LR=0.002`, `BIGRAM_HASH_BUCKETS=4096` | **1.69408507** | Clean rerun with final roundtrip |
+| 3 | Dense Scylla baseline, corrected | about **1.69637493** | Log was pre-byte-override, corrected from exact val loss |
+| 4 | PoE3, `POE_HEAD_LR=0.0025` | 1.69787138 | Best of second PoE sweep |
+| 5 | PoE3, `POE_HEAD_LR=0.001` | 1.69919329 | Worse than `0.002` |
+| 6 | PoE3, `POE_HEAD_LR=0.008` | 1.69923407 | Initial PoE try, too aggressive |
+| 7 | PoE2, `POE_HEAD_LR=0.004` | 1.70085542 | Worse |
+| 8 | XSA4 corrected | about 1.70250566 | XSA implementation is correct but hurt here |
+| 9 | Eff8 prelude/coda + XSA3 | 1.70473223 | More effective layers plus XSA hurt |
+| 10 | Coda MoE4 top-1 | 1.71156502 | Worse |
+
+### BigramHash bucket-size sweep on current PoE best
+
+A focused sweep was run on the best current-scaffold PoE config (`POE_NUM_EXPERTS=3`, `POE_HEAD_LR=0.002`) with varying `BIGRAM_HASH_BUCKETS`.
+
+| Run | `BIGRAM_HASH_BUCKETS` | Final exact BPB | Final exact loss | Train time (ms) | Step avg (ms) | int8+zlib bytes | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `logs/exp_scylla_poe3_lr0p002_bigram4096_clean_2000.txt` | 4096 | 1.69408507 | 2.90836178 | 412858 | 206.43 | 5,357,060 | Worse than 8192 |
+| `logs/exp_scylla_poe3_lr0p002_bigram8192_2000.txt` | 8192 | 1.69172418 | 2.90430866 | 397444 | 198.72 | 6,368,860 | **Current best** |
+| `logs/exp_scylla_poe3_lr0p002_bigram16384_2000.txt` | 16384 | 1.71050917 | 2.93655825 | 423607 | 211.80 | 8,403,272 | Worse |
+| `logs/exp_scylla_poe3_lr0p002_bigram32768_2000.txt` | 32768 | 1.70532632 | 2.92766048 | 404159 | 202.08 | 12,469,815 | Worse |
+
+Findings from this sweep:
+- `BIGRAM_HASH_BUCKETS=8192` improved validation quality by ~0.00236 BPB over 4096 and was not slower in this concurrent launch.
+- Larger caches did not continue improving; 16384/32768 were clearly worse on BPB and significantly increased artifact size.
+- The 8192 result remains a concurrent-run result sharing global artifact filenames during execution; for official reporting, a solo rerun is still recommended.
 
 ### Current-best Scylla base config
 
