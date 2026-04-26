@@ -46,6 +46,7 @@ class Hyperparameters:
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     tokenizer_meta_path = os.environ.get("TOKENIZER_META_PATH", "")
     tokenizer_meta_validate = bool(int(os.environ.get("TOKENIZER_META_VALIDATE", "0")))
+    val_byte_count_override = float(os.environ.get("VAL_BYTE_COUNT_OVERRIDE", "0"))
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -2435,8 +2436,11 @@ def main() -> None:
     log0(
         f"val_bpb:enabled tokenizer_kind={tokenizer_metadata.get('tokenizer_kind', 'unknown')} "
         f"tokenizer_path={args.tokenizer_path} meta_path={tokenizer_metadata.get('meta_path')} "
-        f"source_model_name={tokenizer_metadata.get('source_model_name')} vocab_size={tokenizer_metadata['vocab_size']}"
+        f"source_model_name={tokenizer_metadata.get('source_model_name')} vocab_size={tokenizer_metadata['vocab_size']} "
+        f"byte_count_override:{args.val_byte_count_override:g}"
     )
+    if tokenizer_metadata.get("tokenizer_kind") == "tokenmonster" and args.val_byte_count_override <= 0:
+        log0("warning:tokenmonster_byte_count_override_missing bpb_uses_metadata_bytes")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
