@@ -81,7 +81,7 @@ Architecture triage:
 
 | idea | note |
 |---|---|
-| DeepSeek/Gemma MoE | tested coda top-1 MoE lost; do not revisit without router diagnostics |
+| MoE | legacy coda top-1 MoE lost; DeepSeek-style coda MoE is now available default-off for router-diagnostic tests, but should not be treated as proven without a matched run |
 | MTP | auxiliary only under current evaluator; BPB path scores shifted next-token CE |
 | TensorSLM/LBLLM | artifact-budget tools, not direct BPB improvements unless offline reconstruction/distillation preserves BPB |
 | Gemma 4 PLE | promising as small zero-init PLE-lite/token-conditioning, safer than raw additive reinjection |
@@ -100,3 +100,17 @@ Architecture triage:
 `train_gpt_parcae.py` now has default-off parallel residual support. Use `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=core` to make recurrent core blocks compute `x + attn(norm_1(x)) + mlp(norm_2(x))` while leaving prelude/coda sequential. `PARALLEL_RESIDUAL_SCOPE=all` also applies it to prelude/coda. Defaults are `RESIDUAL_MODE=sequential` and `PARALLEL_RESIDUAL_SCOPE=none`, preserving current behavior.
 
 Follow-up correction: this was rewritten to match `curr_record_sub.py` more faithfully when enabled. Parallel mode now creates record-style per-channel `attn_scale`, `mlp_scale`, and `resid_mix` controls in the selected scope, uses `x_in = resid_mix[0] * x + resid_mix[1] * x0`, applies optional `1/sqrt(physical_layer_idx + 1)` normalized-input scaling, and supports `PARALLEL_RESIDUAL_START` as a physical block-index gate. In Parcae, `x0` is stream-local: outer input embeddings for prelude/coda and the initialized recurrent state for the recurrent core. Default sequential mode still does not create these extra tensors.
+
+## 2026-04-26 DeepSeekMoE coda implementation
+
+`train_gpt_parcae.py` has a default-off DeepSeek-style coda MoE path integrated from the `deepseek-moe-coda` worktree. It replaces coda MLPs only when `DEEPSEEK_MOE_NUM_BASE_EXPERTS > 0`; otherwise the dense coda remains unchanged unless the older `CODA_MOE_NUM_EXPERTS` path is enabled.
+
+Implementation scope:
+
+| item | note |
+|---|---|
+| placement | coda MLP replacement only |
+| controls | `DEEPSEEK_MOE_NUM_BASE_EXPERTS`, `DEEPSEEK_MOE_EXPERT_SEGMENTS`, `DEEPSEEK_MOE_SHARED_EXPERTS`, `DEEPSEEK_MOE_ACTIVE_EXPERTS` |
+| paper mapping | total fine experts = base experts x segments; shared experts are always on; routed top-k = active - shared |
+| default derived active count | if `DEEPSEEK_MOE_ACTIVE_EXPERTS=0`, active count is `shared + max(1, segments - shared)` |
+| disabled behavior | `DEEPSEEK_MOE_NUM_BASE_EXPERTS=0` preserves dense coda unless legacy `CODA_MOE_NUM_EXPERTS>0` is set |
