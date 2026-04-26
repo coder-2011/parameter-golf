@@ -126,6 +126,7 @@ class Hyperparameters:
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
     qk_bias = bool(int(os.environ.get("QK_BIAS", "0")))
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "1")))
     gradient_checkpointing = bool(int(os.environ.get("GRADIENT_CHECKPOINTING", "0")))
     activation_checkpoint_impl = os.environ.get("ACTIVATION_CHECKPOINT_IMPL", "none")
