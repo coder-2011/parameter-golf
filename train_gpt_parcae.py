@@ -120,6 +120,7 @@ class Hyperparameters:
     sampling_scheme = os.environ.get("SAMPLING_SCHEME", "fixed")
     curriculum_target = os.environ.get("CURRICULUM_TARGET", "forward")
     injection_type = os.environ.get("INJECTION_TYPE", "diagonal")
+    injection_swiglu_scale = float(os.environ.get("INJECTION_SWIGLU_SCALE", "0.1"))
     state_init = os.environ.get("STATE_INIT", "like-init")
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
@@ -1636,13 +1637,28 @@ class AdditiveInjection(nn.Module):
         return x + input_embeds
 
 
-def _get_injection_method(injection_type: str, state_dim: int, input_dim: int) -> nn.Module:
+class SwiGLUAddInjection(nn.Module):
+    def __init__(self, state_dim: int, input_dim: int, scale_init: float):
+        super().__init__()
+        self.fc = CastedLinear(input_dim, 2 * state_dim, bias=False)
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        nn.init.normal_(self.fc.weight, mean=0.0, std=1.0 / math.sqrt(input_dim))
+
+    def forward(self, x: Tensor, input_embeds: Tensor) -> Tensor:
+        gate, value = self.fc(input_embeds).chunk(2, dim=-1)
+        injected = F.silu(gate) * value
+        return x + self.scale.to(dtype=x.dtype) * injected
+
+
+def _get_injection_method(injection_type: str, state_dim: int, input_dim: int, swiglu_scale: float) -> nn.Module:
     if injection_type == 'diagonal':
         return DiagonalInjection(state_dim, input_dim)
     if injection_type == 'linear':
         return LinearInjection(state_dim, input_dim)
     if injection_type == 'add':
         return AdditiveInjection(state_dim, input_dim)
+    if injection_type == 'swiglu-add':
+        return SwiGLUAddInjection(state_dim, input_dim, swiglu_scale)
     raise ValueError(f'Invalid injection type: {injection_type}')
 
 
@@ -1745,7 +1761,12 @@ class GPT(nn.Module):
             )
             for i in range(self.n_layers_in_prelude)
         )
-        self.adapter = _get_injection_method(h.injection_type, self.recurrent_dim, self.outer_dim)
+        self.adapter = _get_injection_method(
+            h.injection_type,
+            self.recurrent_dim,
+            self.outer_dim,
+            h.injection_swiglu_scale,
+        )
         self.core_block = nn.ModuleList(
             TransformerPreNormBlock(
                 dim=self.recurrent_dim,
@@ -2265,6 +2286,8 @@ def main() -> None:
         raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
     if args.poe_head_lr < 0:
         raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
+    if args.injection_swiglu_scale < 0:
+        raise ValueError(f"INJECTION_SWIGLU_SCALE must be non-negative, got {args.injection_swiglu_scale}")
     if not (0 < args.eval_stride <= args.train_seq_len):
         raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
     if args.ttt_chunk_tokens <= 0:
@@ -2481,7 +2504,8 @@ def main() -> None:
     log0(
         f"parcae:prelude:{args.n_layers_in_prelude} core:{args.n_layers_in_recurrent_block} coda:{args.n_layers_in_coda} "
         f"recurrent_dim:{args.recurrent_dim} recurrence:{args.mean_recurrence}/{args.mean_backprop_depth} "
-        f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type}"
+        f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
+        f"swiglu_scale:{args.injection_swiglu_scale:g}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
