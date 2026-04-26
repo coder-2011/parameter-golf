@@ -55,6 +55,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    val_byte_count_override = float(os.environ.get("VAL_BYTE_COUNT_OVERRIDE", "0"))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.005))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -149,6 +150,13 @@ class Hyperparameters:
     coda_moe_num_experts = int(os.environ.get("CODA_MOE_NUM_EXPERTS", 0))
     coda_moe_top_k = int(os.environ.get("CODA_MOE_TOP_K", 1))
     coda_moe_mlp_mult = int(os.environ.get("CODA_MOE_MLP_MULT", 0))
+    deepseek_moe_num_base_experts = int(os.environ.get("DEEPSEEK_MOE_NUM_BASE_EXPERTS", 0))
+    deepseek_moe_expert_segments = int(os.environ.get("DEEPSEEK_MOE_EXPERT_SEGMENTS", 4))
+    deepseek_moe_shared_experts = int(os.environ.get("DEEPSEEK_MOE_SHARED_EXPERTS", 1))
+    deepseek_moe_active_experts = int(os.environ.get("DEEPSEEK_MOE_ACTIVE_EXPERTS", 0))
+    deepseek_moe_mlp_mult = int(os.environ.get("DEEPSEEK_MOE_MLP_MULT", os.environ.get("CODA_MOE_MLP_MULT", 0)))
+    deepseek_moe_balance_alpha = float(os.environ.get("DEEPSEEK_MOE_BALANCE_ALPHA", 0.0))
+    deepseek_moe_norm_topk_prob = bool(int(os.environ.get("DEEPSEEK_MOE_NORM_TOPK_PROB", "1")))
     poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
     poe_head_lr = float(os.environ.get("POE_HEAD_LR", os.environ.get("HEAD_LR", "0.008")))
     emb_scale = float(os.environ.get("EMB_SCALE", "1.0"))
@@ -1526,6 +1534,107 @@ class TopKMoE(nn.Module):
         return out_flat.reshape(orig_shape)
 
 
+class AddAuxiliaryLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, loss: Tensor | None) -> Tensor:
+        if loss is None:
+            ctx.required_aux_loss = False
+            ctx.dtype = x.dtype
+            return x
+        if loss.numel() != 1:
+            raise ValueError("auxiliary loss must be scalar")
+        ctx.required_aux_loss = loss.requires_grad
+        ctx.dtype = loss.dtype
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, Tensor | None]:
+        grad_loss = torch.ones((), dtype=ctx.dtype, device=grad_output.device) if ctx.required_aux_loss else None
+        return grad_output, grad_loss
+
+
+class DeepSeekMoE(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_base_experts: int,
+        expert_segments: int,
+        shared_experts: int,
+        active_experts: int,
+        mlp_class_name: str,
+        balance_alpha: float,
+        norm_topk_prob: bool,
+    ):
+        super().__init__()
+        if num_base_experts <= 0:
+            raise ValueError(f"num_base_experts must be positive, got {num_base_experts}")
+        if expert_segments <= 0:
+            raise ValueError(f"expert_segments must be positive, got {expert_segments}")
+        if hidden_dim % expert_segments != 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} must be divisible by expert_segments={expert_segments}"
+            )
+        self.total_fine_experts = num_base_experts * expert_segments
+        if shared_experts < 0 or shared_experts >= self.total_fine_experts:
+            raise ValueError(
+                f"shared_experts must be in [0, total_fine_experts), got {shared_experts} "
+                f"for total_fine_experts={self.total_fine_experts}"
+            )
+        if active_experts <= shared_experts or active_experts > self.total_fine_experts:
+            raise ValueError(
+                f"active_experts must be in (shared_experts, total_fine_experts], got "
+                f"active_experts={active_experts} shared_experts={shared_experts} "
+                f"total_fine_experts={self.total_fine_experts}"
+            )
+        self.shared_experts_count = shared_experts
+        self.routed_experts_count = self.total_fine_experts - shared_experts
+        self.routed_top_k = active_experts - shared_experts
+        self.balance_alpha = balance_alpha
+        self.norm_topk_prob = norm_topk_prob
+        expert_hidden_dim = hidden_dim // expert_segments
+        mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
+        self.router = CastedLinear(dim, self.routed_experts_count, bias=False)
+        self.routed_experts = nn.ModuleList(
+            mlp_cls(dim, expert_hidden_dim) for _ in range(self.routed_experts_count)
+        )
+        self.shared_experts = (
+            mlp_cls(dim, expert_hidden_dim * shared_experts)
+            if shared_experts > 0
+            else None
+        )
+
+    def _balance_loss(self, scores: Tensor, topk_idx: Tensor) -> Tensor | None:
+        if not self.training or self.balance_alpha <= 0.0:
+            return None
+        selected = F.one_hot(topk_idx.reshape(-1), num_classes=self.routed_experts_count).float()
+        ce = selected.mean(dim=0)
+        pi = scores.mean(dim=0)
+        fi = ce * self.routed_experts_count
+        return (pi * fi).sum() * self.balance_alpha
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])
+        scores = F.softmax(self.router(x_flat).float(), dim=-1)
+        topk_weight, topk_idx = torch.topk(scores, k=self.routed_top_k, dim=-1, sorted=False)
+        if self.norm_topk_prob and self.routed_top_k > 1:
+            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        routed_out = torch.zeros_like(x_flat)
+        for expert_idx, expert in enumerate(self.routed_experts):
+            rows, slots = (topk_idx == expert_idx).nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+            weights = topk_weight[rows, slots].to(dtype=x.dtype)
+            expert_out = expert(x_flat[rows]) * weights[:, None]
+            routed_out.index_add_(0, rows, expert_out)
+        if self.shared_experts is not None:
+            routed_out = routed_out + self.shared_experts(x_flat)
+        aux_loss = self._balance_loss(scores, topk_idx)
+        routed_out = AddAuxiliaryLoss.apply(routed_out, aux_loss)
+        return routed_out.reshape(orig_shape)
+
+
 class ParcaeCausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -1797,6 +1906,10 @@ class GPT(nn.Module):
         self.logit_scale = h.logit_scale
         self.coda_moe_num_experts = h.coda_moe_num_experts
         self.coda_moe_top_k = h.coda_moe_top_k
+        self.deepseek_moe_num_base_experts = h.deepseek_moe_num_base_experts
+        self.deepseek_moe_expert_segments = h.deepseek_moe_expert_segments
+        self.deepseek_moe_shared_experts = h.deepseek_moe_shared_experts
+        self.deepseek_moe_active_experts = h.deepseek_moe_active_experts
         self.poe_num_experts = h.poe_num_experts
         self.ple_scope = h.ple_scope
         self.ple_dim = h.ple_dim
@@ -1911,12 +2024,13 @@ class GPT(nn.Module):
             for i in range(self.n_layers_in_recurrent_block)
         )
         self.project_out = CastedLinear(self.recurrent_dim, self.outer_dim, bias=False)
+        coda_hidden_dim = h.mlp_mult * self.outer_dim
         self.coda = nn.ModuleList(
             TransformerPreNormBlock(
                 dim=self.outer_dim,
                 num_heads=h.num_heads,
                 num_kv_heads=h.num_kv_heads,
-                hidden_dim=h.mlp_mult * self.outer_dim,
+                hidden_dim=coda_hidden_dim,
                 rope_base=h.rope_base,
                 layer_id=i + self.coda_layer_offset,
                 n_layer=self.total_effective_layers,
@@ -1939,6 +2053,32 @@ class GPT(nn.Module):
             )
             for i in range(self.n_layers_in_coda)
         )
+        if h.deepseek_moe_num_base_experts > 0:
+            deepseek_hidden_dim = (h.deepseek_moe_mlp_mult or h.mlp_mult) * self.outer_dim
+            active_experts = h.deepseek_moe_active_experts or (
+                h.deepseek_moe_shared_experts + max(1, h.deepseek_moe_expert_segments - h.deepseek_moe_shared_experts)
+            )
+            for block in self.coda:
+                block.mlp = DeepSeekMoE(
+                    dim=self.outer_dim,
+                    hidden_dim=deepseek_hidden_dim,
+                    num_base_experts=h.deepseek_moe_num_base_experts,
+                    expert_segments=h.deepseek_moe_expert_segments,
+                    shared_experts=h.deepseek_moe_shared_experts,
+                    active_experts=active_experts,
+                    mlp_class_name=h.mlp_class_name,
+                    balance_alpha=h.deepseek_moe_balance_alpha,
+                    norm_topk_prob=h.deepseek_moe_norm_topk_prob,
+                )
+        elif h.coda_moe_num_experts > 0:
+            moe_hidden_dim = (h.coda_moe_mlp_mult or h.mlp_mult) * self.outer_dim
+            for block in self.coda:
+                block.mlp = TopKMoE(
+                    dim=self.outer_dim,
+                    hidden_dim=moe_hidden_dim,
+                    num_experts=h.coda_moe_num_experts,
+                    top_k=h.coda_moe_top_k,
+                )
         self.prelude_norm_layer = ParcaeRMSNorm(self.outer_dim) if self.prelude_norm else None
         self.final_norm = ParcaeRMSNorm(self.outer_dim)
         self.lm_head = None if h.tie_embeddings else CastedLinear(self.outer_dim, h.vocab_size, bias=False)
@@ -2032,9 +2172,15 @@ class GPT(nn.Module):
             if isinstance(module, CastedLinear):
                 if name == 'project_out':
                     continue
-                if name.endswith(('attn.c_proj', 'mlp.proj')):
+                is_moe_proj = (
+                    '.routed_experts.' in name and name.endswith('.proj')
+                ) or name.endswith('shared_experts.proj')
+                is_moe_fc = (
+                    '.routed_experts.' in name and name.endswith('.fc')
+                ) or name.endswith('shared_experts.fc')
+                if name.endswith(('attn.c_proj', 'mlp.proj')) or is_moe_proj:
                     std = (recurrent_std if name.startswith('core_block.') else base_std) / out_proj_divisor
-                elif name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'mlp.fc', 'lm_head')):
+                elif name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'mlp.fc', 'lm_head')) or is_moe_fc or name.endswith('mlp.router'):
                     std = recurrent_std if name.startswith('core_block.') else base_std
                 else:
                     continue
@@ -2451,6 +2597,42 @@ def main() -> None:
         )
     if args.coda_moe_mlp_mult < 0:
         raise ValueError(f"CODA_MOE_MLP_MULT must be non-negative, got {args.coda_moe_mlp_mult}")
+    if args.deepseek_moe_num_base_experts < 0:
+        raise ValueError(f"DEEPSEEK_MOE_NUM_BASE_EXPERTS must be non-negative, got {args.deepseek_moe_num_base_experts}")
+    if args.deepseek_moe_expert_segments <= 0:
+        raise ValueError(f"DEEPSEEK_MOE_EXPERT_SEGMENTS must be positive, got {args.deepseek_moe_expert_segments}")
+    if args.deepseek_moe_shared_experts < 0:
+        raise ValueError(f"DEEPSEEK_MOE_SHARED_EXPERTS must be non-negative, got {args.deepseek_moe_shared_experts}")
+    if args.deepseek_moe_active_experts < 0:
+        raise ValueError(f"DEEPSEEK_MOE_ACTIVE_EXPERTS must be non-negative, got {args.deepseek_moe_active_experts}")
+    if args.deepseek_moe_mlp_mult < 0:
+        raise ValueError(f"DEEPSEEK_MOE_MLP_MULT must be non-negative, got {args.deepseek_moe_mlp_mult}")
+    if args.deepseek_moe_balance_alpha < 0:
+        raise ValueError(f"DEEPSEEK_MOE_BALANCE_ALPHA must be non-negative, got {args.deepseek_moe_balance_alpha}")
+    if args.deepseek_moe_num_base_experts > 0:
+        total_fine_experts = args.deepseek_moe_num_base_experts * args.deepseek_moe_expert_segments
+        active_experts = args.deepseek_moe_active_experts or (
+            args.deepseek_moe_shared_experts + max(1, args.deepseek_moe_expert_segments - args.deepseek_moe_shared_experts)
+        )
+        hidden_dim = (args.deepseek_moe_mlp_mult or args.mlp_mult) * args.model_dim
+        if args.coda_moe_num_experts > 0:
+            raise ValueError("Use either DEEPSEEK_MOE_NUM_BASE_EXPERTS or CODA_MOE_NUM_EXPERTS, not both")
+        if args.deepseek_moe_shared_experts >= total_fine_experts:
+            raise ValueError(
+                f"DEEPSEEK_MOE_SHARED_EXPERTS must be less than total fine experts; got "
+                f"{args.deepseek_moe_shared_experts} for total {total_fine_experts}"
+            )
+        if active_experts <= args.deepseek_moe_shared_experts or active_experts > total_fine_experts:
+            raise ValueError(
+                f"DEEPSEEK_MOE_ACTIVE_EXPERTS (or derived active count) must be in "
+                f"(shared, total]; got active={active_experts} shared={args.deepseek_moe_shared_experts} "
+                f"total={total_fine_experts}"
+            )
+        if hidden_dim % args.deepseek_moe_expert_segments != 0:
+            raise ValueError(
+                f"DeepSeekMoE hidden dim {hidden_dim} must be divisible by "
+                f"DEEPSEEK_MOE_EXPERT_SEGMENTS={args.deepseek_moe_expert_segments}"
+            )
     if args.poe_num_experts < 1:
         raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
     if args.poe_head_lr < 0:
@@ -2679,6 +2861,22 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    if args.deepseek_moe_num_base_experts > 0:
+        active_experts = args.deepseek_moe_active_experts or (
+            args.deepseek_moe_shared_experts + max(1, args.deepseek_moe_expert_segments - args.deepseek_moe_shared_experts)
+        )
+        log0(
+            f"deepseek_moe:coda base_experts:{args.deepseek_moe_num_base_experts} "
+            f"segments:{args.deepseek_moe_expert_segments} "
+            f"shared:{args.deepseek_moe_shared_experts} active:{active_experts} "
+            f"routed_top_k:{active_experts - args.deepseek_moe_shared_experts} "
+            f"balance_alpha:{args.deepseek_moe_balance_alpha}"
+        )
+    elif args.coda_moe_num_experts > 0:
+        log0(
+            f"coda_moe:experts:{args.coda_moe_num_experts} top_k:{args.coda_moe_top_k} "
+            f"mlp_mult:{args.coda_moe_mlp_mult or args.mlp_mult}"
+        )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_backend:flash_attn4_wrapper has_flash_attn:{HAS_FLASH_ATTN}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
