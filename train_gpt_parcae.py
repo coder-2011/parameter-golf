@@ -109,13 +109,6 @@ class Hyperparameters:
     recurrent_rope_dims = int(os.environ.get("RECURRENT_ROPE_DIMS", rope_dims))
     recurrent_layer_rope_dims = os.environ.get("RECURRENT_LAYER_ROPE_DIMS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    ple_scope = os.environ.get("PLE_SCOPE", "none")
-    ple_dim = int(os.environ.get("PLE_DIM", 0))
-    ple_scale_init = float(os.environ.get("PLE_SCALE_INIT", "0.0"))
-    ple_init_std = float(os.environ.get("PLE_INIT_STD", "0.02"))
-    ple_placement = os.environ.get("PLE_PLACEMENT", "before")
-    ple_proj_optimizer = os.environ.get("PLE_PROJ_OPTIMIZER", "muon")
-    ple_norm = bool(int(os.environ.get("PLE_NORM", "1")))
     laurel_scope = os.environ.get("LAUREL_SCOPE", "none")
     laurel_rank = int(os.environ.get("LAUREL_RANK", 0))
     laurel_scale_init = float(os.environ.get("LAUREL_SCALE_INIT", "0.01"))
@@ -176,8 +169,6 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    ple_proj_lr = float(os.environ.get("PLE_PROJ_LR", "0.01" if ple_proj_optimizer == "adam" else str(matrix_lr)))
-    ple_scale_lr = float(os.environ.get("PLE_SCALE_LR", "0.004"))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -1457,35 +1448,6 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
-class PerLayerTokenEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, token_dim: int, out_dim: int, scale_init: float, init_std: float, norm_output: bool):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, token_dim)
-        self.proj = CastedLinear(token_dim, out_dim, bias=False)
-        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
-        self.norm_output = norm_output
-        nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
-        nn.init.normal_(self.proj.weight, mean=0.0, std=1.0 / math.sqrt(token_dim))
-
-    def forward(
-        self,
-        token_ids: Tensor,
-        dtype: torch.dtype,
-        return_raw: bool = False,
-        qat_bits: int = 0,
-    ) -> Tensor | tuple[Tensor, Tensor]:
-        weight = self.embed.weight
-        if self.training and qat_bits > 0:
-            weight = fake_quant_weight_ste(weight, qat_bits)
-        raw = self.proj(F.embedding(token_ids, weight))
-        if self.norm_output:
-            raw = F.rms_norm(raw.float(), (raw.size(-1),)).to(dtype=raw.dtype)
-        injected = self.scale.to(dtype=dtype) * raw
-        if return_raw:
-            return injected, raw
-        return injected
-
-
 class LinearCrossEntropyLoss(nn.Module):
     def __init__(
         self,
@@ -2012,12 +1974,6 @@ class GPT(nn.Module):
         self.activation_checkpoint_impl = h.activation_checkpoint_impl
         self.monitoring = h.monitoring
         self.latest_metrics: dict[str, Tensor] = {}
-        self._ple_stat_count = 0
-        self._ple_raw_rms: Tensor | None = None
-        self._ple_injected_rms: Tensor | None = None
-        self._ple_x_rms: Tensor | None = None
-        self._ple_ratio: Tensor | None = None
-        self._ple_scale_abs: Tensor | None = None
         self.extreme_monitoring = False
         self.step = 0
         self.qat_bits = h.qat_bits if h.qat_linear else 0
@@ -2034,37 +1990,10 @@ class GPT(nn.Module):
         self.deepseek_moe_shared_experts = h.deepseek_moe_shared_experts
         self.deepseek_moe_active_experts = h.deepseek_moe_active_experts
         self.poe_num_experts = h.poe_num_experts
-        self.ple_scope = h.ple_scope
-        self.ple_dim = h.ple_dim
-        self.ple_scale_init = h.ple_scale_init
-        self.ple_init_std = h.ple_init_std
-        self.ple_placement = h.ple_placement
-        self.ple_proj_optimizer = h.ple_proj_optimizer
-        self.ple_norm = h.ple_norm
         self.laurel_scope = h.laurel_scope
         self.laurel_rank = h.laurel_rank
         self.laurel_scale_init = h.laurel_scale_init
         self.laurel_norm = h.laurel_norm
-        valid_ple_scopes = {"none", "prelude", "core", "coda", "all"}
-        valid_ple_placements = {"before", "after"}
-        valid_ple_proj_optimizers = {"muon", "adam"}
-        if self.ple_scope not in valid_ple_scopes:
-            raise ValueError(f"PLE_SCOPE must be one of {sorted(valid_ple_scopes)}, got {self.ple_scope!r}")
-        if self.ple_placement not in valid_ple_placements:
-            raise ValueError(f"PLE_PLACEMENT must be one of {sorted(valid_ple_placements)}, got {self.ple_placement!r}")
-        if self.ple_proj_optimizer not in valid_ple_proj_optimizers:
-            raise ValueError(
-                f"PLE_PROJ_OPTIMIZER must be one of {sorted(valid_ple_proj_optimizers)}, "
-                f"got {self.ple_proj_optimizer!r}"
-            )
-        if self.ple_dim < 0:
-            raise ValueError(f"PLE_DIM must be non-negative, got {self.ple_dim}")
-        if self.ple_init_std <= 0.0:
-            raise ValueError(f"PLE_INIT_STD must be positive, got {self.ple_init_std}")
-        if self.ple_scope == "none" and self.ple_dim > 0:
-            raise ValueError("PLE_DIM > 0 requires PLE_SCOPE to be prelude, core, coda, or all")
-        if self.ple_scope != "none" and self.ple_dim == 0:
-            raise ValueError("PLE_SCOPE is enabled but PLE_DIM is 0")
         valid_laurel_scopes = {"none", "prelude", "core", "coda", "all"}
         if self.laurel_scope not in valid_laurel_scopes:
             raise ValueError(f"LAUREL_SCOPE must be one of {sorted(valid_laurel_scopes)}, got {self.laurel_scope!r}")
@@ -2269,10 +2198,6 @@ class GPT(nn.Module):
                 if h.use_value_embeddings and has_ve(i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block, self.total_effective_layers)
             }
         )
-        self.prelude_ple = nn.ModuleList()
-        self.core_ple = nn.ModuleList()
-        self.coda_ple = nn.ModuleList()
-
         self.register_buffer(
             'outer_freqs_cis',
             precompute_freqs_cis(self.outer_rope_dims, self.block_size, h.rope_base),
@@ -2284,78 +2209,16 @@ class GPT(nn.Module):
             persistent=False,
         )
         self._init_weights()
-        if self.ple_dim > 0:
-            if self.ple_scope in {"prelude", "all"}:
-                self.prelude_ple = self._make_ple_layers(self.n_layers_in_prelude, self.outer_dim)
-            if self.ple_scope in {"core", "all"}:
-                self.core_ple = self._make_ple_layers(self.n_layers_in_recurrent_block, self.recurrent_dim)
-            if self.ple_scope in {"coda", "all"}:
-                self.coda_ple = self._make_ple_layers(self.n_layers_in_coda, self.outer_dim)
         self.qat_linears = [module for module in self.modules() if isinstance(module, CastedLinear)]
         for module in self.qat_linears:
             module.qat_bits = self.qat_bits
             module.qat_enabled = False
-
-    def _make_ple_layers(self, count: int, out_dim: int) -> nn.ModuleList:
-        return nn.ModuleList(
-            PerLayerTokenEmbedding(
-                vocab_size=self.tok_emb.num_embeddings,
-                token_dim=self.ple_dim,
-                out_dim=out_dim,
-                scale_init=self.ple_scale_init,
-                init_std=self.ple_init_std,
-                norm_output=self.ple_norm,
-            )
-            for _ in range(count)
-        )
-
-    @torch.no_grad()
-    def _reset_ple_stats(self, device: torch.device) -> None:
-        self._ple_stat_count = 0
-        self._ple_raw_rms = torch.zeros((), device=device)
-        self._ple_injected_rms = torch.zeros((), device=device)
-        self._ple_x_rms = torch.zeros((), device=device)
-        self._ple_ratio = torch.zeros((), device=device)
-        self._ple_scale_abs = torch.zeros((), device=device)
-
-    @torch.no_grad()
-    def _record_ple_stats(self, x: Tensor, raw: Tensor, injected: Tensor, scale: Tensor) -> None:
-        x = x.detach()
-        raw = raw.detach()
-        injected = injected.detach()
-        scale = scale.detach()
-        x_rms = x.float().pow(2).mean().sqrt().clamp_min(1e-8)
-        raw_rms = raw.float().pow(2).mean().sqrt()
-        injected_rms = injected.float().pow(2).mean().sqrt()
-        assert self._ple_raw_rms is not None
-        assert self._ple_injected_rms is not None
-        assert self._ple_x_rms is not None
-        assert self._ple_ratio is not None
-        assert self._ple_scale_abs is not None
-        self._ple_raw_rms = self._ple_raw_rms + raw_rms
-        self._ple_injected_rms = self._ple_injected_rms + injected_rms
-        self._ple_x_rms = self._ple_x_rms + x_rms
-        self._ple_ratio = self._ple_ratio + injected_rms / x_rms
-        self._ple_scale_abs = self._ple_scale_abs + scale.float().abs()
-        self._ple_stat_count += 1
 
     def _embedding(self, emb: nn.Embedding, input_ids: Tensor) -> Tensor:
         weight = emb.weight
         if self.training and self._qat_enabled and self.qat_bits > 0:
             weight = fake_quant_weight_ste(weight, self.qat_bits)
         return F.embedding(input_ids, weight)
-
-    def _apply_ple(self, x: Tensor, layers: nn.ModuleList, layer_idx: int, input_ids: Tensor) -> Tensor:
-        if layer_idx >= len(layers):
-            return x
-        layer = layers[layer_idx]
-        qat_bits = self.qat_bits if self.training and self._qat_enabled else 0
-        if self.monitoring:
-            injected, raw = layer(input_ids, x.dtype, return_raw=True, qat_bits=qat_bits)
-            self._record_ple_stats(x, raw, injected, layer.scale)
-        else:
-            injected = layer(input_ids, x.dtype, qat_bits=qat_bits)
-        return x + injected
 
     def _laurel_rank_for(self, scope: str) -> int:
         return self.laurel_rank if self.laurel_scope in {scope, "all"} else 0
@@ -2437,17 +2300,11 @@ class GPT(nn.Module):
         if self.emb_scale != 1.0:
             input_embeds = input_embeds * self.emb_scale
         self._current_input_ids = input_ids
-        if self.monitoring:
-            self._reset_ple_stats(input_ids.device)
 
         x = input_embeds
         for i, block in enumerate(self.prelude):
             ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
-            if self.ple_placement == "before":
-                x = self._apply_ple(x, self.prelude_ple, i, input_ids)
             x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
-            if self.ple_placement == "after":
-                x = self._apply_ple(x, self.prelude_ple, i, input_ids)
 
         if self.prelude_norm_layer is not None:
             x = self.prelude_norm_layer(x)
@@ -2459,14 +2316,10 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.coda):
             ve = self._embedding(self.coda_value_embeds[str(i)], input_ids) if str(i) in self.coda_value_embeds else None
-            if self.ple_placement == "before":
-                x = self._apply_ple(x, self.coda_ple, i, input_ids)
             if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
                 x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
             else:
                 x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
-            if self.ple_placement == "after":
-                x = self._apply_ple(x, self.coda_ple, i, input_ids)
         if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
             x = self._checkpoint(self.final_norm, x)
         else:
@@ -2602,14 +2455,10 @@ class GPT(nn.Module):
             raise RuntimeError('current input ids are not set')
         for layer_idx, block in enumerate(self.core_block):
             ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
-            if self.ple_placement == "before":
-                x = self._apply_ple(x, self.core_ple, layer_idx, input_ids)
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
                 x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve)
             else:
                 x = block(x, freqs_cis, mask, x0=x0, ve=ve)
-            if self.ple_placement == "after":
-                x = self._apply_ple(x, self.core_ple, layer_idx, input_ids)
         return x
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
@@ -2794,22 +2643,6 @@ class GPT(nn.Module):
             'recurrent_residual': (x_rec - xk).norm(dim=-1).mean(),
             'rel_residual': ((x_rec - xk).norm(dim=-1) / x_rec.norm(dim=-1).clamp_min(1e-8)).mean(),
         }
-        if self._ple_stat_count > 0:
-            count = float(self._ple_stat_count)
-            assert self._ple_raw_rms is not None
-            assert self._ple_injected_rms is not None
-            assert self._ple_x_rms is not None
-            assert self._ple_ratio is not None
-            assert self._ple_scale_abs is not None
-            self.latest_metrics.update(
-                {
-                    'ple_raw_rms': self._ple_raw_rms / count,
-                    'ple_injected_rms': self._ple_injected_rms / count,
-                    'ple_x_rms': self._ple_x_rms / count,
-                    'ple_injected_ratio': self._ple_ratio / count,
-                    'ple_scale_abs': self._ple_scale_abs / count,
-                }
-            )
 
 
 # -----------------------------
@@ -2885,14 +2718,6 @@ def main() -> None:
         raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
     if args.poe_head_lr < 0:
         raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
-    if args.ple_proj_lr < 0:
-        raise ValueError(f"PLE_PROJ_LR must be non-negative, got {args.ple_proj_lr}")
-    if args.ple_scale_lr < 0:
-        raise ValueError(f"PLE_SCALE_LR must be non-negative, got {args.ple_scale_lr}")
-    if args.ple_placement not in {"before", "after"}:
-        raise ValueError(f"PLE_PLACEMENT must be before or after, got {args.ple_placement!r}")
-    if args.ple_proj_optimizer not in {"muon", "adam"}:
-        raise ValueError(f"PLE_PROJ_OPTIMIZER must be muon or adam, got {args.ple_proj_optimizer!r}")
     if args.injection_swiglu_scale < 0:
         raise ValueError(f"INJECTION_SWIGLU_SCALE must be non-negative, got {args.injection_swiglu_scale}")
     if args.residual_mode not in {"sequential", "parallel"}:
@@ -3052,35 +2877,18 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR or TIED_EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - PLE projection/scales can use dedicated Adam rates
     # - all remaining matrices use MATRIX_LR via Muon
     # - vectors/scalars/control params use SCALAR_LR via Adam
     named_params = list(base_model.named_parameters())
     def is_token_embedding_param(name: str) -> bool:
-        return name in {'tok_emb.weight', 'bigram_hash.embed.weight'} or (
-            name.startswith(('prelude_ple.', 'core_ple.', 'coda_ple.')) and name.endswith('.embed.weight')
-        )
-
-    def is_ple_proj_param(name: str) -> bool:
-        return name.startswith(('prelude_ple.', 'core_ple.', 'coda_ple.')) and name.endswith('.proj.weight')
-
-    def is_ple_scale_param(name: str) -> bool:
-        return name.startswith(('prelude_ple.', 'core_ple.', 'coda_ple.')) and name.endswith('.scale')
+        return name in {'tok_emb.weight', 'bigram_hash.embed.weight'}
 
     matrix_params = []
     scalar_params = []
-    ple_proj_params = []
-    ple_scale_params = []
     for name, p in named_params:
         if not p.requires_grad:
             continue
         if is_token_embedding_param(name):
-            continue
-        if args.ple_proj_optimizer == "adam" and is_ple_proj_param(name):
-            ple_proj_params.append(p)
-            continue
-        if is_ple_scale_param(name):
-            ple_scale_params.append(p)
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
@@ -3117,22 +2925,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
-    if ple_proj_params:
-        optimizer_ple_proj = torch.optim.Adam(
-            [{'params': ple_proj_params, 'lr': args.ple_proj_lr, 'base_lr': args.ple_proj_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_ple_proj)
-    if ple_scale_params:
-        optimizer_ple_scale = torch.optim.Adam(
-            [{'params': ple_scale_params, 'lr': args.ple_scale_lr, 'base_lr': args.ple_scale_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_ple_scale)
     optimizers.append(optimizer_scalar)
     head_params = []
     if base_model.lm_head is not None:
@@ -3181,18 +2973,6 @@ def main() -> None:
         f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
         f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
         f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale}"
-    )
-    ple_params = sum(
-        p.numel()
-        for modules in (base_model.prelude_ple, base_model.core_ple, base_model.coda_ple)
-        for module in modules
-        for p in module.parameters()
-    )
-    log0(
-        f"ple:scope:{args.ple_scope} dim:{args.ple_dim} scale_init:{args.ple_scale_init:g} "
-        f"init_std:{args.ple_init_std:g} placement:{args.ple_placement} norm:{args.ple_norm} "
-        f"proj_optimizer:{args.ple_proj_optimizer} proj_lr:{args.ple_proj_lr:g} "
-        f"scale_lr:{args.ple_scale_lr:g} params:{ple_params}"
     )
     laurel_params = sum(
         p.numel()
@@ -3245,36 +3025,6 @@ def main() -> None:
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-    def grad_norm_for(suffix: str) -> float:
-        total = torch.zeros((), device=device)
-        for name, param in base_model.named_parameters():
-            if name.startswith(('prelude_ple.', 'core_ple.', 'coda_ple.')) and name.endswith(suffix) and param.grad is not None:
-                total = total + param.grad.detach().float().pow(2).sum()
-        return float(total.sqrt().item())
-
-    def ple_train_log_suffix() -> str:
-        if args.ple_dim <= 0:
-            return ""
-        metrics = base_model.latest_metrics
-        parts = []
-        for key in (
-            'ple_scale_abs',
-            'ple_raw_rms',
-            'ple_injected_rms',
-            'ple_x_rms',
-            'ple_injected_ratio',
-        ):
-            if key in metrics:
-                parts.append(f"{key}:{float(metrics[key].item()):.6g}")
-        parts.extend(
-            [
-                f"ple_embed_grad:{grad_norm_for('.embed.weight'):.6g}",
-                f"ple_proj_grad:{grad_norm_for('.proj.weight'):.6g}",
-                f"ple_scale_grad:{grad_norm_for('.scale'):.6g}",
-            ]
-        )
-        return " " + " ".join(parts)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     if max_wallclock_ms is not None and args.gptq_enabled and args.gptq_reserve_seconds > 0.0:
@@ -3405,7 +3155,6 @@ def main() -> None:
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        ple_log_suffix = ple_train_log_suffix() if should_log_train else ""
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -3417,7 +3166,6 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f"{ple_log_suffix}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
