@@ -72,3 +72,7 @@ Focused checks run:
 Refactor caveat: cleanup extracted `_validation_result`, `_rank_bounds`, `_token_byte_sum`, `_ttt_chunk_windows`, and `_window_batch`. This reduced repeated logic and made metric handling safer, but it did not shrink line count. If minimizing code size becomes the priority, `_window_batch` is the least essential helper.
 
 Performance caveat: no full Scylla TTT run has proven this helps. Quantized-weight SGD TTT remains experimental and may hurt.
+
+## 2026-04-26 Validation scorer alignment
+
+`train_gpt_parcae.py::eval_val` was changed back to the same main scorer body as canonical `train_gpt.py::eval_val`: same sequence partitioning, contiguous next-token windows, bf16 autocast model loss, token-byte LUT calculation, distributed all-reduce order, and BPB formula. The only intentional extra line is `VAL_BYTE_COUNT_OVERRIDE`, applied after byte-count all-reduce for Scylla denominator control. An AST body comparison passed with that override line ignored.
