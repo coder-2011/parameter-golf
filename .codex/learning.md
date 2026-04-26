@@ -159,6 +159,10 @@ Silent no-ops are now guarded: `XSA_LAST_N>0`, explicit `NUM_LAYERS`, and explic
 
 `train_gpt_parcae.py` no longer carries the default-off PLE-lite path. The PLE env knobs, per-layer token embedding module, forward injections, PLE monitoring metrics, dedicated optimizer groups, and PLE train-log suffix were removed to keep the active experiment surface smaller.
 
+## 2026-04-26 RWKV-v7 Muon port
+
+`RWKV-LM-V7` now has a default-off `--optimizer muon` path. The port keeps AdamW as the default and uses manual optimization only for Muon mode. Muon is applied to hidden 2D matrix parameters, while `emb.weight`, `head.weight`, vectors/scalars, norms, and `blocks.*.att.r_k` stay on AdamW. Follow-up needed before serious Muon runs: the training callback still schedules only `trainer.optimizers[0]`, so multi-optimizer LR and momentum scheduling needs an audit.
+
 ## 2026-04-26 RWKV SP1892 BPB path
 
 `RWKV-LM-V7/eval_fineweb_bpb.py` mirrors the Parcae SentencePiece byte accounting: byte pieces count as one byte, normal pieces count their UTF-8 payload bytes after stripping leading `▁`, and a leading `▁` adds one space byte only when the previous token is not a boundary/control token. The reported BPB is `loss_sum / (ln(2) * scored_bytes)`. Local SP1892 artifacts are not present yet; the checked-in data currently has only `data/datasets/fineweb10B_sp1024` and `data/tokenizers/fineweb_1024_bpe.model`.
