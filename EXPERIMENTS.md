@@ -69,8 +69,17 @@ Implementation behavior:
 
 Current caveats:
 
-- No completed result proves this injection helps.
+- A completed scale `0.1` result did not help.
 - The default was changed from an earlier local `0.1` to `0.0` to keep the new branch inactive by default.
+
+Completed check:
+
+| Run | Injection | Corrected BPB | Logged BPB | Exact loss | Steps | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `logs/exp_scylla_poe3_diag_scale_compare_300_rerun.txt` | `diagonal` | `1.73644542` | `1.63007385` | `2.91578821` | 1991 | Baseline; omitted byte override, corrected from exact loss |
+| `logs/exp_scylla_poe3_swiglu_add_scale0p1_compare_300.txt` | `swiglu-add`, scale `0.1` | `1.79727366` | `1.68717587` | `3.01792921` | 2017 | Worse despite slightly faster step time |
+
+Interpretation: raw additive SwiGLU token reinjection at scale `0.1` is too disruptive. If revisited, use a much smaller scale, a learned zero-init gate, or modulation of the existing diagonal path instead of an additional raw residual injection.
 
 ### Validation scorer alignment
 

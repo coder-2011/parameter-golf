@@ -71,7 +71,21 @@ Focused checks run:
 
 Refactor caveat: cleanup extracted `_validation_result`, `_rank_bounds`, `_token_byte_sum`, `_ttt_chunk_windows`, and `_window_batch`. This reduced repeated logic and made metric handling safer, but it did not shrink line count. If minimizing code size becomes the priority, `_window_batch` is the least essential helper.
 
-Performance caveat: no full Scylla TTT run has proven this helps. Quantized-weight SGD TTT remains experimental and may hurt.
+Performance update: `runs/exp_scylla_poe3_diag_ttt_compare_300.console.log` completed a local score-first TTT pass with `VAL_BYTE_COUNT_OVERRIDE`, improving roundtrip BPB from `1.73147091` to `1.68571400`, but the TTT eval pass took `682647ms`. Treat TTT as promising but too slow for a competition-ready default until optimized.
+
+## 2026-04-26 diagnostic and architecture triage
+
+Current belief from checkpoint diagnostics: no token-collapse degeneracy was found, but recurrent state scale is pathological. Trained recurrent norms reached roughly `85-622` while final hidden norms were normalized to roughly `1.1-1.5`; recurrent relative residual stayed around `0.39-0.42`, so the loop is active rather than a no-op. Output matrices are full rank with `r99` around `229-235`, so the stronger bottleneck is hidden/latent utilization and recurrent scale management rather than output-rank collapse.
+
+Architecture triage:
+
+| idea | note |
+|---|---|
+| DeepSeek/Gemma MoE | tested coda top-1 MoE lost; do not revisit without router diagnostics |
+| MTP | auxiliary only under current evaluator; BPB path scores shifted next-token CE |
+| TensorSLM/LBLLM | artifact-budget tools, not direct BPB improvements unless offline reconstruction/distillation preserves BPB |
+| Gemma 4 PLE | promising as small zero-init PLE-lite/token-conditioning, safer than raw additive reinjection |
+| Kimi/Gated Delta | possible later recurrent-core test after live latent diagnostics |
 
 ## 2026-04-26 Validation scorer alignment
 
