@@ -134,3 +134,13 @@ First 300s Scylla PoE3/bigram8192 tests with `PLE_SCOPE=none` and `TTT_ENABLED=0
 Keeping roughly the same effective block count but removing recurrent reuse helped the 300s Scylla PoE3/bigram8192 local baseline: `N_LAYERS_IN_PRELUDE=1 N_LAYERS_IN_RECURRENT_BLOCK=4 N_LAYERS_IN_CODA=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1`, with PLE/LAuReL/TTT off, reached exact int8 roundtrip BPB `1.72512145` at `1601` steps. It was slower than the recurrent baseline (`~187.5ms/step` vs about `165ms/step`) and larger (`8,026,003` byte int8+zlib model), but beat the matched recent recurrent 300s rerun around `1.73508599`. This suggests recurrence reuse is not clearly paying for the local 300s budget, even if the best longer/solo recurrent result remains around `1.69`.
 
 Larger width/depth recurrence was strongly negative: `MODEL_DIM=512 RECURRENT_DIM=512 N_LAYERS_IN_PRELUDE=2 N_LAYERS_IN_RECURRENT_BLOCK=3 N_LAYERS_IN_CODA=3 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=1`, with PLE/LAuReL/TTT off, reached exact int8 roundtrip BPB `1.80886096` at `1114` steps. It was too slow (`~269.5ms/step`) and over budget (`23,913,791` byte int8+zlib model, `24,072,355` bytes with code). Do not chase this 512-wide recurrent shape as-is.
+
+## 2026-04-26 Parcae audit fixes
+
+`train_gpt_parcae.py` was cleaned up after a source-level audit found correctness footguns. Defaults now use deterministic zero recurrent state, monitoring off, and value embeddings off. Legacy random state modes still work during training but evaluate as zero state so validation is deterministic. Warmup now restores Python, NumPy, CPU torch, and CUDA RNG states.
+
+Correctness fixes landed: distributed train loader uses one shared overlap token instead of dropping rank-boundary targets; `QK_BIAS=1` now has separate query/KV-head bias tensors for GQA; value embeddings are small-initialized if enabled; GPTQ sigma clipping is capped by row amax; QAT covers token, bigram, PLE, and value embedding lookups; low-bit `QUANT_BITS<8` now packs payloads instead of storing int8-shaped tensors; TTT distributed gradient sync is token-weighted for uneven local batches.
+
+Silent no-ops are now guarded: `XSA_LAST_N>0`, explicit `NUM_LAYERS`, and explicit `QK_GAIN_INIT` fail fast in `train_gpt_parcae.py`. Timed runs skip step-0 validation and raw `final_model.pt` save unless `SAVE_RAW_MODEL=1`.
+
+`RECURRENT_INTERMEDIATE_DIM` now defaults to `MLP_MULT * RECURRENT_DIM`; `scripts/run_parcae_scylla_current_best.sh` pins `RECURRENT_INTERMEDIATE_DIM=1024` to preserve the old 4x current-best shape.
