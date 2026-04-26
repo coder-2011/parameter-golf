@@ -1,5 +1,232 @@
 # Experiment Notes
 
+## 2026-04-25 Scylla / XSA / MoE / PoE session
+
+This section is the central record for the Scylla tokenizer/scoring work, Parcae-recipe checks, XSA analysis, coda-only MoE attempt, and Product-of-Experts output-head tuning.
+
+### Current best from this session
+
+The best result from this session is the Scylla current-best recurrent stack with 3 total categorical PoE experts and a lower extra-head LR.
+
+| Field | Value |
+| --- | --- |
+| Exact final BPB | **1.69388607** |
+| Exact final loss | **2.90802014** |
+| Run log | `logs/exp_scylla_poe3_lr0p002_full_2000.txt` |
+| Key delta | `POE_NUM_EXPERTS=3 POE_HEAD_LR=0.002` |
+| Base launcher | `scripts/run_parcae_scylla_current_best.sh` |
+| Scylla data | `data_scylla/fineweb_scylla` |
+| Tokenizer | `data_scylla/tokenizers/scylla/candidate.vocab` |
+| Tokenizer metadata | `data_scylla/tokenizers/scylla/candidate.meta.npz` |
+| Corrected val byte count | `VAL_BYTE_COUNT_OVERRIDE=151080363` |
+| Total int8+zlib submission size | 5,348,437 bytes |
+
+Current Scylla leaderboard from this session:
+
+| Rank | Variant | Exact / corrected BPB | Notes |
+| ---: | --- | ---: | --- |
+| 1 | PoE3, `POE_HEAD_LR=0.002` | **1.69388607** | Current best |
+| 2 | Dense Scylla baseline, corrected | about **1.69637493** | Log was pre-byte-override, corrected from exact val loss |
+| 3 | PoE3, `POE_HEAD_LR=0.0025` | 1.69787138 | Best of second PoE sweep |
+| 4 | PoE3, `POE_HEAD_LR=0.001` | 1.69919329 | Worse than `0.002` |
+| 5 | PoE3, `POE_HEAD_LR=0.008` | 1.69923407 | Initial PoE try, too aggressive |
+| 6 | PoE2, `POE_HEAD_LR=0.004` | 1.70085542 | Worse |
+| 7 | XSA4 corrected | about 1.70250566 | XSA implementation is correct but hurt here |
+| 8 | Eff8 prelude/coda + XSA3 | 1.70473223 | More effective layers plus XSA hurt |
+| 9 | Coda MoE4 top-1 | 1.71156502 | Worse |
+
+### Current-best Scylla base config
+
+Unless otherwise noted, the Scylla experiments used the current recurrent stack:
+
+| Setting | Value |
+| --- | --- |
+| `DATA_PATH` | `/workspace/parameter-golf/data_scylla/fineweb_scylla` |
+| `TOKENIZER_PATH` | `/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.vocab` |
+| `TOKENIZER_META_PATH` | `/workspace/parameter-golf/data_scylla/tokenizers/scylla/candidate.meta.npz` |
+| `VOCAB_SIZE` | `998` |
+| `VAL_BYTE_COUNT_OVERRIDE` | `151080363` |
+| `MODEL_DIM` / `RECURRENT_DIM` | `256` / `256` |
+| `NUM_HEADS` / `NUM_KV_HEADS` | `4` / `2` |
+| `RECURRENT_NUM_HEADS` | `4` |
+| `N_LAYERS_IN_PRELUDE` / core / coda | `1` / `2` / `1` |
+| `MEAN_RECURRENCE` / `MEAN_BACKPROP_DEPTH` | `2` / `1` |
+| `TRAIN_SEQ_LEN` / `TRAIN_BATCH_TOKENS` | `512` / `16384` |
+| `MLP_MULT` | `3` |
+| `QK_NORM` | `1` |
+| `USE_VALUE_EMBEDDINGS` | `0` |
+| BigramHash | `BIGRAM_HASH_BUCKETS=4096 BIGRAM_HASH_DIM=128 BIGRAM_HASH_HEADS=2 BIGRAM_HASH_GATE=1` |
+
+### Scylla tokenizer and byte-count work
+
+Implemented Scylla / TokenMonster metadata support in `train_gpt_parcae.py` and wired defaults into `scripts/run_parcae_scylla_current_best.sh`.
+
+Code support added:
+
+| Item | Purpose |
+| --- | --- |
+| `TOKENIZER_META_PATH` | Direct path for tokenizer metadata `.npz` |
+| `TOKENIZER_META_VALIDATE` | Optional metadata validation path |
+| Non-`.model` metadata discovery | Allows `candidate.vocab` to find `candidate.meta.npz` |
+| Strict metadata vocab-size check | Prevents silent tokenizer/model mismatch |
+| `VAL_BYTE_COUNT_OVERRIDE` | Uses a corrected validation-byte denominator for TokenMonster capcode |
+
+Scylla files placed and checked:
+
+| File | Purpose |
+| --- | --- |
+| `data_scylla/fineweb_scylla/fineweb_train_000000.bin` | Scylla training shard |
+| `data_scylla/fineweb_scylla/fineweb_val_000000.bin` | Scylla validation shard |
+| `data_scylla/tokenizers/scylla/candidate.vocab` | TokenMonster tokenizer vocab |
+| `data_scylla/tokenizers/scylla/candidate.meta.npz` | Tokenizer byte metadata |
+
+Checks:
+
+- SHA256 checksums matched `data_scylla/SHA256SUMS.txt`.
+- `candidate.vocab` loads with TokenMonster and reports vocab size 998.
+- `candidate.meta.npz` has `tokenizer_kind=tokenmonster`, vocab size 998, and arrays of shape `(998,)`.
+- Metadata per-token decoded byte lengths match `id_to_token_decoded(...).encode("utf-8")`.
+- Full validation byte accounting does not equal the summed per-token metadata because TokenMonster capcode is context-dependent.
+
+Byte-count measurements:
+
+| Measurement | Value |
+| --- | ---: |
+| Scylla metadata-summed validation byte count | 157,319,833 |
+| TokenMonster decoded Scylla validation bytes | about 151,073,500 |
+| SP1024 full validation bytes | 151,080,891 |
+| SP1024 seq512 scored validation bytes used for comparable BPB | 151,080,363 |
+
+Conclusion: Scylla is usable in this codebase, but BPB must use the corrected denominator for the current seq512 evaluation setup: `VAL_BYTE_COUNT_OVERRIDE=151080363`. Old Scylla logs before this override have metadata BPB that is too optimistic and must be corrected from exact `val_loss`.
+
+### Official Parcae recipe comparison and small recipe checks
+
+Official Parcae-style settings we identified as missing or inactive in the local current-best runs:
+
+| Item | Local status at the time | Official-style setting |
+| --- | --- | --- |
+| Prelude norm | off by default | `PRELUDE_NORM=1` |
+| Gradient clipping | off by default | `GRAD_CLIP_NORM=1.0` |
+| Recurrence sampling | fixed per-batch | per-sequence, poisson-truncated-full |
+| Injection optimizer treatment | `B` still goes through matrix optimizer/WD path | no weight decay for injection params |
+| Init recipe | close but not exact | scaled-zero + orthogonal details |
+| Partial-depth eval / recurrence diagnostics | lighter | richer official diagnostics |
+
+Focused checks run around the recurrent `2/1` SP1024 baseline:
+
+| Run | Log | Config delta | Final exact BPB | Notes |
+| --- | --- | --- | ---: | --- |
+| Prelude norm 1930-step | `runs/exp_recur2_bptt1_preludenorm_1930/logs/exp_recur2_bptt1_preludenorm_1930.txt` | `PRELUDE_NORM=1` | 1.71984287 | Worse |
+| Grad clip 1930-step | `runs/exp_recur2_bptt1_clip_1930/logs/exp_recur2_bptt1_clip_1930.txt` | `GRAD_CLIP_NORM=1.0` | 1.71223512 | Worse than best, better than prelude norm alone |
+| Prelude norm + grad clip solo | `runs/exp_recur2_bptt1_preludenorm_clip_solo/logs/exp_recur2_bptt1_preludenorm_clip_solo.txt` | `PRELUDE_NORM=1 GRAD_CLIP_NORM=1.0` | 1.70760220 | Did not beat `1.70106946` |
+| QK gain 5.25 solo | `runs/exp_recur2_bptt1_qkgain525_solo/logs/exp_recur2_bptt1_qkgain525_solo.txt` | `QK_GAIN_INIT=5.25` | 1.71530074 | Worse |
+| No-loop current stack solo | `runs/exp_noloop_currentstack_solo/logs/exp_noloop_currentstack_solo.txt` | no recurrence with current stack | 1.71097365 | Faster but did not beat recurrence |
+
+Conclusion: for the local short-budget setup, simply adding prelude norm, grad clipping, or higher QK gain did not improve the recurrent best. Recurrence still helped versus the no-loop current-stack rerun.
+
+### XSA implementation profile and experiments
+
+XSA behavior was checked directly before interpreting experiment results.
+
+Implementation checks:
+
+- `_xsa_efficient` matched an explicit `repeat_interleave` reference exactly in fp32.
+- Post-XSA value-aligned projection was near zero in fp32 and small in bf16.
+- Zero-value inputs did not produce NaNs.
+- Gradients remained finite.
+- Routing checks matched expected active layers: XSA4 on depth 6 activated `[2, 3, 4, 5]`; XSA3 on effective depth 8 activated `[5, 6, 7]`; XSA0 made zero calls.
+
+Experiment results:
+
+| Run | Config | Exact / corrected BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_xsa4_full_2000.txt` | current Scylla stack, `XSA_LAST_N=4` | about 1.70250566 corrected | Worse than dense |
+| `logs/exp_scylla_eff8_p2c2_xsa3_full_2000.txt` | prelude 2, core 2, coda 2, `XSA_LAST_N=3` | 1.70473223 | Worse |
+
+Interpretation: XSA appears correctly implemented, but it likely removes useful value-aligned state in late recurrent/coda layers. If revisited, test weaker or more targeted variants: last-1 only, coda-only, fractional subtraction, or scheduled XSA.
+
+### Coda-only MoE implementation and experiment
+
+Implemented configurable coda-only MoE in `train_gpt_parcae.py`.
+
+Added knobs:
+
+| Variable | Meaning |
+| --- | --- |
+| `CODA_MOE_NUM_EXPERTS` | Enables MoE only in coda blocks when greater than zero |
+| `CODA_MOE_TOP_K` | Sparse top-k routing count |
+| `CODA_MOE_MLP_MULT` | Optional expert MLP width multiplier override |
+
+Implementation notes:
+
+- Prelude and recurrent core remain dense.
+- Coda blocks can use `TopKMoE` instead of the dense MLP.
+- Router gradient handling was fixed to gather full-softmax probabilities over selected experts. The first top-k-only softmax form collapses router gradients for top-1 routing.
+- Expert fc/proj/router init is handled in `_init_weights`.
+
+Experiment:
+
+| Run | Config | Exact BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_coda_moe4_top1_full_2000.txt` | `CODA_MOE_NUM_EXPERTS=4 CODA_MOE_TOP_K=1` | 1.71156502 | Worse than dense and PoE |
+
+Conclusion: coda-only top-1 MoE did not help in this tested form. If revisited, change routing dynamics rather than simply adding more experts: smaller router LR, top-2, router temperature, delayed MoE activation, or router warmup.
+
+### Product-of-Experts output heads
+
+Implemented token-level categorical Product of Experts output heads in `train_gpt_parcae.py`.
+
+Added knobs:
+
+| Variable | Meaning |
+| --- | --- |
+| `POE_NUM_EXPERTS` | Total categorical experts, including the base tied/untied output head |
+| `POE_HEAD_LR` | Adam LR for extra PoE output heads |
+
+Implementation notes:
+
+- Final logits are the sum of base logits plus extra expert logits.
+- This implements categorical PoE because `softmax(sum_i logits_i)` is proportional to the product of the expert categorical distributions.
+- Extra PoE heads are zero-init, so `POE_NUM_EXPERTS>1` starts as a no-op.
+- Extra heads are excluded from Muon/scalar groups and optimized with the head Adam path.
+- `POE_NUM_EXPERTS=1` preserves baseline behavior.
+
+Initial PoE result:
+
+| Run | Config | Exact BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_poe3_full_2000.txt` | `POE_NUM_EXPERTS=3 POE_HEAD_LR=0.008` | 1.69923407 | Close but worse than corrected dense baseline |
+
+PoE sweep 1:
+
+| Run | Config | Exact BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_poe2_lr0p004_full_2000.txt` | 2 experts, lr `0.004` | 1.70085542 | Worse |
+| `logs/exp_scylla_poe2_lr0p002_full_2000.txt` | 2 experts, lr `0.002` | 1.70887737 | Worse |
+| `logs/exp_scylla_poe3_lr0p004_full_2000.txt` | 3 experts, lr `0.004` | 1.70408370 | Worse |
+| `logs/exp_scylla_poe3_lr0p002_full_2000.txt` | 3 experts, lr `0.002` | **1.69388607** | Best |
+
+PoE sweep 2:
+
+| Run | Config | Exact BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_poe3_lr0p0010_full_2000.txt` | 3 experts, lr `0.001` | 1.69919329 | Worse |
+| `logs/exp_scylla_poe3_lr0p0015_full_2000.txt` | 3 experts, lr `0.0015` | 1.70530234 | Worse |
+| `logs/exp_scylla_poe3_lr0p0025_full_2000.txt` | 3 experts, lr `0.0025` | 1.69787138 | Best of sweep 2, still worse than lr `0.002` |
+| `logs/exp_scylla_poe4_lr0p0015_full_2000.txt` | 4 experts, lr `0.0015` | 1.70043171 | Worse and larger artifact |
+
+Conclusion: PoE is now the best tested path, but the simple count/LR response is sharp. `POE_NUM_EXPERTS=3 POE_HEAD_LR=0.002` is the current best. The next PoE work should be structural, not another small scalar LR sweep: delayed PoE-head activation, extra-head LR warmup, extra-head logit scaling, expert dropout/gating, or a clean solo rerun of the best setting.
+
+### Scale test status
+
+An attempted larger Scylla scale run was started as `logs/exp_scylla_scale448_full_2000.txt` with roughly 10.6M params, but it stopped during or near warmup and has no final comparable result. There is currently no proof that PoE scales to the 16MB-ish setting; a paired dense-vs-PoE scale test is still required.
+
+### Caveats from this session
+
+- Several Scylla baseline/XSA logs were produced before `VAL_BYTE_COUNT_OVERRIDE`; their exact logged BPB is metadata-denominator BPB and must be corrected from exact val loss.
+- Some sweeps ran concurrently. The validation lines are usable, but concurrent final export/eval can race on shared `final_model*` filenames. If a result is promoted as official, rerun it alone.
+- The dense Scylla baseline should be rerun with the current override for a clean paired official comparison against PoE.
+
 ## Current Recurrent Working Model
 
 This is the best recurrent Parcae model so far and the current working baseline for recurrent tuning.
@@ -54,6 +281,65 @@ BIGRAM_HASH_HEADS=2 \
 BIGRAM_HASH_GATE=1 \
 python train_gpt_parcae.py
 ```
+
+## Hyperloop / Hyperconnection Attempt
+
+Status as of 2026-04-25: deprioritize as a main path. The best Hyperloop result is still worse than both the comparable recurrent `2/2` baseline and the current `2/1` SOTA.
+
+Implementation lived in the separate worktree `/workspace/parameter-golf-hyperconn` on branch `hyperconn-loop`.
+The main checkout was left untouched except for this experiment note.
+
+Implemented behavior:
+
+- Added loop-level Hyperloop-style hyperconnections for the recurrent middle block.
+- Duplicated the post-prelude residual stream into `HYPERCONN_STREAMS` parallel streams.
+- Used input-dependent `H_pre`, `H_post`, and diagonal sigmoid `H_res` per loop.
+- Added loop position embeddings.
+- Applied hyperconnections only after each complete recurrent loop, not after every layer.
+- Removed the existing Parcae adapter when Hyperloop is enabled, so this tested replacing that recurrent residual adapter with Hyperloop routing.
+- Current implementation requires `MEAN_BACKPROP_DEPTH == MEAN_RECURRENCE`, which prevents a direct comparison to the current `2/1` SOTA.
+- Added diagnostics via `HYPERCONN_DIAG_SEQS`: per-loop gate stats, per-stream norms, and inter-stream cosine similarity after final roundtrip validation.
+
+Focused checks run before trusting numbers:
+
+- `python -m py_compile train_gpt_parcae.py`
+- `git diff --check`
+- Disabled-path equivalence to the pre-Hyperloop script for state keys, initialized weights, and deterministic loss.
+- Gate math checks for duplicate streams, read/write equations, expected `H_post` and `H_res` initial values, and input-dependent nonzero gates.
+- Integrated recurrence check against a hand-computed deterministic middle block.
+- Gradient and optimizer checks confirming hyperconnection parameters receive gradients and use their own Adam group through `HYPERCONN_LR`.
+- Quantization/roundtrip checks confirming hyperconnection control tensors restore as fp32.
+- Tiny CUDA smoke/stress tests after the LR split confirmed training no longer collapsed.
+
+Run results:
+
+| Run | Log | Config delta | Final BPB | Steps | Notes |
+| --- | --- | --- | ---: | ---: | --- |
+| Pre-fix Hyperloop | `/workspace/parameter-golf-hyperconn/runs/hyperconn_stream4_recur2_bptt2_solo_20260425/logs/hyperconn_stream4_recur2_bptt2_solo_20260425.txt` | Hyperconn params accidentally used `SCALAR_LR=0.04` | 4.10520466 | 1429 | Invalid. Gates saturated; logits collapsed to zero and train loss stuck at `6.9315`. |
+| Hyperloop fixed LR | `/workspace/parameter-golf-hyperconn/logs/hyperconn_stream4_recur2_bptt2_lr001_rerun_20260425.txt` | `HYPERCONN_LR=0.001`, `HYPERCONN_RES_INIT=0.05`, streams 4 | 1.72230267 | 1424 | Healthy training but worse than recurrent baselines. |
+| Hyperloop ablation A | `/workspace/parameter-golf-hyperconn/logs/hyperconn_ablate_A_lr3e4_res005_clean_20260425.txt` | `HYPERCONN_LR=0.0003`, `HYPERCONN_RES_INIT=0.05`, streams 4 | 1.71694044 | 1430 | Best Hyperloop result so far; still worse than the comparable recurrent `2/2` baseline. |
+| Hyperloop ablation B | `/workspace/parameter-golf-hyperconn/logs/hyperconn_ablate_B_lr3e4_res05_clean_20260425.txt` | `HYPERCONN_LR=0.0003`, `HYPERCONN_RES_INIT=0.5`, streams 4 | not completed | stopped at 400 | Aborted because external main-checkout workers started sharing the GPU; do not use this partial run. |
+
+Comparisons:
+
+- Current real SOTA: `1.70106946` BPB with `MEAN_RECURRENCE=2`, `MEAN_BACKPROP_DEPTH=1`.
+- Comparable recurrent `2/2` baseline with seq512, MLP3, gated 2-head BigramHash: `1.71261107` BPB.
+- Best Hyperloop so far: `1.71694044` BPB.
+- Best Hyperloop is `+0.01587098` BPB worse than current SOTA and `+0.00432937` BPB worse than the comparable recurrent `2/2` baseline.
+
+Diagnostics:
+
+- The fixed-LR Hyperloop run was active, not dead: gates learned strongly input-dependent routing.
+- With `HYPERCONN_LR=0.001`, gates were extreme. Loop 0 wrote almost entirely to one stream, causing major norm imbalance, and loop 1 nearly reset that stream.
+- Raw and int8 roundtrip diagnostics were nearly identical, so quantization was not the cause.
+- Lowering `HYPERCONN_LR` to `0.0003` improved BPB from `1.72230267` to `1.71694044` and reduced `H_pre` saturation.
+- However, ablation A still showed stream recollapse: final post-loop stream cosine mean was `0.990655`, so the model paid for multi-stream routing without retaining useful stream diversity.
+
+Conclusion:
+
+- Scrap Hyperloop as the main path for now.
+- The negative result is not proof that hyperconnections cannot work, but this small 2-loop Parcae setup did not benefit.
+- The only follow-up worth considering later is a narrow implementation ablation with shared loop gates or another mechanism that supports `MEAN_BACKPROP_DEPTH=1`, since the current SOTA depends heavily on the `2/1` training regime.
 
 ## Parcae 5-minute ablations
 
