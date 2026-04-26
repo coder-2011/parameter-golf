@@ -105,7 +105,10 @@ def copy_from_hf_cache(*, repo_id: str, remote_root: str, filename: str, destina
     try:
         os.link(source, destination)
     except OSError:
-        shutil.copy2(source, destination)
+        try:
+            destination.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, destination)
     return True
 
 
@@ -314,6 +317,7 @@ def export_shards(
     num_val_docs: int,
     shard_size: int,
     docs_total: int,
+    max_train_shards: int | None = None,
 ) -> dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin"):
@@ -352,6 +356,7 @@ def export_shards(
 
     batch_encode = tok.get("encode_batch")
     batch_size = SP_BATCH_SIZE if callable(batch_encode) else 1
+    stop_export = False
     for texts in batched_docs_jsonl(docs_jsonl, batch_size):
         encoded_docs = batch_encode(texts) if callable(batch_encode) else [tok["encode"](text) for text in texts]
         for text, encoded in zip(texts, encoded_docs, strict=True):
@@ -385,12 +390,20 @@ def export_shards(
                 pos += take
                 if fill == shard_size:
                     flush()
+                    if max_train_shards is not None and split == "train" and shards["train"] >= max_train_shards:
+                        stop_export = True
+                        break
+
+            if stop_export:
+                break
 
         if stats["docs_total"] and stats["docs_total"] % 100_000 == 0:
             print(f"{output_dir.name}: {stats['docs_total']}/{docs_total} docs", flush=True)
+        if stop_export:
+            break
 
     flush()
-    if stats["docs_total"] != docs_total:
+    if max_train_shards is None and stats["docs_total"] != docs_total:
         raise ValueError(f"expected {docs_total} docs, exported {stats['docs_total']}")
     return stats
 
@@ -501,6 +514,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Limit the number of docs used for tokenizer training.",
     )
+    parser.add_argument(
+        "--max-train-shards",
+        type=int,
+        default=None,
+        help="Stop each dataset export after this many training shards. Defaults to full export.",
+    )
     parser.add_argument("--skip-byte", action="store_true", help="Skip byte-tokenizer export.")
     parser.add_argument(
         "--reuse-sp-model",
@@ -516,6 +535,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.chunk_tokens <= 0:
         raise ValueError(f"--chunk_tokens must be positive, got {args.chunk_tokens}")
+    if args.max_train_shards is not None and args.max_train_shards < 0:
+        raise ValueError(f"--max-train-shards must be non-negative, got {args.max_train_shards}")
 
     output_root = Path(args.output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -599,6 +620,7 @@ def main() -> None:
             num_val_docs=num_val_docs,
             shard_size=int(args.chunk_tokens),
             docs_total=docs_total,
+            max_train_shards=args.max_train_shards,
         )
         manifest["tokenizers"].append(tok["manifest"])
         manifest["datasets"].append(
