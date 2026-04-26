@@ -1,0 +1,10 @@
+logs/exp_scylla_poe3_swiglu_add_scale0p1_full_300.txt
+Traceback (most recent call last):
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 2841, in <module>
+    main()
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 2434, in main
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 431, in load_validation_tokens
+    raise FileNotFoundError(f"No files found for pattern: {pattern}")
+FileNotFoundError: No files found for pattern: /workspace/parameter-golf/data_scylla/fineweb_scylla/fineweb_val_*.bin
