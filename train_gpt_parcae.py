@@ -112,6 +112,10 @@ class Hyperparameters:
     ple_dim = int(os.environ.get("PLE_DIM", 0))
     ple_scale_init = float(os.environ.get("PLE_SCALE_INIT", "0.0"))
     ple_init_std = float(os.environ.get("PLE_INIT_STD", "0.02"))
+    laurel_scope = os.environ.get("LAUREL_SCOPE", "none")
+    laurel_rank = int(os.environ.get("LAUREL_RANK", 0))
+    laurel_scale_init = float(os.environ.get("LAUREL_SCALE_INIT", "0.01"))
+    laurel_norm = bool(int(os.environ.get("LAUREL_NORM", "1")))
 
     # Parcae-style recurrent architecture.
     n_layers_in_prelude = int(os.environ.get("N_LAYERS_IN_PRELUDE", 1))
@@ -1476,6 +1480,25 @@ class ParcaeRMSNorm(nn.Module):
         return y.type_as(x) * self.weight.to(dtype=x.dtype)
 
 
+class LaurelLowRank(nn.Module):
+    def __init__(self, dim: int, rank: int, scale_init: float, use_norm: bool):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"LAUREL_RANK must be positive when enabled, got {rank}")
+        self.left = CastedLinear(dim, rank, bias=False)
+        self.right = CastedLinear(rank, dim, bias=False)
+        self.norm = ParcaeRMSNorm(dim) if use_norm else None
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        nn.init.normal_(self.left.weight, mean=0.0, std=1.0 / math.sqrt(dim))
+        nn.init.normal_(self.right.weight, mean=0.0, std=1.0 / math.sqrt(rank))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.right(self.left(x))
+        if self.norm is not None:
+            y = self.norm(y)
+        return self.scale.to(dtype=x.dtype) * y
+
+
 class BaseMLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
@@ -1742,6 +1765,9 @@ class TransformerPreNormBlock(nn.Module):
         record_residual: bool,
         ln_scale: bool,
         residual_layer_idx: int,
+        laurel_rank: int = 0,
+        laurel_scale_init: float = 0.01,
+        laurel_norm: bool = True,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -1763,10 +1789,18 @@ class TransformerPreNormBlock(nn.Module):
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
         self.mlp = mlp_cls(dim, hidden_dim)
+        self.laurel = (
+            LaurelLowRank(dim, laurel_rank, laurel_scale_init, laurel_norm)
+            if laurel_rank > 0
+            else None
+        )
         if record_residual:
             self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def _add_laurel(self, x_out: Tensor, x_in: Tensor) -> Tensor:
+        return x_out + self.laurel(x_in) if self.laurel is not None else x_out
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, x0: Tensor | None = None, **kwargs) -> Tensor:
         if self.record_residual:
@@ -1779,15 +1813,19 @@ class TransformerPreNormBlock(nn.Module):
             mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
             if self.parallel_residual:
                 mlp_out = self.mlp(self.norm_2(x_in) * self.ln_scale_factor)
-                return x_in + attn_scale * attn_out + mlp_scale * mlp_out
+                x_out = x_in + attn_scale * attn_out + mlp_scale * mlp_out
+                return self._add_laurel(x_out, x_in)
             x_out = x_in + attn_scale * attn_out
-            return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
+            x_out = x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
+            return self._add_laurel(x_out, x_in)
         if self.parallel_residual:
             x0 = x
-            return x0 + self.attn(self.norm_1(x0), freqs_cis, mask, **kwargs) + self.mlp(self.norm_2(x0))
+            x_out = x0 + self.attn(self.norm_1(x0), freqs_cis, mask, **kwargs) + self.mlp(self.norm_2(x0))
+            return self._add_laurel(x_out, x0)
+        x_in = x
         x = self.attn(self.norm_1(x), freqs_cis, mask, **kwargs) + x
         x = self.mlp(self.norm_2(x)) + x
-        return x
+        return self._add_laurel(x, x_in)
 
 
 class DiagonalInjection(nn.Module):
@@ -1915,6 +1953,10 @@ class GPT(nn.Module):
         self.ple_dim = h.ple_dim
         self.ple_scale_init = h.ple_scale_init
         self.ple_init_std = h.ple_init_std
+        self.laurel_scope = h.laurel_scope
+        self.laurel_rank = h.laurel_rank
+        self.laurel_scale_init = h.laurel_scale_init
+        self.laurel_norm = h.laurel_norm
         valid_ple_scopes = {"none", "prelude", "core", "coda", "all"}
         if self.ple_scope not in valid_ple_scopes:
             raise ValueError(f"PLE_SCOPE must be one of {sorted(valid_ple_scopes)}, got {self.ple_scope!r}")
@@ -1926,6 +1968,15 @@ class GPT(nn.Module):
             raise ValueError("PLE_DIM > 0 requires PLE_SCOPE to be prelude, core, coda, or all")
         if self.ple_scope != "none" and self.ple_dim == 0:
             raise ValueError("PLE_SCOPE is enabled but PLE_DIM is 0")
+        valid_laurel_scopes = {"none", "prelude", "core", "coda", "all"}
+        if self.laurel_scope not in valid_laurel_scopes:
+            raise ValueError(f"LAUREL_SCOPE must be one of {sorted(valid_laurel_scopes)}, got {self.laurel_scope!r}")
+        if self.laurel_rank < 0:
+            raise ValueError(f"LAUREL_RANK must be non-negative, got {self.laurel_rank}")
+        if self.laurel_scope == "none" and self.laurel_rank > 0:
+            raise ValueError("LAUREL_RANK > 0 requires LAUREL_SCOPE to be prelude, core, coda, or all")
+        if self.laurel_scope != "none" and self.laurel_rank == 0:
+            raise ValueError("LAUREL_SCOPE is enabled but LAUREL_RANK is 0")
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -1989,6 +2040,9 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i,
+                laurel_rank=self._laurel_rank_for("prelude"),
+                laurel_scale_init=h.laurel_scale_init,
+                laurel_norm=h.laurel_norm,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -2020,6 +2074,9 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope in {"core", "all"},
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude,
+                laurel_rank=self._laurel_rank_for("core"),
+                laurel_scale_init=h.laurel_scale_init,
+                laurel_norm=h.laurel_norm,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -2050,6 +2107,9 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block,
+                laurel_rank=self._laurel_rank_for("coda"),
+                laurel_scale_init=h.laurel_scale_init,
+                laurel_norm=h.laurel_norm,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -2156,6 +2216,9 @@ class GPT(nn.Module):
         if layer_idx >= len(layers):
             return x
         return x + layers[layer_idx](input_ids, x.dtype)
+
+    def _laurel_rank_for(self, scope: str) -> int:
+        return self.laurel_rank if self.laurel_scope in {scope, "all"} else 0
 
     def _init_weights(self) -> None:
         base_std = math.sqrt(2.0 / (5.0 * self.outer_dim))
@@ -2903,6 +2966,16 @@ def main() -> None:
     log0(
         f"ple:scope:{args.ple_scope} dim:{args.ple_dim} scale_init:{args.ple_scale_init:g} "
         f"init_std:{args.ple_init_std:g} params:{ple_params}"
+    )
+    laurel_params = sum(
+        p.numel()
+        for module in base_model.modules()
+        if isinstance(module, LaurelLowRank)
+        for p in module.parameters()
+    )
+    log0(
+        f"laurel:scope:{args.laurel_scope} rank:{args.laurel_rank} "
+        f"scale_init:{args.laurel_scale_init:g} norm:{args.laurel_norm} params:{laurel_params}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
