@@ -156,7 +156,6 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend = os.environ.get("MUON_BACKEND", "ns5")
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -183,46 +182,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
-def zeropower_via_qr(G: Tensor, eps: float = 1e-7) -> Tensor:
-    X = G.float()
-    norm = X.norm()
-    if norm <= eps:
-        return torch.zeros_like(G)
-    X = X / norm
-    transposed = X.size(0) > X.size(1)
-    if transposed:
-        X = X.T
-    Q, R = torch.linalg.qr(X.T, mode="reduced")
-    signs = torch.sign(torch.diagonal(R, 0))
-    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-    X = (Q * signs.unsqueeze(0)).T
-    return (X.T if transposed else X).to(dtype=G.dtype)
-
-
-def zeropower_via_svd(G: Tensor, eps: float = 1e-7) -> Tensor:
-    X = G.float()
-    norm = X.norm()
-    if norm <= eps:
-        return torch.zeros_like(G)
-    X = X / norm
-    transposed = X.size(0) > X.size(1)
-    if transposed:
-        X = X.T
-    U, _, Vh = torch.linalg.svd(X, full_matrices=False)
-    X = U @ Vh
-    return (X.T if transposed else X).to(dtype=G.dtype)
-
-
-def zeropower_update(G: Tensor, backend: str, steps: int) -> Tensor:
-    if backend == "ns5":
-        return zeropower_via_newtonschulz5(G, steps=steps)
-    if backend in {"qr", "gram_schmidt", "gram-schmidt"}:
-        return zeropower_via_qr(G)
-    if backend in {"svd", "polar"}:
-        return zeropower_via_svd(G)
-    raise ValueError(f"Invalid MUON_BACKEND={backend!r}; expected ns5, qr, or svd")
-
-
 class Muon(torch.optim.Optimizer):
     """Muon optimizer with optional row normalization (MuonEq-R).
 
@@ -236,7 +195,6 @@ class Muon(torch.optim.Optimizer):
         params,
         lr: float,
         momentum: float,
-        backend: str,
         backend_steps: int,
         nesterov: bool = True,
         weight_decay: float = 0.0,
@@ -247,7 +205,6 @@ class Muon(torch.optim.Optimizer):
             dict(
                 lr=lr,
                 momentum=momentum,
-                backend=backend,
                 backend_steps=backend_steps,
                 nesterov=nesterov,
                 weight_decay=weight_decay,
@@ -272,7 +229,6 @@ class Muon(torch.optim.Optimizer):
                 continue
             lr = group["lr"]
             momentum = group["momentum"]
-            backend = group["backend"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
@@ -296,7 +252,7 @@ class Muon(torch.optim.Optimizer):
                         row_norms = g.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
                         g = g / row_norms.to(g.dtype)
 
-                    g = zeropower_update(g, backend=backend, steps=backend_steps)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -2575,7 +2531,6 @@ def main() -> None:
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
-        backend=args.muon_backend,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
         row_normalize=args.muon_row_normalize,
@@ -2626,8 +2581,8 @@ def main() -> None:
         f"poe_experts:{args.poe_num_experts} poe_extra_heads:{len(base_model.poe_heads)} "
         f"poe_head_lr:{args.poe_head_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
-        f"muon_backend:{args.muon_backend} muon_steps:{args.muon_backend_steps} "
-        f"muon_wd:{args.muon_wd} muon_row_normalize:{args.muon_row_normalize}"
+        f"muon_steps:{args.muon_backend_steps} muon_wd:{args.muon_wd} "
+        f"muon_row_normalize:{args.muon_row_normalize}"
     )
     log0(
         f"qat:bits:{args.qat_bits} start_step:{args.qat_start_step} "
