@@ -38,10 +38,18 @@ Focused checks run:
 
 Current caveats:
 
-- No full Scylla TTT result has been established yet.
+- A full local Scylla TTT result exists below, but it is not yet an official-quality result because the TTT eval pass took longer than 10 minutes locally.
 - Quantized-weight SGD TTT is experimental and may hurt; the previous record-submission code warned that SGD TTT on quantized weights was unfavorable in that setup.
 - Manual full-parameter gradient all-reduce is correctness-oriented but may be expensive.
 - The latest cleanup reduced duplicated expressions but added helper surface; `_validation_result` and `_token_byte_sum` are worth keeping for metric safety, while `_window_batch` is debatable if minimizing line count becomes the priority.
+
+Full local Scylla TTT check:
+
+| Run | Standard exact BPB | TTT exact BPB | TTT eval time | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `runs/exp_scylla_poe3_diag_ttt_compare_300.console.log` | `1.73147091` | `1.68571400` | `682647ms` | Uses `VAL_BYTE_COUNT_OVERRIDE`; score-first TTT improved BPB but exceeded 10 minutes on the local eval path |
+
+Interpretation: TTT is promising for BPB, but the current implementation is too slow to treat as a competition-ready default. The next TTT work should target stride/chunk/epoch reductions or a cheaper adapted-parameter subset while preserving the score-before-train legality invariant.
 
 ### SwiGLU recurrent input injection
 
@@ -63,6 +71,161 @@ Current caveats:
 
 - No completed result proves this injection helps.
 - The default was changed from an earlier local `0.1` to `0.0` to keep the new branch inactive by default.
+
+### Validation scorer alignment
+
+The standard `eval_val` path in `train_gpt_parcae.py` was realigned to the canonical `train_gpt.py` scorer body.
+
+Implementation behavior now matches the canonical scorer for:
+
+- sequence partitioning across ranks
+- contiguous next-token `x`/`y` construction
+- bf16 autocast model loss
+- token-byte LUT calculation
+- distributed all-reduce order
+- BPB formula
+
+The only intentional extra line is the Scylla denominator hook:
+
+```python
+if args.val_byte_count_override > 0:
+    val_byte_count.fill_(args.val_byte_count_override)
+```
+
+That override is applied after byte-count all-reduce. An AST comparison passed with this override line ignored.
+
+### Parallel residual switch
+
+Implemented default-off parallel residual support in `train_gpt_parcae.py`.
+
+Added knobs:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RESIDUAL_MODE` | `sequential` | Keeps the existing sequential residual block unless set to `parallel` |
+| `PARALLEL_RESIDUAL_SCOPE` | `none` | Chooses where parallel residuals apply: `none`, `core`, or `all` |
+| `PARALLEL_RESIDUAL_START` | `-1` | Physical block index at which blocks become parallel; `-1` means all blocks in scope |
+| `PARALLEL_RESIDUAL_LN_SCALE` | `1` | Uses the `curr_record_sub.py` layer-dependent normalized-input scale for record-style residual blocks |
+
+Implementation behavior:
+
+- Default behavior remains the existing sequential block:
+
+```python
+x = x + attn(norm_1(x))
+x = x + mlp(norm_2(x))
+```
+
+- When enabled, the block now follows the `curr_record_sub.py` residual mechanics inside the selected scope:
+
+```python
+x_in = resid_mix[0] * x + resid_mix[1] * x0
+attn_out = attn(norm_1(x_in) * ln_scale_factor)
+if parallel:
+    mlp_out = mlp(norm_2(x_in) * ln_scale_factor)
+    x = x_in + attn_scale * attn_out + mlp_scale * mlp_out
+else:
+    x = x_in + attn_scale * attn_out
+    x = x + mlp_scale * mlp(norm_2(x) * ln_scale_factor)
+```
+
+- `attn_scale`, `mlp_scale`, and `resid_mix` are per-channel FP32 control tensors initialized like `curr_record_sub.py`.
+- `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=core` applies record-style residual controls only to recurrent core blocks; `all` applies them to prelude, core, and coda.
+- In Parcae, `x0` is the matching stream's initial state: original outer input embeddings for prelude/coda and the initialized recurrent state for core recurrence.
+- `PARALLEL_RESIDUAL_START` uses physical block indices, not recurrence-expanded depth. With the default Parcae shape, prelude is index `0`, core is `1..4`, and coda is `5`.
+- `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=none` is rejected to avoid accidentally believing the feature is enabled when it is not.
+- Default `RESIDUAL_MODE=sequential` does not create the extra record-style control tensors, preserving the default architecture.
+
+Older result note:
+
+- The first completed parallel-core run used the simpler GPT-J formula `x + attn(norm(x)) + mlp(norm(x))`, without record-style branch scales, residual mixing, or layer scaling.
+- That older result should not be treated as a faithful `curr_record_sub.py` parallel-residual test.
+
+Checks run:
+
+- `.venv/bin/python -m py_compile train_gpt_parcae.py`
+- `git diff --check`
+- Formula-level unit check confirmed sequential and parallel block equations.
+- Fresh-process construction checks confirmed the original simple switch:
+  - default: prelude/core/coda all false
+  - `core`: prelude false, core true, coda false
+  - `all`: prelude/core/coda all true
+  - invalid flag combinations fail early
+- After the record-style rewrite:
+  - default construction has no `attn_scale`, `mlp_scale`, or `resid_mix` tensors.
+  - `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=core PARALLEL_RESIDUAL_START=-1` creates record-style control tensors for core blocks and makes all core blocks parallel.
+  - `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=all PARALLEL_RESIDUAL_START=3` leaves physical blocks before index `3` sequential while still giving selected-scope blocks record-style controls.
+  - tiny CUDA forward/backward smoke passed with core record-style parallel residual enabled.
+
+Recommended first experiment:
+
+```bash
+RESIDUAL_MODE=parallel \
+PARALLEL_RESIDUAL_SCOPE=core \
+POE_NUM_EXPERTS=3 \
+POE_HEAD_LR=0.002 \
+BIGRAM_HASH_BUCKETS=8192 \
+TTT_ENABLED=0 \
+RUN_ID=exp_scylla_poe3_bigram8192_parallel_core_300 \
+bash scripts/run_parcae_scylla_current_best.sh
+```
+
+Result:
+
+| Run | Scope | Final exact BPB | Exact loss | Steps | Step avg | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `logs/exp_scylla_poe3_bigram8192_parallel_core_300.txt` | recurrent core only | `1.75860255` | `2.95299381` | 1885 | `159.20ms` | Worse than matched sequential NS5 row norm run |
+
+Matched comparison:
+
+| Run | Residual mode | Final exact BPB | Notes |
+| --- | --- | ---: | --- |
+| `logs/exp_scylla_poe3_bigram8192_muon_ns5_row1_300_rerun.txt` | sequential | `1.73508599` | Same Scylla/PoE3/bigram8192/current-local 300s setup |
+| `logs/exp_scylla_poe3_bigram8192_parallel_core_300.txt` | parallel core | `1.75860255` | `+0.02351656` BPB worse |
+
+Conclusion: core-only parallel residuals hurt in this current-local Scylla 300s setup. The hypothesis that independent attention/MLP deltas would improve recurrent update quality did not hold under this config.
+
+### Muon backend sanity check and QR removal
+
+The temporary Muon backend comparison checked whether exact QR / Gram-Schmidt-style orthogonalization looked better than the existing Newton-Schulz Muon path.
+
+Before interpreting results, Muon correctness was checked against canonical `train_gpt.py`:
+
+| Check | Result |
+| --- | --- |
+| Parcae Muon with NS5, no row norm, no matrix WD vs canonical `train_gpt.py` Muon | bit-for-bit match |
+| Two-step momentum behavior vs canonical `train_gpt.py` Muon | bit-for-bit match |
+| Max absolute parameter diff | `0.0` |
+
+Current-local Scylla 300s sweep setup:
+
+| Setting | Value |
+| --- | --- |
+| `POE_NUM_EXPERTS` | `3` |
+| `POE_HEAD_LR` | `0.002` |
+| `BIGRAM_HASH_BUCKETS` | `8192` |
+| `TTT_ENABLED` | `0` |
+| Residuals | sequential; this was not a parallel-residual test |
+
+Results:
+
+| Run | Backend / row norm | Final exact BPB | Step | Notes |
+| --- | --- | ---: | ---: | --- |
+| `logs/exp_scylla_poe3_bigram8192_muon_ns5_row1_300_rerun.txt` | NS5, row norm on | `1.73508599` | 1863 | Best of this sweep so far |
+| `logs/exp_scylla_poe3_bigram8192_muon_ns5_row0_300_rerun.txt` | NS5, row norm off | `1.76854122` | 1875 | Clearly worse than row norm on |
+| `logs/exp_scylla_poe3_bigram8192_muon_qr_row0_300_rerun.txt` | QR, row norm off | no final roundtrip; mid/final pre-roundtrip `1.8640` | 1869 | Bad enough to abandon |
+
+Speed read:
+
+- QR was not meaningfully slower than NS5 in this setup: roughly `160.5 ms/step` versus `160.0-161.1 ms/step`.
+- QR was much worse on quality, so the issue was not speed.
+
+Conclusion:
+
+- Keep NS5 Muon.
+- Keep row-normalized MuonEq-R style path enabled for current-best style runs.
+- Remove the temporary QR/SVD backend code and `MUON_BACKEND` knob. `train_gpt_parcae.py` is back to NS5-only, with `MUON_BACKEND_STEPS` still controlling Newton-Schulz iterations.
+- Do not compare this current-local 300s sweep directly to the older `1.69172418` headline run; data token count and runtime are not fully apples-to-apples. Within current-local 300s comparisons, NS5 row norm on is around the existing baseline range and row norm off / QR are worse.
 
 ## 2026-04-25 Scylla / XSA / MoE / PoE session
 

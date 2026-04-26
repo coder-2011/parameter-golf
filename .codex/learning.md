@@ -80,3 +80,5 @@ Performance caveat: no full Scylla TTT run has proven this helps. Quantized-weig
 ## 2026-04-26 Parallel Residual Switch
 
 `train_gpt_parcae.py` now has default-off parallel residual support. Use `RESIDUAL_MODE=parallel PARALLEL_RESIDUAL_SCOPE=core` to make recurrent core blocks compute `x + attn(norm_1(x)) + mlp(norm_2(x))` while leaving prelude/coda sequential. `PARALLEL_RESIDUAL_SCOPE=all` also applies it to prelude/coda. Defaults are `RESIDUAL_MODE=sequential` and `PARALLEL_RESIDUAL_SCOPE=none`, preserving current behavior.
+
+Follow-up correction: this was rewritten to match `curr_record_sub.py` more faithfully when enabled. Parallel mode now creates record-style per-channel `attn_scale`, `mlp_scale`, and `resid_mix` controls in the selected scope, uses `x_in = resid_mix[0] * x + resid_mix[1] * x0`, applies optional `1/sqrt(physical_layer_idx + 1)` normalized-input scaling, and supports `PARALLEL_RESIDUAL_START` as a physical block-index gate. In Parcae, `x0` is stream-local: outer input embeddings for prelude/coda and the initialized recurrent state for the recurrent core. Default sequential mode still does not create these extra tensors.
