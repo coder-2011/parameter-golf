@@ -1,5 +1,15 @@
 # Codex Learning Notes
 
+## 2026-04-26 RWKV-LM-V7 Blackwell CUDA compiler
+
+RWKV-LM-V7 native extension builds require an `nvcc` that knows Blackwell `compute_120`. The initial environment had PyTorch `2.11.0+cu128` and an RTX PRO 4500 Blackwell GPU, but `/usr/local/cuda` pointed at CUDA 12.4 whose `nvcc --list-gpu-arch` stopped at `compute_90`. That caused RWKV/DeepSpeed native compilation failures unless forced through `TORCH_CUDA_ARCH_LIST=9.0+PTX`.
+
+Installed `cuda-nvcc-12-8` from the NVIDIA apt repo, which moved `/usr/local/cuda` to `/usr/local/cuda-12.8`. After that, `nvcc --list-gpu-arch` includes `compute_120`; a fresh RWKV `wind_backstepping` extension build compiled `sm_120` directly and the FineWeb smoke script ran without the PTX workaround. The pip `nvidia-cuda-nvcc-cu12` package was not sufficient by itself here because it installed `ptxas`/NVVM files but no `nvcc` executable.
+
+DeepSpeed FusedAdam additionally needs CUDA library dev headers such as `cusparse.h`, not just `nvcc`. Installing `cuda-libraries-dev-12-8` supplied cuSPARSE/cuBLAS/cuSOLVER/etc. headers and libs under `/usr/local/cuda-12.8`; a forced fresh `FusedAdamBuilder().load()` then compiled successfully for `sm_120`.
+
+RWKV-LM-V7 `--compile 1` plus `deepspeed_stage_2` originally failed during backward with `CompiledFunctionBackward returned an invalid gradient at index 4 - got [512] but expected [1, 1, 512]`. The root cause was semantic channel-vector mix parameters being registered with fake broadcast shape `[1, 1, C]`; DeepSpeed/AOTAutograd returned the natural `[C]` gradient. Fix both attention time-mix parameters and FFN `x_k` to true vectors `[C]`, while keeping checkpoint load reshape compatibility for old `[1,1,C]` checkpoints. After that, the default 8-layer/512-dim FineWeb run with `COMPILE=1 STRATEGY=deepspeed_stage_2 M_BSZ=16` completed 3,052 steps and saved `out/fineweb-10min-L8-D512-x070/rwkv-final.pth`; it stopped on the 50M-token cap before the 600s wall-clock cap.
+
 ## 2026-04-25 Scylla / Parcae / PoE session
 
 Scylla support is now wired through `train_gpt_parcae.py` and `scripts/run_parcae_scylla_current_best.sh`.
@@ -144,3 +154,17 @@ Correctness fixes landed: distributed train loader carries one overlap token acr
 Silent no-ops are now guarded: `XSA_LAST_N>0`, explicit `NUM_LAYERS`, and explicit `QK_GAIN_INIT` fail fast in `train_gpt_parcae.py`. Timed runs skip step-0 validation and raw `final_model.pt` save unless `SAVE_RAW_MODEL=1`.
 
 `RECURRENT_INTERMEDIATE_DIM` now defaults to `MLP_MULT * RECURRENT_DIM`; `scripts/run_parcae_scylla_current_best.sh` pins `RECURRENT_INTERMEDIATE_DIM=1024` and `STATE_INIT=like-init` to preserve the old current-best training shape/init while retaining deterministic validation.
+
+## 2026-04-26 PLE removal
+
+`train_gpt_parcae.py` no longer carries the default-off PLE-lite path. The PLE env knobs, per-layer token embedding module, forward injections, PLE monitoring metrics, dedicated optimizer groups, and PLE train-log suffix were removed to keep the active experiment surface smaller.
+
+## 2026-04-26 RWKV SP1892 BPB path
+
+`RWKV-LM-V7/eval_fineweb_bpb.py` mirrors the Parcae SentencePiece byte accounting: byte pieces count as one byte, normal pieces count their UTF-8 payload bytes after stripping leading `▁`, and a leading `▁` adds one space byte only when the previous token is not a boundary/control token. The reported BPB is `loss_sum / (ln(2) * scored_bytes)`. Local SP1892 artifacts are not present yet; the checked-in data currently has only `data/datasets/fineweb10B_sp1024` and `data/tokenizers/fineweb_1024_bpe.model`.
+
+Follow-up: SP1892 local data was installed under `data_sp1892/` using `data/download_hf_docs_and_tokenize.py --max-train-shards 1` with HF cache redirected to `/workspace/.cache/huggingface`. The export contains one 100M-token train shard plus the full first validation shard, and the docs JSONL is symlinked to the HF cache to avoid duplicating the 48GB source file. RWKV V7 time-only runs need `src/trainer.py` to initialize `lr = args.lr_init` before the token-based exit branch; otherwise `MY_EXIT_TOKENS=0` fails before the first optimizer step.
+
+## 2026-04-26 RWKV RoPE experiment
+
+`RWKV-LM-V7` has a default-off RoPE path controlled by `--rope_mode none|rk` and `--rope_theta`. The enabled mode rotates the RWKV time-mix recurrent query/key analogues (`r` and `k`) per head after their linear projections and before `fused_k_rwkv7`, so both `kk` and the updated key entering the RWKV7 kernel carry the positional rotation. The inverse-frequency buffer is non-persistent, so RoPE adds no checkpoint tensors. Use `ROPE_MODE=rk` in the FineWeb run scripts to enable it; output dirs get a `-roperk` suffix by default.
