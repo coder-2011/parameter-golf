@@ -120,3 +120,17 @@ Implementation scope:
 `train_gpt_parcae.py` now has default-off LAuReL low-rank residual augmentation. Use `LAUREL_SCOPE=prelude|core|coda|all`, `LAUREL_RANK>0`, `LAUREL_SCALE_INIT`, and `LAUREL_NORM=0|1`. Each selected `TransformerPreNormBlock` adds `scale * RMSNorm(right(left(block_input)))` to the block output, using the record-style mixed residual input when parallel residual mode is active. Disabled default creates zero LAuReL modules.
 
 Focused checks passed: py_compile under system Python and `.venv`, enabled CUDA forward/backward smoke, default-off module count, strict state-dict reload, and int8 quant/dequant strict reload.
+
+## 2026-04-26 PLE diagnostics and stabilization
+
+PLE coda-after is mechanically live, but unnormalized PLE over-injects. A 300s Scylla PoE3/bigram8192 run with `PLE_SCOPE=coda PLE_DIM=32 PLE_SCALE_INIT=0.02 PLE_PLACEMENT=after PLE_PROJ_OPTIMIZER=adam PLE_PROJ_LR=0.01` reached exact BPB `1.81262890`; diagnostics showed injected RMS at roughly `30-45%` of stream RMS. Adding `PLE_SCALE_LR=0.004` slowed early growth but still reached exact BPB `1.80265695` with late injected ratio around `20-30%`.
+
+Implementation correction: PLE now logs raw/injected/x RMS, injected ratio, scale abs, and PLE grad norms; supports `PLE_PLACEMENT=before|after`; can route PLE projection to Adam; routes PLE scales through `PLE_SCALE_LR`; and defaults enabled PLE output to RMS-normalized (`PLE_NORM=1`) to stop raw projection norm growth. A short normalized smoke kept raw RMS near `1.0` and injected ratio around `5-8%` through step 118. The full normalized run was interrupted before training, so no BPB is available yet.
+
+First 300s Scylla PoE3/bigram8192 tests with `PLE_SCOPE=none` and `TTT_ENABLED=0` were negative versus the current-local baseline around `1.73508599`: coda rank 8, scale 0.01 reached exact int8 roundtrip BPB `1.74979565`; core rank 8, scale 0.005 reached `1.76566406` and was slower (`1537` steps vs coda `1820` under the same cap). Treat LAuReL-LR as implemented but not yet promising in these placements.
+
+## 2026-04-26 No-loop recurrent-core comparison
+
+Keeping roughly the same effective block count but removing recurrent reuse helped the 300s Scylla PoE3/bigram8192 local baseline: `N_LAYERS_IN_PRELUDE=1 N_LAYERS_IN_RECURRENT_BLOCK=4 N_LAYERS_IN_CODA=1 MEAN_RECURRENCE=1 MEAN_BACKPROP_DEPTH=1`, with PLE/LAuReL/TTT off, reached exact int8 roundtrip BPB `1.72512145` at `1601` steps. It was slower than the recurrent baseline (`~187.5ms/step` vs about `165ms/step`) and larger (`8,026,003` byte int8+zlib model), but beat the matched recent recurrent 300s rerun around `1.73508599`. This suggests recurrence reuse is not clearly paying for the local 300s budget, even if the best longer/solo recurrent result remains around `1.69`.
+
+Larger width/depth recurrence was strongly negative: `MODEL_DIM=512 RECURRENT_DIM=512 N_LAYERS_IN_PRELUDE=2 N_LAYERS_IN_RECURRENT_BLOCK=3 N_LAYERS_IN_CODA=3 MEAN_RECURRENCE=2 MEAN_BACKPROP_DEPTH=1`, with PLE/LAuReL/TTT off, reached exact int8 roundtrip BPB `1.80886096` at `1114` steps. It was too slow (`~269.5ms/step`) and over budget (`23,913,791` byte int8+zlib model, `24,072,355` bytes with code). Do not chase this 512-wide recurrent shape as-is.
