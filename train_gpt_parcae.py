@@ -124,6 +124,8 @@ class Hyperparameters:
     injection_swiglu_scale = float(os.environ.get("INJECTION_SWIGLU_SCALE", "0.0"))
     residual_mode = os.environ.get("RESIDUAL_MODE", "sequential")
     parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
+    parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", "-1"))
+    parallel_residual_ln_scale = bool(int(os.environ.get("PARALLEL_RESIDUAL_LN_SCALE", "1")))
     state_init = os.environ.get("STATE_INIT", "like-init")
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
@@ -1610,9 +1612,14 @@ class TransformerPreNormBlock(nn.Module):
         mlp_class_name: str,
         rope_dims: int,
         parallel_residual: bool,
+        record_residual: bool,
+        ln_scale: bool,
+        residual_layer_idx: int,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
+        self.record_residual = record_residual
+        self.ln_scale_factor = 1.0 / math.sqrt(residual_layer_idx + 1) if ln_scale else 1.0
         self.norm_1 = ParcaeRMSNorm(dim)
         self.attn = ParcaeCausalSelfAttention(
             dim=dim,
@@ -1629,8 +1636,25 @@ class TransformerPreNormBlock(nn.Module):
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
         self.mlp = mlp_cls(dim, hidden_dim)
+        if record_residual:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, x0: Tensor | None = None, **kwargs) -> Tensor:
+        if self.record_residual:
+            if x0 is None:
+                x0 = x
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            attn_out = self.attn(self.norm_1(x_in) * self.ln_scale_factor, freqs_cis, mask, **kwargs)
+            attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
+            mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
+            if self.parallel_residual:
+                mlp_out = self.mlp(self.norm_2(x_in) * self.ln_scale_factor)
+                return x_in + attn_scale * attn_out + mlp_scale * mlp_out
+            x_out = x_in + attn_scale * attn_out
+            return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
         if self.parallel_residual:
             x0 = x
             return x0 + self.attn(self.norm_1(x0), freqs_cis, mask, **kwargs) + self.mlp(self.norm_2(x0))
@@ -1735,6 +1759,7 @@ class GPT(nn.Module):
         self.curriculum_target = h.curriculum_target
         self.residual_mode = h.residual_mode
         self.parallel_residual_scope = h.parallel_residual_scope
+        self.parallel_residual_start = h.parallel_residual_start
         self.lockstep_n = h.lockstep_n
         self.lockstep_k = h.lockstep_k
         self.state_init = h.state_init
@@ -1810,7 +1835,14 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
                 rope_dims=self.outer_rope_dims,
-                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
+                parallel_residual=(
+                    h.residual_mode == "parallel"
+                    and h.parallel_residual_scope == "all"
+                    and (h.parallel_residual_start < 0 or i >= h.parallel_residual_start)
+                ),
+                record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
+                ln_scale=h.parallel_residual_ln_scale,
+                residual_layer_idx=i,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -1834,7 +1866,14 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.recurrent_mlp_class_name,
                 rope_dims=self.recurrent_layer_rope_dims[i],
-                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope in {"core", "all"},
+                parallel_residual=(
+                    h.residual_mode == "parallel"
+                    and h.parallel_residual_scope in {"core", "all"}
+                    and (h.parallel_residual_start < 0 or i + self.n_layers_in_prelude >= h.parallel_residual_start)
+                ),
+                record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope in {"core", "all"},
+                ln_scale=h.parallel_residual_ln_scale,
+                residual_layer_idx=i + self.n_layers_in_prelude,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -1853,7 +1892,17 @@ class GPT(nn.Module):
                 clip_qkv=h.clip_qkv,
                 mlp_class_name=h.mlp_class_name,
                 rope_dims=self.outer_rope_dims,
-                parallel_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
+                parallel_residual=(
+                    h.residual_mode == "parallel"
+                    and h.parallel_residual_scope == "all"
+                    and (
+                        h.parallel_residual_start < 0
+                        or i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block >= h.parallel_residual_start
+                    )
+                ),
+                record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
+                ln_scale=h.parallel_residual_ln_scale,
+                residual_layer_idx=i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -1972,7 +2021,7 @@ class GPT(nn.Module):
         x = input_embeds
         for i, block in enumerate(self.prelude):
             ve = self.prelude_value_embeds[str(i)](input_ids) if str(i) in self.prelude_value_embeds else None
-            x = block(x, outer_freqs_cis, None, ve=ve)
+            x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
 
         if self.prelude_norm_layer is not None:
             x = self.prelude_norm_layer(x)
@@ -1985,9 +2034,9 @@ class GPT(nn.Module):
         for i, block in enumerate(self.coda):
             ve = self.coda_value_embeds[str(i)](input_ids) if str(i) in self.coda_value_embeds else None
             if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
-                x = self._checkpoint(block, x, outer_freqs_cis, None, ve=ve)
+                x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
             else:
-                x = block(x, outer_freqs_cis, None, ve=ve)
+                x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
         if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
             x = self._checkpoint(self.final_norm, x)
         else:
@@ -2031,12 +2080,13 @@ class GPT(nn.Module):
             raise RuntimeError('forward expected a loss tensor')
         return loss
 
-    def update_recurrent_state(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor) -> Tensor:
-        return self.core_block_forward(x, input_embeds, freqs_cis, mask, step, total_steps)
+    def update_recurrent_state(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor, x0: Tensor) -> Tensor:
+        return self.core_block_forward(x, input_embeds, freqs_cis, mask, step, total_steps, x0)
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
     def iterate_forward(self, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, num_steps_pair: Tensor | None = None):
         x = self.initialize_state(input_embeds)
+        x0 = x
         xk = x
 
         if self.recurrent_iteration_method == 'per-batch':
@@ -2085,21 +2135,21 @@ class GPT(nn.Module):
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
             for step in range(num_steps_with_grad_int):
                 xk = x
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
                 else:
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
         else:
             with torch.no_grad():
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     active_mask = step < n_per_sample
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
                     mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                     x = torch.where(mask_expanded, x_new, x)
             for step in range(num_steps_with_grad_int):
@@ -2107,15 +2157,15 @@ class GPT(nn.Module):
                 active_mask = step < k_per_sample
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
                 else:
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
                 mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                 x = torch.where(mask_expanded, x_new, x)
 
         return x, num_steps_no_grad, num_steps_with_grad, xk.detach()
 
-    def core_block_forward(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor, **kwargs) -> Tensor:
+    def core_block_forward(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor, x0: Tensor, **kwargs) -> Tensor:
         x = self.adapter(x, input_embeds)
         input_ids = self._current_input_ids
         if input_ids is None:
@@ -2123,9 +2173,9 @@ class GPT(nn.Module):
         for layer_idx, block in enumerate(self.core_block):
             ve = self.core_value_embeds[str(layer_idx)](input_ids) if str(layer_idx) in self.core_value_embeds else None
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                x = self._checkpoint(block, x, freqs_cis, mask, ve=ve)
+                x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve)
             else:
-                x = block(x, freqs_cis, mask, ve=ve)
+                x = block(x, freqs_cis, mask, x0=x0, ve=ve)
         return x
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
@@ -2352,6 +2402,8 @@ def main() -> None:
         )
     if args.residual_mode == "parallel" and args.parallel_residual_scope == "none":
         raise ValueError("RESIDUAL_MODE=parallel requires PARALLEL_RESIDUAL_SCOPE=core or all")
+    if args.parallel_residual_start < -1:
+        raise ValueError(f"PARALLEL_RESIDUAL_START must be -1 or non-negative, got {args.parallel_residual_start}")
     if not (0 < args.eval_stride <= args.train_seq_len):
         raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
     if args.ttt_chunk_tokens <= 0:
@@ -2573,7 +2625,8 @@ def main() -> None:
         f"recurrent_dim:{args.recurrent_dim} recurrence:{args.mean_recurrence}/{args.mean_backprop_depth} "
         f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
         f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
-        f"parallel_residual_scope:{args.parallel_residual_scope}"
+        f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
+        f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
