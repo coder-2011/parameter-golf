@@ -53,6 +53,14 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.005))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -127,6 +135,11 @@ class Hyperparameters:
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
+    coda_moe_num_experts = int(os.environ.get("CODA_MOE_NUM_EXPERTS", 0))
+    coda_moe_top_k = int(os.environ.get("CODA_MOE_TOP_K", 1))
+    coda_moe_mlp_mult = int(os.environ.get("CODA_MOE_MLP_MULT", 0))
+    poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
+    poe_head_lr = float(os.environ.get("POE_HEAD_LR", os.environ.get("HEAD_LR", "0.008")))
     emb_scale = float(os.environ.get("EMB_SCALE", "1.0"))
     logit_scale = float(os.environ.get("LOGIT_SCALE", "1.0"))
 
@@ -422,6 +435,15 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+def _loss_bpb(args: Hyperparameters, loss_sum: Tensor, token_count: Tensor, byte_count: Tensor) -> tuple[float, float]:
+    if args.val_byte_count_override > 0:
+        byte_count.fill_(args.val_byte_count_override)
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -477,11 +499,128 @@ def eval_val(
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+    return _loss_bpb(args, val_loss_sum, val_token_count, val_byte_count)
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log_fn=None,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    context_size = seq_len - stride
+    total_tokens = val_tokens.numel() - 1
+    num_chunks = (total_tokens + args.ttt_chunk_tokens - 1) // args.ttt_chunk_tokens
+    chunk_windows = [[] for _ in range(num_chunks)]
+    for ws in range(0, total_tokens, stride):
+        if ws + context_size >= total_tokens:
+            continue
+        scored_start = ws if ws == 0 else ws + context_size
+        chunk_windows[min(scored_start // args.ttt_chunk_tokens, num_chunks - 1)].append(ws)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    logits_fn = model.forward_logits
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    if log_fn is not None:
+        log_fn(
+            f"ttt:start chunks:{num_chunks} chunk_tokens:{args.ttt_chunk_tokens} epochs:{args.ttt_epochs} "
+            f"lr:{args.ttt_lr:g} stride:{stride} batch_seqs:{args.ttt_batch_seqs}"
+        )
+
+    def sync_grads(has_batch: bool) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        active = torch.tensor(float(has_batch), device=device)
+        dist.all_reduce(active, op=dist.ReduceOp.SUM)
+        for p in params:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(active.clamp_min(1.0))
+
+    for ci, windows in enumerate(chunk_windows):
+        chunk_start = ci * args.ttt_chunk_tokens
+        chunk_end = min((ci + 1) * args.ttt_chunk_tokens, total_tokens)
+        model.eval()
+        with torch.no_grad():
+            my_start = len(windows) * rank // world_size
+            my_end = len(windows) * (rank + 1) // world_size
+            for batch_start in range(my_start, my_end, args.ttt_batch_seqs):
+                batch_ws = windows[batch_start:min(batch_start + args.ttt_batch_seqs, my_end)]
+                x = torch.zeros(len(batch_ws), seq_len, dtype=torch.int64, device=device)
+                y = torch.zeros_like(x)
+                wlens = []
+                for i, ws in enumerate(batch_ws):
+                    we = min(ws + seq_len, total_tokens)
+                    wlens.append(we - ws)
+                    chunk = val_tokens[ws:we + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+                    x[i, :we - ws] = chunk[:-1]
+                    y[i, :we - ws] = chunk[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = logits_fn(x)
+                nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
+                for i, ws in enumerate(batch_ws):
+                    s = 0 if ws == 0 else context_size
+                    wlen = wlens[i]
+                    loss_sum += nll[i, s:wlen].to(torch.float64).sum()
+                    token_count += float(wlen - s)
+                    prev_ids = x[i, s:wlen]
+                    tgt_ids = y[i, s:wlen]
+                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                    byte_count += token_bytes.to(torch.float64).sum()
+
+        chunk_seqs = (chunk_end - chunk_start) // seq_len
+        if args.ttt_epochs <= 0 or ci == num_chunks - 1 or chunk_seqs <= 0:
+            continue
+        lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        seq_start = chunk_seqs * rank // world_size
+        seq_end = chunk_seqs * (rank + 1) // world_size
+        max_local = (chunk_seqs + world_size - 1) // world_size
+        model.train()
+        for _ in range(args.ttt_epochs):
+            for local_start in range(0, max_local, args.ttt_batch_seqs):
+                local_end = min(local_start + args.ttt_batch_seqs, max_local)
+                bs = min(seq_start + local_start, seq_end)
+                be = min(seq_start + local_end, seq_end)
+                optimizer.zero_grad(set_to_none=True)
+                has_batch = be > bs
+                if has_batch:
+                    start_tok = chunk_start + bs * seq_len
+                    end_tok = chunk_start + be * seq_len + 1
+                    local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64, non_blocking=True)
+                    x = local[:-1].reshape(-1, seq_len)
+                    y = local[1:].reshape(-1, seq_len)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        train_loss = model(x, y)
+                    train_loss.backward()
+                sync_grads(has_batch)
+                if args.ttt_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(params, args.ttt_grad_clip)
+                optimizer.step()
+        if log_fn is not None and (ci == 0 or (ci + 1) % 100 == 0 or ci == num_chunks - 2):
+            log_fn(f"ttt:chunk:{ci + 1}/{num_chunks} lr:{lr:.6g} scored_windows:{len(windows)}")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+    model.eval()
+    return _loss_bpb(args, loss_sum, token_count, byte_count)
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1321,42 +1460,6 @@ class TopKMoE(nn.Module):
         return out_flat.reshape(orig_shape)
 
 
-<<<<<<< HEAD
-=======
-class TopKMoE(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int, top_k: int):
-        super().__init__()
-        if num_experts <= 0:
-            raise ValueError(f"num_experts must be positive, got {num_experts}")
-        if top_k <= 0 or top_k > num_experts:
-            raise ValueError(f"top_k must be in [1, num_experts], got top_k={top_k} num_experts={num_experts}")
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.router = CastedLinear(dim, num_experts, bias=False)
-        self.experts = nn.ModuleList(BaseMLP(dim, hidden_dim) for _ in range(num_experts))
-
-    def forward(self, x: Tensor) -> Tensor:
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, orig_shape[-1])
-        route_logits = self.router(x_flat).float()
-        route_probs = F.softmax(route_logits, dim=-1)
-        _, route_indices = route_logits.topk(self.top_k, dim=-1)
-        route_weights = route_probs.gather(1, route_indices) * (self.num_experts / self.top_k)
-        route_weights = route_weights.to(dtype=x.dtype)
-        out_flat = torch.zeros_like(x_flat)
-        for slot in range(self.top_k):
-            slot_indices = route_indices[:, slot]
-            slot_weights = route_weights[:, slot]
-            for expert_idx, expert in enumerate(self.experts):
-                token_mask = slot_indices == expert_idx
-                if not bool(token_mask.any()):
-                    continue
-                expert_out = expert(x_flat[token_mask])
-                out_flat[token_mask] += expert_out * slot_weights[token_mask, None]
-        return out_flat.reshape(orig_shape)
-
-
->>>>>>> 2ce5e3f (fix(train): adjust top-k MOE routing weights with softmax normalization)
 class ParcaeCausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -1581,6 +1684,9 @@ class GPT(nn.Module):
         self._current_input_ids: Tensor | None = None
         self.emb_scale = h.emb_scale
         self.logit_scale = h.logit_scale
+        self.coda_moe_num_experts = h.coda_moe_num_experts
+        self.coda_moe_top_k = h.coda_moe_top_k
+        self.poe_num_experts = h.poe_num_experts
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -1678,6 +1784,12 @@ class GPT(nn.Module):
         self.prelude_norm_layer = ParcaeRMSNorm(self.outer_dim) if self.prelude_norm else None
         self.final_norm = ParcaeRMSNorm(self.outer_dim)
         self.lm_head = None if h.tie_embeddings else CastedLinear(self.outer_dim, h.vocab_size, bias=False)
+        self.poe_heads = nn.ModuleList(
+            CastedLinear(self.outer_dim, h.vocab_size, bias=False)
+            for _ in range(max(h.poe_num_experts - 1, 0))
+        )
+        for head in self.poe_heads:
+            head._zero_init = True
 
         outer_kv_dim = h.num_kv_heads * (self.outer_dim // h.num_heads)
         recurrent_kv_dim = self.recurrent_num_heads * (self.recurrent_dim // self.recurrent_num_heads)
@@ -1817,6 +1929,8 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError('lm_head is required when tie_embeddings=False')
             logits_proj = self.lm_head(x)
+        for head in self.poe_heads:
+            logits_proj = logits_proj + head(x)
         logits_proj = logits_proj.float() * self.logit_scale
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -2134,6 +2248,33 @@ def main() -> None:
     signed_quant_max(args.quant_bits)
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
+    if args.xsa_last_n < 0:
+        raise ValueError(f"XSA_LAST_N must be non-negative, got {args.xsa_last_n}")
+    if args.coda_moe_num_experts < 0:
+        raise ValueError(f"CODA_MOE_NUM_EXPERTS must be non-negative, got {args.coda_moe_num_experts}")
+    if args.coda_moe_num_experts == 0 and args.coda_moe_top_k != 1:
+        raise ValueError("CODA_MOE_TOP_K must stay 1 when CODA_MOE_NUM_EXPERTS=0")
+    if args.coda_moe_num_experts > 0 and not (1 <= args.coda_moe_top_k <= args.coda_moe_num_experts):
+        raise ValueError(
+            f"CODA_MOE_TOP_K must be in [1, CODA_MOE_NUM_EXPERTS], got "
+            f"{args.coda_moe_top_k} for {args.coda_moe_num_experts} experts"
+        )
+    if args.coda_moe_mlp_mult < 0:
+        raise ValueError(f"CODA_MOE_MLP_MULT must be non-negative, got {args.coda_moe_mlp_mult}")
+    if args.poe_num_experts < 1:
+        raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
+    if args.poe_head_lr < 0:
+        raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
+    if not (0 < args.eval_stride <= args.train_seq_len):
+        raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
+    if args.ttt_chunk_tokens <= 0:
+        raise ValueError(f"TTT_CHUNK_TOKENS must be positive, got {args.ttt_chunk_tokens}")
+    if args.ttt_epochs < 0:
+        raise ValueError(f"TTT_EPOCHS must be non-negative, got {args.ttt_epochs}")
+    if args.ttt_batch_seqs <= 0:
+        raise ValueError(f"TTT_BATCH_SEQS must be positive, got {args.ttt_batch_seqs}")
+    if args.ttt_lr < 0 or args.ttt_momentum < 0 or args.ttt_grad_clip < 0:
+        raise ValueError("TTT_LR, TTT_MOMENTUM, and TTT_GRAD_CLIP must be non-negative")
     if args.gptq_enabled:
         if args.gptq_calibration_batches <= 0:
             raise ValueError("GPTQ_CALIBRATION_BATCHES must be positive when GPTQ_ENABLED=1")
@@ -2279,6 +2420,8 @@ def main() -> None:
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
+        if name.startswith('poe_heads.'):
+            continue
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
             matrix_params.append(p)
         else:
@@ -2311,9 +2454,13 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    head_params = []
     if base_model.lm_head is not None:
+        head_params.append(base_model.lm_head.weight)
+    head_params.extend(p for head in base_model.poe_heads for p in head.parameters())
+    if head_params:
         optimizer_head = torch.optim.Adam(
-            [{'params': [base_model.lm_head.weight], 'lr': args.head_lr, 'base_lr': args.head_lr}],
+            [{'params': head_params, 'lr': args.poe_head_lr, 'base_lr': args.poe_head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -2339,6 +2486,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"poe_experts:{args.poe_num_experts} poe_extra_heads:{len(base_model.poe_heads)} "
+        f"poe_head_lr:{args.poe_head_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_wd:{args.muon_wd} muon_row_normalize:{args.muon_row_normalize}"
     )
@@ -2356,6 +2505,11 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"ttt:enabled:{args.ttt_enabled} stride:{args.eval_stride} chunk_tokens:{args.ttt_chunk_tokens} "
+        f"epochs:{args.ttt_epochs} lr:{args.ttt_lr:g} momentum:{args.ttt_momentum:g} "
+        f"grad_clip:{args.ttt_grad_clip:g}"
     )
     log0(f"seed:{args.seed}")
 
@@ -2599,6 +2753,28 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_{quant_format}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.ttt_enabled:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_{quant_format}_zlib_roundtrip_ttt val_loss:{ttt_val_loss:.4f} "
+            f"val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_{quant_format}_zlib_roundtrip_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
