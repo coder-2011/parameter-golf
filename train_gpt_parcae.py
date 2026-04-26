@@ -107,6 +107,10 @@ class Hyperparameters:
     recurrent_rope_dims = int(os.environ.get("RECURRENT_ROPE_DIMS", rope_dims))
     recurrent_layer_rope_dims = os.environ.get("RECURRENT_LAYER_ROPE_DIMS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    ple_scope = os.environ.get("PLE_SCOPE", "none")
+    ple_dim = int(os.environ.get("PLE_DIM", 0))
+    ple_scale_init = float(os.environ.get("PLE_SCALE_INIT", "0.0"))
+    ple_init_std = float(os.environ.get("PLE_INIT_STD", "0.02"))
 
     # Parcae-style recurrent architecture.
     n_layers_in_prelude = int(os.environ.get("N_LAYERS_IN_PRELUDE", 1))
@@ -1377,6 +1381,20 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class PerLayerTokenEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, token_dim: int, out_dim: int, scale_init: float, init_std: float):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, token_dim)
+        self.proj = CastedLinear(token_dim, out_dim, bias=False)
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=1.0 / math.sqrt(token_dim))
+
+    def forward(self, token_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        x = self.proj(self.embed(token_ids))
+        return self.scale.to(dtype=dtype) * x
+
+
 class LinearCrossEntropyLoss(nn.Module):
     def __init__(
         self,
@@ -1780,6 +1798,21 @@ class GPT(nn.Module):
         self.coda_moe_num_experts = h.coda_moe_num_experts
         self.coda_moe_top_k = h.coda_moe_top_k
         self.poe_num_experts = h.poe_num_experts
+        self.ple_scope = h.ple_scope
+        self.ple_dim = h.ple_dim
+        self.ple_scale_init = h.ple_scale_init
+        self.ple_init_std = h.ple_init_std
+        valid_ple_scopes = {"none", "prelude", "core", "coda", "all"}
+        if self.ple_scope not in valid_ple_scopes:
+            raise ValueError(f"PLE_SCOPE must be one of {sorted(valid_ple_scopes)}, got {self.ple_scope!r}")
+        if self.ple_dim < 0:
+            raise ValueError(f"PLE_DIM must be non-negative, got {self.ple_dim}")
+        if self.ple_init_std <= 0.0:
+            raise ValueError(f"PLE_INIT_STD must be positive, got {self.ple_init_std}")
+        if self.ple_scope == "none" and self.ple_dim > 0:
+            raise ValueError("PLE_DIM > 0 requires PLE_SCOPE to be prelude, core, coda, or all")
+        if self.ple_scope != "none" and self.ple_dim == 0:
+            raise ValueError("PLE_SCOPE is enabled but PLE_DIM is 0")
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -1939,6 +1972,9 @@ class GPT(nn.Module):
                 if h.use_value_embeddings and has_ve(i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block, self.total_effective_layers)
             }
         )
+        self.prelude_ple = nn.ModuleList()
+        self.core_ple = nn.ModuleList()
+        self.coda_ple = nn.ModuleList()
 
         self.register_buffer(
             'outer_freqs_cis',
@@ -1951,10 +1987,35 @@ class GPT(nn.Module):
             persistent=False,
         )
         self._init_weights()
+        if self.ple_dim > 0:
+            if self.ple_scope in {"prelude", "all"}:
+                self.prelude_ple = self._make_ple_layers(self.n_layers_in_prelude, self.outer_dim)
+            if self.ple_scope in {"core", "all"}:
+                self.core_ple = self._make_ple_layers(self.n_layers_in_recurrent_block, self.recurrent_dim)
+            if self.ple_scope in {"coda", "all"}:
+                self.coda_ple = self._make_ple_layers(self.n_layers_in_coda, self.outer_dim)
         self.qat_linears = [module for module in self.modules() if isinstance(module, CastedLinear)]
         for module in self.qat_linears:
             module.qat_bits = self.qat_bits
             module.qat_enabled = False
+
+    def _make_ple_layers(self, count: int, out_dim: int) -> nn.ModuleList:
+        return nn.ModuleList(
+            PerLayerTokenEmbedding(
+                vocab_size=self.tok_emb.num_embeddings,
+                token_dim=self.ple_dim,
+                out_dim=out_dim,
+                scale_init=self.ple_scale_init,
+                init_std=self.ple_init_std,
+            )
+            for _ in range(count)
+        )
+
+    @staticmethod
+    def _apply_ple(x: Tensor, layers: nn.ModuleList, layer_idx: int, input_ids: Tensor) -> Tensor:
+        if layer_idx >= len(layers):
+            return x
+        return x + layers[layer_idx](input_ids, x.dtype)
 
     def _init_weights(self) -> None:
         base_std = math.sqrt(2.0 / (5.0 * self.outer_dim))
@@ -2021,6 +2082,7 @@ class GPT(nn.Module):
         x = input_embeds
         for i, block in enumerate(self.prelude):
             ve = self.prelude_value_embeds[str(i)](input_ids) if str(i) in self.prelude_value_embeds else None
+            x = self._apply_ple(x, self.prelude_ple, i, input_ids)
             x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
 
         if self.prelude_norm_layer is not None:
@@ -2033,6 +2095,7 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.coda):
             ve = self.coda_value_embeds[str(i)](input_ids) if str(i) in self.coda_value_embeds else None
+            x = self._apply_ple(x, self.coda_ple, i, input_ids)
             if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
                 x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
             else:
@@ -2172,6 +2235,7 @@ class GPT(nn.Module):
             raise RuntimeError('current input ids are not set')
         for layer_idx, block in enumerate(self.core_block):
             ve = self.core_value_embeds[str(layer_idx)](input_ids) if str(layer_idx) in self.core_value_embeds else None
+            x = self._apply_ple(x, self.core_ple, layer_idx, input_ids)
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
                 x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve)
             else:
@@ -2553,12 +2617,17 @@ def main() -> None:
     # - all remaining matrices use MATRIX_LR via Muon
     # - vectors/scalars/control params use SCALAR_LR via Adam
     named_params = list(base_model.named_parameters())
+    def is_token_embedding_param(name: str) -> bool:
+        return name in {'tok_emb.weight', 'bigram_hash.embed.weight'} or (
+            name.startswith(('prelude_ple.', 'core_ple.', 'coda_ple.')) and name.endswith('.embed.weight')
+        )
+
     matrix_params = []
     scalar_params = []
     for name, p in named_params:
         if not p.requires_grad:
             continue
-        if name in {'tok_emb.weight', 'bigram_hash.embed.weight'}:
+        if is_token_embedding_param(name):
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
@@ -2570,9 +2639,8 @@ def main() -> None:
             scalar_params.append(p)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    token_param_group = [{'params': [base_model.tok_emb.weight], 'lr': token_lr, 'base_lr': token_lr}]
-    if base_model.bigram_hash is not None:
-        token_param_group.append({'params': [base_model.bigram_hash.embed.weight], 'lr': token_lr, 'base_lr': token_lr})
+    token_params = [p for name, p in named_params if p.requires_grad and is_token_embedding_param(name)]
+    token_param_group = [{'params': token_params, 'lr': token_lr, 'base_lr': token_lr}]
     optimizer_tok = torch.optim.Adam(
         token_param_group,
         betas=(args.beta1, args.beta2),
@@ -2627,6 +2695,16 @@ def main() -> None:
         f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
         f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
         f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale}"
+    )
+    ple_params = sum(
+        p.numel()
+        for modules in (base_model.prelude_ple, base_model.core_ple, base_model.coda_ple)
+        for module in modules
+        for p in module.parameters()
+    )
+    log0(
+        f"ple:scope:{args.ple_scope} dim:{args.ple_dim} scale_init:{args.ple_scale_init:g} "
+        f"init_std:{args.ple_init_std:g} params:{ple_params}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
