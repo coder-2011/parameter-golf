@@ -1,0 +1,1 @@
+{"type":"config","name":"Minimize RWKV-7 FineWeb SP1892 val BPB under 5-min / 16-MB INT6","metricName":"val_bpb","metricUnit":"","bestDirection":"lower"}

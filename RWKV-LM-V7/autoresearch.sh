@@ -137,7 +137,7 @@ python eval_fineweb_bpb.py \
   --n_layer "$N_LAYER" \
   --n_embd "$N_EMBD" \
   --dim_att "$DIM_ATT" \
-  --dim_fnn "$DIM_FFN" \
+  --dim_ffn "$DIM_FFN" \
   --head_size "$HEAD_SIZE" \
   --rope_mode "$ROPE_MODE" \
   --rope_dims "$ROPE_DIMS" \
@@ -163,7 +163,7 @@ if [ -z "$VAL_LOSS" ]; then
     VAL_LOSS="999"
 fi
 
-# parse train step count from last line of train_log.csv if present
+# parse train step count from last line of loss_log.csv if present
 TRAIN_STEPS=0
 if [ -f "$PROJ_DIR/loss_log.csv" ]; then
     TRAIN_STEPS=$(tail -1 "$PROJ_DIR/loss_log.csv" | cut -d',' -f2 | tr -d ' ' || echo 0)
@@ -175,6 +175,7 @@ if [ -f "$PROJ_DIR/loss_log.csv" ]; then
     TRAIN_LOSS=$(tail -1 "$PROJ_DIR/loss_log.csv" | cut -d',' -f5 | tr -d ' ' || echo "")
 fi
 
+INT6_SIZE=$(stat --format=%s "$PROJ_DIR/rwkv-final.int6.ptz" 2>/dev/null || echo 0)
 INT6_MB=$(python3 -c "print(f'{int('$INT6_SIZE')/1024/1024:.4f}')" 2>/dev/null || echo "0")
 
 echo "METRIC val_bpb=$VAL_BPB"
