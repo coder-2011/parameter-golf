@@ -201,6 +201,55 @@ Caveats:
   head, vectors/scalars, norms, and gain-like tensors stay on AdamW; only hidden
   2D matrix parameters use Muon.
 
+## 2026-04-27 RMSNorm Trial, 5 Minutes
+
+| Field | Value |
+| --- | --- |
+| Run dir | `out/fineweb-sp1892-rmsnorm-10min-L8-D512-x070` |
+| Checkpoint | `out/fineweb-sp1892-rmsnorm-10min-L8-D512-x070/rwkv-final.pth` |
+| Base config | Same SP1892 FineWeb, RWKV x070 8x512, ctx 1024, bf16 as baseline |
+| Norm | `--norm_type rmsnorm` |
+| RoPE | disabled, `rope_mode=none` |
+| Optimizer | AdamW |
+| Strategy | DeepSpeed stage 2 |
+| Time cap | 300 seconds |
+| Exit token cap | disabled for this run, `my_exit_tokens=0` |
+
+Training command:
+
+```bash
+NORM_TYPE=rmsnorm ROPE_MODE=none MY_EXIT_SECONDS=300 MY_EXIT_TOKENS=0 \
+  ./run-fineweb-10min.sh
+```
+
+Validation command:
+
+```bash
+python3 eval_fineweb_bpb.py \
+  --load_model out/fineweb-sp1892-rmsnorm-10min-L8-D512-x070/rwkv-final.pth \
+  --norm_type rmsnorm \
+  --rope_mode none
+```
+
+Validation result:
+
+| Metric | Value |
+| --- | ---: |
+| Final timed step | 3208 |
+| Train avg loss | 3.31999591 |
+| `val_loss` | 2.98938593 |
+| `val_bpb` | 1.52069558 |
+| Scored tokens | 53,270,528 |
+| Scored bytes | 151,078,006 |
+| Eval stride | 1024, non-overlapping |
+
+Caveats:
+
+- RMSNorm was slightly worse than the LayerNorm baseline in this comparable
+  5-minute trial (`1.52069558` vs `1.51916871` BPB).
+- This is close enough that random initialization noise may matter, but it is
+  not an immediate improvement on the current best short-run result.
+
 ## 2026-04-26 RoPE Experiment Path
 
 Implemented a default-off RoPE path for RWKV time-mix:
@@ -343,3 +392,71 @@ Checks run:
 - `python -m unittest tests.test_norms tests.test_rope tests.test_weight_tying tests.test_lr_schedule`
 - `bash -n run-fineweb-10min.sh demo-training-run-fineweb.sh`
 - `python train.py --help | rg -n -- "--cooldown_steps"`
+
+## 2026-04-27 Deep/Narrow Scaled-Down RWKV
+
+Tested a scaled-down deep/narrow shape after `L29-D512` proved too slow for the
+5-minute local budget.
+
+| Field | Value |
+| --- | ---: |
+| Shape | `L16-D384`, `dim_att=384`, `dim_ffn=1536`, `head_size=64` |
+| Params | 33,028,608 |
+| Norm / RoPE | LayerNorm, no RoPE |
+| Runtime cap | 300s |
+| Final step | 1,928 |
+| Tokens | 31,588,352 |
+| Avg train loss | 3.54086975 |
+| Throughput near end | ~120 Ktok/s |
+| Checkpoint | `out/fineweb-sp1892-deepnarrow-L16-D384-5min-x070/rwkv-final.pth` |
+| Checkpoint size | 64M |
+| Eval val_loss | 3.13026364 |
+| Eval val_bpb | 1.59235983 |
+
+Notes:
+
+- The interrupted `L29-D512` attempt was about 102M params and ran around
+  54-55 Ktok/s, so it was not a useful 5-minute local-budget shape.
+- `L16-D384` was much faster, but still scored worse than the 8x512 LayerNorm
+  baseline (`val_bpb=1.51916871`).
+- This result suggests simply making RWKV deeper and narrower is not currently
+  helping under the short local training budget.
+
+## 2026-04-27 SDPA Hybrid Attention Path
+
+Implemented a default-off hybrid architecture path where selected nonzero RWKV
+layers replace `RWKV_Tmix_x070` with a PyTorch SDPA causal self-attention anchor.
+
+| Flag | Default | Meaning |
+| --- | ---: | --- |
+| `--attn_every` | `0` | Disabled when `0`; otherwise select every Nth nonzero layer |
+| `--attn_offset` | `0` | First selected layer; `0` maps to `attn_every` in train/eval entrypoints |
+| `--attn_heads` | `0` | Derived from `attn_dim / head_size` when `0` |
+| `--attn_dim` | `0` | Uses `n_embd` when `0` |
+| `--attn_dropout` | `0.0` | SDPA dropout during training |
+| `--attn_rope` | `1` | Apply RoPE to attention q/k |
+
+Implementation details:
+
+- Layer 0 always remains RWKV so `v_first` is initialized for later recurrent
+  layers.
+- Attention layers preserve the existing block contract by returning
+  `(x_attn, v_first)`.
+- Attention output projection is zero-initialized, matching the residual-safe
+  style used elsewhere in the RWKV blocks.
+- `run-fineweb-10min.sh`, `demo-training-run-fineweb.sh`, and
+  `eval_fineweb_bpb.py` all expose matching flags.
+
+Checks run:
+
+- `python3 -m py_compile train.py src/model.py eval_fineweb_bpb.py tests/test_hybrid_attention.py`
+- `bash -n run-fineweb-10min.sh demo-training-run-fineweb.sh`
+- `python3 -m unittest tests.test_hybrid_attention tests.test_rope tests.test_norms tests.test_weight_tying`
+- Tiny train smoke:
+  `N_LAYER=2 N_EMBD=128 CTX_LEN=128 M_BSZ=2 ATTN_EVERY=1 ATTN_OFFSET=1 MY_EXIT_TOKENS=8192 PROJ_DIR=out/smoke-hybrid-attn ./demo-training-run-fineweb.sh`
+- Tiny eval smoke:
+  `python3 eval_fineweb_bpb.py --load_model out/smoke-hybrid-attn/rwkv-final.pth --n_layer 2 --n_embd 128 --dim_att 128 --dim_ffn 512 --ctx_len 128 --micro_bsz 2 --attn_every 1 --attn_offset 1 --attn_rope 1 --max_spans 2`
+
+Next comparable run should start with one attention anchor in the 8x512 baseline
+shape, for example `ATTN_EVERY=4 ATTN_OFFSET=4`, then evaluate with matching
+`--attn_every 4 --attn_offset 4`.
