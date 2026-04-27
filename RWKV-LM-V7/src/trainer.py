@@ -152,6 +152,44 @@ def _wandb_log(trainer, metrics, step):
     wandb.log({k: v for k, v in payload.items() if v is not None}, step=int(step))
 
 
+def scheduled_lr(args, step: int) -> float:
+    warmup_steps = int(args.warmup_steps)
+    lr = float(args.lr_init)
+
+    if args.my_exit_tokens != 0:
+        real_tokens = step * args.ctx_len * args.real_bsz
+        warmup_tokens = warmup_steps * args.ctx_len * args.real_bsz
+        progress = (real_tokens - warmup_tokens) / (
+            abs(args.my_exit_tokens) - warmup_tokens
+        )
+        progress = max(0.0, min(1.0, progress))
+        lr_final_factor = args.lr_final / args.lr_init
+        lr_mult = (0.5 + lr_final_factor / 2) + (
+            0.5 - lr_final_factor / 2
+        ) * math.cos(math.pi * progress)
+        if args.my_exit_tokens > 0:
+            lr = args.lr_init * lr_mult
+        else:
+            lr = (lr + args.lr_init * lr_mult) / 2
+    else:
+        cooldown_steps = max(0, int(getattr(args, "cooldown_steps", 0)))
+        total_steps = max(0, int(getattr(args, "epoch_steps", 0)))
+        if cooldown_steps > 0 and total_steps > 0:
+            cooldown_start = max(total_steps - cooldown_steps, 0)
+            if step >= cooldown_start:
+                progress = (step - cooldown_start) / max(cooldown_steps, 1)
+                progress = max(0.0, min(1.0, progress))
+                lr_final_factor = args.lr_final / args.lr_init
+                lr_mult = (0.5 + lr_final_factor / 2) + (
+                    0.5 - lr_final_factor / 2
+                ) * math.cos(math.pi * progress)
+                lr = args.lr_init * lr_mult
+
+    if step < warmup_steps:
+        lr = lr * (0.01 + 0.99 * step / warmup_steps)
+    return lr
+
+
 class train_callback(pl.Callback):
     def __init__(self, args):
         super().__init__()
@@ -167,26 +205,16 @@ class train_callback(pl.Callback):
         real_step = trainer.global_step + args.epoch_begin * args.epoch_steps
         token_per_step = args.ctx_len * args.real_bsz
 
-        # LR schedule
-        w_step = args.warmup_steps
-        lr = args.lr_init
+        lr = scheduled_lr(args, trainer.global_step)
         wd_now = args.weight_decay
 
         if args.my_exit_tokens != 0:  # cosine decay
             real_tokens = real_step * args.ctx_len * args.real_bsz
-            warmup_tokens = w_step * args.ctx_len * args.real_bsz
+            warmup_tokens = args.warmup_steps * args.ctx_len * args.real_bsz
             progress = (real_tokens - warmup_tokens) / (
                 abs(args.my_exit_tokens) - warmup_tokens
             )
             progress = max(0, min(1, progress))
-            lr_final_factor = args.lr_final / args.lr_init
-            lr_mult = (0.5 + lr_final_factor / 2) + (
-                0.5 - lr_final_factor / 2
-            ) * math.cos(math.pi * progress)
-            if args.my_exit_tokens > 0:
-                lr = args.lr_init * lr_mult
-            else:
-                lr = (lr + args.lr_init * lr_mult) / 2
             if progress >= 1:
                 if (trainer.is_global_zero) or ("deepspeed_stage_3" in args.strategy):
                     to_save_dict = pl_module.state_dict()
@@ -226,8 +254,6 @@ class train_callback(pl.Callback):
                     import sys
 
                     sys.exit(0)
-        if trainer.global_step < w_step:
-            lr = lr * (0.01 + 0.99 * trainer.global_step / w_step)
 
         lr_scale = lr / args.lr_init if args.lr_init != 0 else 1.0
         muon_momentum = None

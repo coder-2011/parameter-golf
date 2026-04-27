@@ -23,6 +23,7 @@ PROJ_DIR="${PROJ_DIR:-out/fineweb-sp${VOCAB_SIZE}${ROPE_SUFFIX}-L${N_LAYER}-D${N
 M_BSZ="${M_BSZ:-4}"
 LR_INIT="${LR_INIT:-6e-4}"
 LR_FINAL="${LR_FINAL:-6e-5}"
+COOLDOWN_STEPS="${COOLDOWN_STEPS:-0}"
 GRAD_CP="${GRAD_CP:-0}"
 EPOCH_SAVE="${EPOCH_SAVE:-1}"
 
@@ -49,6 +50,7 @@ python train.py \
  --beta1 0.9 \
  --beta2 0.99 \
  --compile 0 \
+ --cooldown_steps $COOLDOWN_STEPS \
  --ctx_len $CTX_LEN \
  --data_file $DATA_FILE \
  --data_type $DATA_TYPE \

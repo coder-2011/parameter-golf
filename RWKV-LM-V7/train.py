@@ -52,6 +52,7 @@ if __name__ == "__main__":
     # 6e-4 for L12-D768, 4e-4 for L24-D1024, 3e-4 for L24-D2048
     parser.add_argument("--lr_init", default=6e-4, type=float)
     parser.add_argument("--lr_final", default=1e-5, type=float)
+    parser.add_argument("--cooldown_steps", default=0, type=int)
     parser.add_argument(
         "--warmup_steps", default=-1, type=int
     )  # try 10 if you load a model
@@ -232,6 +233,7 @@ if __name__ == "__main__":
             f"tie_embeddings {bool(args.tie_embeddings)}\n"
             f"#\n"
             f"# Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, "
+            f"cooldown {args.cooldown_steps} steps, "
             f"beta {args.betas}, eps {args.adam_eps}\n"
             f"#\n"
             f"# Found torch {torch.__version__}, recommend latest torch\n"
