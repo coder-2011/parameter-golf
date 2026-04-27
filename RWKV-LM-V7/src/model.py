@@ -148,7 +148,7 @@ if "x070" in os.environ["RWKV_MY_TESTING"]:
 
     def RUN_CUDA_RWKV7g(q, w, k, v, a, b):
         B, T, HC = q.shape
-        q, w, k, v, a, b = [i.view(B, T, HC // 64, 64)
+        q, w, k, v, a, b = [i.view(B, T, HC // HEAD_SIZE, HEAD_SIZE)
                             for i in [q, w, k, v, a, b]]
         return WindBackstepping.apply(w, q, k, v, a, b).view(B, T, HC)
 
@@ -166,7 +166,7 @@ class RWKV_Tmix_x070(nn.Module):
 
         self.head_size = args.head_size
         self.n_head = args.dim_att // self.head_size
-        assert args.dim_att % self.n_head == 0
+        assert args.dim_att % self.head_size == 0
         H = self.n_head
         N = self.head_size
         C = args.n_embd
@@ -388,6 +388,55 @@ class RWKV_CMix_x070(nn.Module):
 #################################################################
 
 
+def _topk_chunk_sparse_attention(q, k, v, chunk_size, topk, dropout_p=0.0):
+    B, H, T, D = q.shape
+    if topk <= 1 or T <= chunk_size * topk:
+        return F.scaled_dot_product_attention(
+            q, k, v, dropout_p=dropout_p, is_causal=True
+        )
+
+    scale = D ** -0.5
+    out = torch.empty_like(q)
+    num_chunks = (T + chunk_size - 1) // chunk_size
+    token_idx = torch.arange(T, device=q.device)
+
+    for b in range(B):
+        for h in range(H):
+            qb = q[b, h]
+            kb = k[b, h]
+            vb = v[b, h]
+            chunk_means = []
+            for chunk_id in range(num_chunks):
+                start = chunk_id * chunk_size
+                end = min(start + chunk_size, T)
+                chunk_means.append(kb[start:end].float().mean(dim=0))
+            chunk_means = torch.stack(chunk_means, dim=0)
+
+            for t in range(T):
+                current_chunk = t // chunk_size
+                local_start = current_chunk * chunk_size
+                pieces = [token_idx[local_start : t + 1]]
+                extra_topk = min(topk - 1, current_chunk)
+                if extra_topk > 0:
+                    gate = chunk_means[:current_chunk] @ qb[t].float()
+                    selected = torch.topk(
+                        gate, k=extra_topk, largest=True, sorted=False
+                    ).indices.sort().values
+                    for selected_chunk in selected:
+                        start = int(selected_chunk.item()) * chunk_size
+                        end = min(start + chunk_size, T)
+                        pieces.append(token_idx[start:end])
+                attn_idx = torch.cat(pieces, dim=0)
+                selected_k = kb.index_select(0, attn_idx)
+                selected_v = vb.index_select(0, attn_idx)
+                logits = (qb[t : t + 1].float() @ selected_k.float().T) * scale
+                probs = torch.softmax(logits, dim=-1).to(dtype=vb.dtype)
+                if dropout_p > 0:
+                    probs = F.dropout(probs, p=dropout_p, training=True)
+                out[b, h, t] = (probs @ selected_v).squeeze(0)
+    return out
+
+
 class CausalSelfAttention(nn.Module):
     @torch.no_grad()
     def __init__(self, args, layer_id):
@@ -395,6 +444,9 @@ class CausalSelfAttention(nn.Module):
         self.args = args
         self.layer_id = layer_id
         C = args.n_embd
+        self.attn_mode = getattr(args, "attn_mode", "full")
+        if self.attn_mode not in {"full", "moba"}:
+            raise ValueError(f"unsupported attn_mode {self.attn_mode!r}")
         self.attn_dim = int(getattr(args, "attn_dim", 0)) or C
         self.n_head = int(getattr(args, "attn_heads", 0)) or max(
             1, self.attn_dim // args.head_size
@@ -406,6 +458,13 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.attn_dim // self.n_head
         self.dropout = float(getattr(args, "attn_dropout", 0.0))
         self.use_rope = bool(getattr(args, "attn_rope", 1))
+        self.rope_dims = int(getattr(args, "rope_dims", 0)) or self.head_dim
+        self.moba_chunk_size = int(getattr(args, "moba_chunk_size", 256))
+        self.moba_topk = int(getattr(args, "moba_topk", 4))
+        if self.moba_chunk_size <= 0:
+            raise ValueError("moba_chunk_size must be positive")
+        if self.moba_topk <= 0:
+            raise ValueError("moba_topk must be positive")
 
         self.qkv = nn.Linear(C, 3 * self.attn_dim, bias=False)
         self.output = nn.Linear(self.attn_dim, C, bias=False)
@@ -413,12 +472,14 @@ class CausalSelfAttention(nn.Module):
         self.output.weight.data.zero_()
 
         if self.use_rope:
-            if self.head_dim % 2 != 0:
-                raise ValueError("attention RoPE requires an even attention head dimension")
+            if self.rope_dims <= 0 or self.rope_dims > self.head_dim or self.rope_dims % 2 != 0:
+                raise ValueError(
+                    f"attention rope_dims must be a positive even value <= attention head dimension; got rope_dims={self.rope_dims} head_dim={self.head_dim}"
+                )
             self.rope_theta = float(getattr(args, "rope_theta", 10000.0))
             inv_freq = 1.0 / (
                 self.rope_theta
-                ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+                ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims)
             )
             self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
 
@@ -426,14 +487,16 @@ class CausalSelfAttention(nn.Module):
         B, T, H, D = x.size()
         pos = torch.arange(T, device=x.device, dtype=self.rope_inv_freq.dtype)
         freqs = torch.outer(pos, self.rope_inv_freq.to(device=x.device))
-        cos = freqs.cos().to(dtype=x.dtype).view(1, T, 1, D // 2)
-        sin = freqs.sin().to(dtype=x.dtype).view(1, T, 1, D // 2)
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        x_rot = torch.empty_like(x)
+        cos = freqs.cos().to(dtype=x.dtype).view(1, T, 1, self.rope_dims // 2)
+        sin = freqs.sin().to(dtype=x.dtype).view(1, T, 1, self.rope_dims // 2)
+        x_rope = x[..., : self.rope_dims]
+        x_pass = x[..., self.rope_dims :]
+        x_even = x_rope[..., 0::2]
+        x_odd = x_rope[..., 1::2]
+        x_rot = torch.empty_like(x_rope)
         x_rot[..., 0::2] = x_even * cos - x_odd * sin
         x_rot[..., 1::2] = x_even * sin + x_odd * cos
-        return x_rot
+        return torch.cat((x_rot, x_pass), dim=-1)
 
     @CompileFunction
     def forward(self, x, v_first):
@@ -445,13 +508,19 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
-        )
+        dropout_p = self.dropout if self.training else 0.0
+        if self.attn_mode == "moba":
+            x = _topk_chunk_sparse_attention(
+                q, k, v, self.moba_chunk_size, self.moba_topk, dropout_p=dropout_p
+            )
+        else:
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                is_causal=True,
+            )
         x = x.transpose(1, 2).contiguous().view(B, T, self.attn_dim)
         return self.output(x), v_first
 
@@ -521,6 +590,8 @@ class RWKV(pl.LightningModule):
             args.attn_every = 0
         if not hasattr(args, "attn_offset"):
             args.attn_offset = args.attn_every
+        if not hasattr(args, "attn_mode"):
+            args.attn_mode = "full"
         if not hasattr(args, "attn_heads"):
             args.attn_heads = 0
         if not hasattr(args, "attn_dim"):
@@ -529,6 +600,12 @@ class RWKV(pl.LightningModule):
             args.attn_dropout = 0.0
         if not hasattr(args, "attn_rope"):
             args.attn_rope = 1
+        if not hasattr(args, "moba_chunk_size"):
+            args.moba_chunk_size = 256
+        if not hasattr(args, "moba_topk"):
+            args.moba_topk = 4
+        if args.attn_mode not in {"full", "moba"}:
+            raise ValueError(f"unsupported attn_mode {args.attn_mode!r}")
         if not hasattr(args, "dim_att"):
             args.dim_att = args.n_embd
         # Set a sane default when the flag is missing *or* non-positive
@@ -547,8 +624,14 @@ class RWKV(pl.LightningModule):
             raise ValueError(
                 f"attn_dim must be divisible by attn_heads; got {args.attn_dim} and {args.attn_heads}"
             )
-        if bool(args.attn_rope) and (args.attn_dim // args.attn_heads) % 2 != 0:
-            raise ValueError("attention RoPE requires an even attention head dimension")
+        attn_head_dim = args.attn_dim // args.attn_heads
+        attn_rope_dims = args.rope_dims or attn_head_dim
+        if bool(args.attn_rope) and (
+            attn_rope_dims <= 0 or attn_rope_dims > attn_head_dim or attn_rope_dims % 2 != 0
+        ):
+            raise ValueError(
+                "attention rope_dims must be a positive even value <= attention head dimension"
+            )
 
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
 

@@ -179,10 +179,13 @@ def load_rwkv_model(args: argparse.Namespace, device: torch.device) -> torch.nn.
         learned_shift_state=args.learned_shift_state,
         attn_every=args.attn_every,
         attn_offset=args.attn_offset if args.attn_offset > 0 else args.attn_every,
+        attn_mode=args.attn_mode,
         attn_heads=args.attn_heads,
         attn_dim=args.attn_dim,
         attn_dropout=0.0,
         attn_rope=args.attn_rope,
+        moba_chunk_size=args.moba_chunk_size,
+        moba_topk=args.moba_topk,
         norm_type=args.norm_type,
         tie_embeddings=args.tie_embeddings,
         my_testing=args.my_testing,
@@ -299,9 +302,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learned_shift_state", type=int, default=0)
     parser.add_argument("--attn_every", type=int, default=0)
     parser.add_argument("--attn_offset", type=int, default=0)
+    parser.add_argument("--attn_mode", default="full", choices=["full", "moba"])
     parser.add_argument("--attn_heads", type=int, default=0)
     parser.add_argument("--attn_dim", type=int, default=0)
     parser.add_argument("--attn_rope", type=int, default=1)
+    parser.add_argument("--moba_chunk_size", type=int, default=256)
+    parser.add_argument("--moba_topk", type=int, default=4)
     parser.add_argument(
         "--norm_type", default="layernorm", choices=["layernorm", "rmsnorm"]
     )
@@ -313,15 +319,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.attn_mode == "moba" and args.compile:
+        print("Disabling --compile for --attn_mode moba because sparse top-k routing uses Python control flow.")
+        args.compile = 0
     val_loss, val_bpb, scored_tokens, scored_bytes = evaluate(args)
     stride = args.stride if args.stride > 0 else args.ctx_len
     print(
         f"val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f} "
         f"scored_tokens:{scored_tokens} scored_bytes:{scored_bytes} "
         f"ctx_len:{args.ctx_len} stride:{stride} vocab_size:{args.vocab_size} "
-        f"rope_mode:{args.rope_mode} learned_shift_state:{args.learned_shift_state} "
+        f"rope_mode:{args.rope_mode} rope_dims:{args.rope_dims} "
+        f"learned_shift_state:{args.learned_shift_state} "
         f"norm_type:{args.norm_type} "
-        f"attn_every:{args.attn_every} attn_offset:{args.attn_offset if args.attn_offset > 0 else args.attn_every}"
+        f"attn_every:{args.attn_every} attn_offset:{args.attn_offset if args.attn_offset > 0 else args.attn_every} "
+        f"attn_mode:{args.attn_mode} attn_rope:{args.attn_rope} "
+        f"moba_chunk_size:{args.moba_chunk_size} moba_topk:{args.moba_topk}"
     )
 
 

@@ -12,6 +12,24 @@ os.environ.setdefault("RWKV_MY_TESTING", "")
 from src.model import CausalSelfAttention, RWKV, RWKV_Tmix_x070, is_attention_layer
 
 
+def reference_attention_rope(x, theta, rope_dims=None):
+    bsz, seq_len, n_head, head_dim = x.shape
+    rope_dims = rope_dims or head_dim
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims)
+    )
+    freqs = torch.outer(torch.arange(seq_len, dtype=torch.float32), inv_freq)
+    cos = freqs.cos().to(dtype=x.dtype).view(1, seq_len, 1, rope_dims // 2)
+    sin = freqs.sin().to(dtype=x.dtype).view(1, seq_len, 1, rope_dims // 2)
+    x_rope = x[..., :rope_dims]
+    x_pass = x[..., rope_dims:]
+    pairs = x_rope.view(bsz, seq_len, n_head, rope_dims // 2, 2)
+    rotated = torch.empty_like(pairs)
+    rotated[..., 0] = pairs[..., 0] * cos - pairs[..., 1] * sin
+    rotated[..., 1] = pairs[..., 1] * cos + pairs[..., 0] * sin
+    return torch.cat((rotated.view(bsz, seq_len, n_head, rope_dims), x_pass), dim=-1)
+
+
 def make_args(**overrides):
     args = dict(
         vocab_size=1892,
@@ -80,6 +98,41 @@ class HybridAttentionTest(unittest.TestCase):
         self.assertEqual(y.shape, x.shape)
         self.assertIsNotNone(x.grad)
         self.assertTrue(torch.isfinite(x.grad).all())
+
+    def test_attention_rope_matches_interleaved_reference(self):
+        module = CausalSelfAttention(
+            make_args(attn_dim=64, attn_heads=2, rope_theta=10000.0), layer_id=4
+        )
+        x = torch.randn(2, 5, 2, 32)
+
+        y = module._apply_rope(x)
+        expected = reference_attention_rope(x, theta=10000.0)
+
+        torch.testing.assert_close(y, expected)
+        torch.testing.assert_close(y[:, 0], x[:, 0])
+        self.assertFalse(torch.allclose(y[:, 1:], x[:, 1:]))
+
+    def test_attention_partial_rope_leaves_tail_dims_unchanged(self):
+        module = CausalSelfAttention(
+            make_args(attn_dim=64, attn_heads=2, rope_dims=16), layer_id=4
+        )
+        x = torch.randn(2, 5, 2, 32)
+
+        y = module._apply_rope(x)
+        expected = reference_attention_rope(x, theta=10000.0, rope_dims=16)
+
+        torch.testing.assert_close(y, expected)
+        torch.testing.assert_close(y[..., 16:], x[..., 16:])
+        self.assertFalse(torch.allclose(y[:, 1:, :, :16], x[:, 1:, :, :16]))
+
+    def test_attention_rope_requires_valid_rope_dims(self):
+        for rope_dims in (15, 34):
+            with self.subTest(rope_dims=rope_dims):
+                with self.assertRaisesRegex(ValueError, "attention rope_dims"):
+                    CausalSelfAttention(
+                        make_args(attn_dim=64, attn_heads=2, rope_dims=rope_dims),
+                        layer_id=4,
+                    )
 
     def test_attention_state_dict_roundtrip(self):
         module = CausalSelfAttention(make_args(attn_dim=64, attn_heads=1), layer_id=4)

@@ -100,10 +100,13 @@ if __name__ == "__main__":
     parser.add_argument("--learned_shift_state", default=0, type=int)
     parser.add_argument("--attn_every", default=0, type=int)
     parser.add_argument("--attn_offset", default=0, type=int)
+    parser.add_argument("--attn_mode", default="full", choices=["full", "moba"], type=str)
     parser.add_argument("--attn_heads", default=0, type=int)
     parser.add_argument("--attn_dim", default=0, type=int)
     parser.add_argument("--attn_dropout", default=0.0, type=float)
     parser.add_argument("--attn_rope", default=1, type=int)
+    parser.add_argument("--moba_chunk_size", default=256, type=int)
+    parser.add_argument("--moba_topk", default=4, type=int)
     parser.add_argument(
         "--norm_type",
         default="layernorm",
@@ -124,6 +127,9 @@ if __name__ == "__main__":
         raise ValueError("--optimizer muon is only wired for single-GPU/DDP paths; use --strategy auto or ddp")
     if args.quant_bits != 0 and not (2 <= args.quant_bits <= 8):
         raise ValueError(f"--quant_bits must be 0 or in [2, 8], got {args.quant_bits}")
+    if args.attn_mode == "moba" and args.compile:
+        rank_zero_info("Disabling --compile for --attn_mode moba because sparse top-k routing uses Python control flow.")
+        args.compile = 0
 
     ########################################################################################################
 
