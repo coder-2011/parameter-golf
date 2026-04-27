@@ -172,3 +172,6 @@ Follow-up: SP1892 local data was installed under `data_sp1892/` using `data/down
 ## 2026-04-26 RWKV RoPE experiment
 
 `RWKV-LM-V7` has a default-off RoPE path controlled by `--rope_mode none|rk` and `--rope_theta`. The enabled mode rotates the RWKV time-mix recurrent query/key analogues (`r` and `k`) per head after their linear projections and before `fused_k_rwkv7`, so both `kk` and the updated key entering the RWKV7 kernel carry the positional rotation. The inverse-frequency buffer is non-persistent, so RoPE adds no checkpoint tensors. Use `ROPE_MODE=rk` in the FineWeb run scripts to enable it; output dirs get a `-roperk` suffix by default.
+
+- 2026-04-27: RWKV Muon now delegates the matrix optimizer step to `torch.optim.Muon`; local code only keeps RWKV-specific parameter grouping and a compatibility constructor.
+- 2026-04-27: RWKV partial RoPE is controlled by `--rope_dims`; for the current head size 64, `rope_dims=16` is 25%. A 300s SP1892 FineWeb run scored `val_bpb=1.53697412`, slightly better than full RoPE `1.53729809` but still worse than no-RoPE `1.51916871`.

@@ -171,7 +171,49 @@ Checks run:
 - One-window eval load worked for the existing no-RoPE checkpoint with
   `rope_mode=none`.
 
-No full RoPE BPB run has been completed yet.
+Completed 5-minute RoPE comparison runs:
+
+| Variant | Run dir | RoPE dims / head | Final timed step | Train avg loss | Validation BPB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Full RoPE | `out/fineweb-sp1892-roperk-10min-L8-D512-x070` | 64 / 64, 100% | 3105 | about 3.336 | 1.53729809 |
+| Partial RoPE | `out/fineweb-sp1892-roperkd16-10min-L8-D512-x070` | 16 / 64, 25% | 2907 | 3.34981295 | 1.53697412 |
+
+Full RoPE validation command:
+
+```bash
+python3 eval_fineweb_bpb.py \
+  --load_model out/fineweb-sp1892-roperk-10min-L8-D512-x070/rwkv-final.pth \
+  --rope_mode rk
+```
+
+Partial RoPE validation command:
+
+```bash
+python3 eval_fineweb_bpb.py \
+  --load_model out/fineweb-sp1892-roperkd16-10min-L8-D512-x070/rwkv-final.pth \
+  --rope_mode rk \
+  --rope_dims 16
+```
+
+Partial RoPE result:
+
+| Metric | Value |
+| --- | ---: |
+| `val_loss` | 3.02138632 |
+| `val_bpb` | 1.53697412 |
+| Scored tokens | 53,270,528 |
+| Scored bytes | 151,078,006 |
+| Eval stride | 1024, non-overlapping |
+| RoPE | `rope_mode=rk`, `rope_dims=16`, `rope_theta=10000` |
+
+Caveats:
+
+- Partial RoPE at 25% was slightly better than full RoPE in this short run, but
+  both were worse than the no-RoPE baseline (`val_bpb=1.51916871`).
+- This comparison is noisy because these are independent random initializations
+  and 5-minute training runs.
+- The partial run reached fewer timed-stop steps than the previous full-RoPE run
+  (`2907` vs `3105`), likely due to transient throughput variation near the end.
 
 ## 2026-04-26 Optional Embedding / Head Weight Tying
 
@@ -200,3 +242,13 @@ Checks run:
 - `python -m py_compile train.py src/model.py eval_fineweb_bpb.py tests/test_weight_tying.py`
 - `python -m unittest tests.test_weight_tying`
 - `python -m unittest tests.test_norms tests.test_rope tests.test_weight_tying`
+- Deep CPU-safe behavior script covering missing-flag default-off construction,
+  explicit untied construction, tied construction, Muon grouping, strict
+  untied-to-tied checkpoint load, strict tied-to-untied checkpoint load, and
+  disk state-dict roundtrip.
+- Fresh-process CUDA forward/backward check with `RWKV_MY_TESTING=x070`,
+  `RWKV_HEAD_SIZE=64`, tied embeddings enabled, and finite shared embedding/head
+  gradient.
+- Default-off checks: `train.py --help`, `eval_fineweb_bpb.py --help`,
+  `TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"` in both FineWeb run scripts, and
+  `bash -n run-fineweb-10min.sh demo-training-run-fineweb.sh`.
