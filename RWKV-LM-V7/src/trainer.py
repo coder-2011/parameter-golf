@@ -7,12 +7,26 @@ import pytorch_lightning as pl
 import torch
 from lightning_utilities.core.rank_zero import rank_zero_info, rank_zero_only
 
+from .quant import save_quantized_state_dict
+
 
 def my_save(args, trainer, dd, ff):
     if "deepspeed_stage_3" in args.strategy:
         trainer.save_checkpoint(ff, weights_only=True)
     else:
         torch.save(dd, ff)
+
+
+def maybe_save_quantized_final(args, state_dict, final_path):
+    bits = int(getattr(args, "quant_bits", 0))
+    if bits <= 0:
+        return
+    quant_path = final_path.removesuffix(".pth") + f".int{bits}.ptz"
+    raw_bytes, file_bytes = save_quantized_state_dict(state_dict, quant_path, bits=bits)
+    rank_zero_info(
+        f"Serialized quantized final checkpoint: {quant_path} "
+        f"(raw_torch:{raw_bytes} compressed:{file_bytes})"
+    )
 
 
 METRICS_CSV_HEADER = [
@@ -175,13 +189,16 @@ class train_callback(pl.Callback):
                 lr = (lr + args.lr_init * lr_mult) / 2
             if progress >= 1:
                 if (trainer.is_global_zero) or ("deepspeed_stage_3" in args.strategy):
+                    to_save_dict = pl_module.state_dict()
                     final_path = f"{args.proj_dir}/rwkv-final.pth"
                     my_save(
                         args,
                         trainer,
-                        pl_module.state_dict(),
+                        to_save_dict,
                         final_path,
                     )
+                    if trainer.is_global_zero:
+                        maybe_save_quantized_final(args, to_save_dict, final_path)
                     rank_zero_info(
                         f"\n✅ End of training. Model saved to: {final_path}\n"
                     )
@@ -433,6 +450,8 @@ class train_callback(pl.Callback):
                         to_save_dict,
                         final_path,
                     )
+                    if trainer.is_global_zero:
+                        maybe_save_quantized_final(args, to_save_dict, final_path)
                     rank_zero_info(
                         f"\n✅ End of training. Model saved to: {final_path}\n"
                     )
@@ -468,6 +487,8 @@ class train_callback(pl.Callback):
                         to_save_dict,
                         final_path,
                     )
+                    if trainer.is_global_zero:
+                        maybe_save_quantized_final(args, to_save_dict, final_path)
                     rank_zero_info(
                         f"\n✅ Timed training stop. Model saved to: {final_path}\n"
                     )

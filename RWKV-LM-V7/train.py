@@ -47,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--dim_att", default=0, type=int)
     parser.add_argument("--dim_ffn", default=0, type=int)
     parser.add_argument("--tie_embeddings", default=0, type=int)
+    parser.add_argument("--quant_bits", default=0, type=int)
 
     # 6e-4 for L12-D768, 4e-4 for L24-D1024, 3e-4 for L24-D2048
     parser.add_argument("--lr_init", default=6e-4, type=float)
@@ -113,6 +114,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.optimizer == "muon" and "deepspeed" in str(args.strategy):
         raise ValueError("--optimizer muon is only wired for single-GPU/DDP paths; use --strategy auto or ddp")
+    if args.quant_bits != 0 and not (2 <= args.quant_bits <= 8):
+        raise ValueError(f"--quant_bits must be 0 or in [2, 8], got {args.quant_bits}")
 
     ########################################################################################################
 
@@ -148,7 +151,9 @@ if __name__ == "__main__":
     args.enable_checkpointing = False
     args.replace_sampler_ddp = False
     args.logger = False
-    args.gradient_clip_val = args.grad_clip
+    # Muon uses manual optimization and clips inside ``training_step``.
+    # Lightning only supports Trainer-level gradient clipping for automatic optimization.
+    args.gradient_clip_val = 0.0 if args.optimizer == "muon" else args.grad_clip
     args.num_sanity_val_steps = 0
     args.check_val_every_n_epoch = int(1e20)
     args.log_every_n_steps = int(1e20)

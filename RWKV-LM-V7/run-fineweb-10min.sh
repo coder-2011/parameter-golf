@@ -12,6 +12,7 @@ CTX_LEN="${CTX_LEN:-1024}"
 M_BSZ="${M_BSZ:-16}"
 VOCAB_SIZE="${VOCAB_SIZE:-1892}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"
+QUANT_BITS="${QUANT_BITS:-0}"
 ROPE_MODE="${ROPE_MODE:-none}"
 ROPE_THETA="${ROPE_THETA:-10000}"
 ROPE_DIMS="${ROPE_DIMS:-0}"
@@ -90,6 +91,7 @@ python train.py \
  --num_nodes $N_NODE \
  --precision bf16 \
  --proj_dir $PROJ_DIR \
+ --quant_bits $QUANT_BITS \
  --rope_mode $ROPE_MODE \
  --rope_theta $ROPE_THETA \
  --rope_dims $ROPE_DIMS \

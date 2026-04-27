@@ -188,7 +188,12 @@ def load_rwkv_model(args: argparse.Namespace, device: torch.device) -> torch.nn.
         accelerator="GPU" if device.type == "cuda" else "CPU",
     )
     model = RWKV(model_args)
-    state = torch.load(args.load_model, map_location="cpu")
+    if args.load_model.endswith(".ptz"):
+        from src.quant import load_quantized_state_dict
+
+        state = load_quantized_state_dict(args.load_model)
+    else:
+        state = torch.load(args.load_model, map_location="cpu")
     for key in list(state.keys()):
         if key.startswith("_forward_module."):
             state[key.replace("_forward_module.", "")] = state.pop(key)
