@@ -176,6 +176,13 @@ def load_rwkv_model(args: argparse.Namespace, device: torch.device) -> torch.nn.
         rope_mode=args.rope_mode,
         rope_theta=args.rope_theta,
         rope_dims=args.rope_dims,
+        learned_shift_state=args.learned_shift_state,
+        attn_every=args.attn_every,
+        attn_offset=args.attn_offset if args.attn_offset > 0 else args.attn_every,
+        attn_heads=args.attn_heads,
+        attn_dim=args.attn_dim,
+        attn_dropout=0.0,
+        attn_rope=args.attn_rope,
         norm_type=args.norm_type,
         tie_embeddings=args.tie_embeddings,
         my_testing=args.my_testing,
@@ -289,6 +296,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rope_mode", default="none", choices=["none", "rk"])
     parser.add_argument("--rope_theta", type=float, default=10000.0)
     parser.add_argument("--rope_dims", type=int, default=0)
+    parser.add_argument("--learned_shift_state", type=int, default=0)
+    parser.add_argument("--attn_every", type=int, default=0)
+    parser.add_argument("--attn_offset", type=int, default=0)
+    parser.add_argument("--attn_heads", type=int, default=0)
+    parser.add_argument("--attn_dim", type=int, default=0)
+    parser.add_argument("--attn_rope", type=int, default=1)
     parser.add_argument(
         "--norm_type", default="layernorm", choices=["layernorm", "rmsnorm"]
     )
@@ -306,7 +319,9 @@ def main() -> None:
         f"val_loss:{val_loss:.8f} val_bpb:{val_bpb:.8f} "
         f"scored_tokens:{scored_tokens} scored_bytes:{scored_bytes} "
         f"ctx_len:{args.ctx_len} stride:{stride} vocab_size:{args.vocab_size} "
-        f"rope_mode:{args.rope_mode} norm_type:{args.norm_type}"
+        f"rope_mode:{args.rope_mode} learned_shift_state:{args.learned_shift_state} "
+        f"norm_type:{args.norm_type} "
+        f"attn_every:{args.attn_every} attn_offset:{args.attn_offset if args.attn_offset > 0 else args.attn_every}"
     )
 
 

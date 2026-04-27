@@ -97,6 +97,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--rope_theta", default=10000.0, type=float)
     parser.add_argument("--rope_dims", default=0, type=int)
+    parser.add_argument("--learned_shift_state", default=0, type=int)
+    parser.add_argument("--attn_every", default=0, type=int)
+    parser.add_argument("--attn_offset", default=0, type=int)
+    parser.add_argument("--attn_heads", default=0, type=int)
+    parser.add_argument("--attn_dim", default=0, type=int)
+    parser.add_argument("--attn_dropout", default=0.0, type=float)
+    parser.add_argument("--attn_rope", default=1, type=int)
     parser.add_argument(
         "--norm_type",
         default="layernorm",
@@ -169,6 +176,8 @@ if __name__ == "__main__":
     if args.dim_ffn <= 0:
         multiplier = 4 if args.my_testing == "x070" else 3.5
         args.dim_ffn = int((args.n_embd * multiplier) // 32 * 32)  # multiple of 32
+    if args.attn_offset <= 0:
+        args.attn_offset = args.attn_every
 
     args.run_name = (
         f"{args.vocab_size} ctx{args.ctx_len} L{args.n_layer} D{args.n_embd}"
@@ -230,7 +239,8 @@ if __name__ == "__main__":
             f'# Each "epoch" = {epoch_steps} steps, {samples_per_epoch} samples, {tokens_per_epoch} tokens\n'
             f"#\n"
             f"# Model = {args.n_layer} n_layer, {args.n_embd} n_embd, {args.ctx_len} ctx_len, "
-            f"tie_embeddings {bool(args.tie_embeddings)}\n"
+            f"tie_embeddings {bool(args.tie_embeddings)}, "
+            f"attn_every {args.attn_every}, attn_offset {args.attn_offset}\n"
             f"#\n"
             f"# Adam = lr {args.lr_init} to {args.lr_final}, warmup {args.warmup_steps} steps, "
             f"cooldown {args.cooldown_steps} steps, "

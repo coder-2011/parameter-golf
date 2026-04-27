@@ -55,6 +55,14 @@ def make_norm(args):
     raise ValueError(f"unknown norm_type {norm_type!r}")
 
 
+def is_attention_layer(args, layer_id):
+    attn_every = int(getattr(args, "attn_every", 0))
+    if attn_every <= 0 or layer_id == 0:
+        return False
+    attn_offset = int(getattr(args, "attn_offset", attn_every))
+    return (layer_id - attn_offset) >= 0 and (layer_id - attn_offset) % attn_every == 0
+
+
 ROCm_flag = torch.version.hip is not None
 CompileFunction = __nop
 if os.environ["RWKV_COMPILE_ON"] == "1":
@@ -165,6 +173,7 @@ class RWKV_Tmix_x070(nn.Module):
         self.rope_mode = getattr(args, "rope_mode", "none")
         self.rope_theta = float(getattr(args, "rope_theta", 10000.0))
         self.rope_dims = int(getattr(args, "rope_dims", 0)) or N
+        self.learned_shift_state = bool(int(getattr(args, "learned_shift_state", 0)))
         if self.rope_mode != "none":
             if self.rope_mode != "rk":
                 raise ValueError(f"Unsupported rope_mode: {self.rope_mode}")
@@ -188,6 +197,8 @@ class RWKV_Tmix_x070(nn.Module):
         self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
         self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
         self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+        if self.learned_shift_state:
+            self.init_shift = nn.Parameter(torch.zeros(C))
 
         def ortho_init(x, scale):
             shape = x.shape
@@ -284,7 +295,8 @@ class RWKV_Tmix_x070(nn.Module):
     @CompileFunction
     def forward(self, x, v_first):
         B, T, C = x.size()
-        xx = token_shift(x)
+        shift_cache = self.init_shift.repeat(B, 1) if self.learned_shift_state else None
+        xx = token_shift(x, cache=shift_cache)
         xr, xw, xk, xv, xa, xg = fused_addcmul_rwkv7(x, xx, self.x_r,
                                                      self.x_w, self.x_k, self.x_v,
                                                      self.x_a, self.x_g)
@@ -343,12 +355,15 @@ class RWKV_CMix_x070(nn.Module):
         self.args = args
         self.layer_id = layer_id
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
+        self.learned_shift_state = bool(int(getattr(args, "learned_shift_state", 0)))
 
         ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
         ddd = torch.ones(args.n_embd)
         for i in range(args.n_embd):
             ddd[i] = i / args.n_embd
         self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+        if self.learned_shift_state:
+            self.init_shift = nn.Parameter(torch.zeros(args.n_embd))
 
         self.key = nn.Linear(args.n_embd, args.n_embd * 4, bias=False)
         self.value = nn.Linear(args.n_embd * 4, args.n_embd, bias=False)
@@ -360,7 +375,9 @@ class RWKV_CMix_x070(nn.Module):
 
     @CompileFunction
     def forward(self, x):
-        xx = token_shift(x)
+        B = x.size(0)
+        shift_cache = self.init_shift.repeat(B, 1) if self.learned_shift_state else None
+        xx = token_shift(x, cache=shift_cache)
         k = torch.addcmul(x, xx, self.x_k)
         k = torch.relu(self.key(k)) ** 2
         return self.value(k)
@@ -369,6 +386,74 @@ class RWKV_CMix_x070(nn.Module):
 #################################################################
 # The RWKV Model with our blocks
 #################################################################
+
+
+class CausalSelfAttention(nn.Module):
+    @torch.no_grad()
+    def __init__(self, args, layer_id):
+        super().__init__()
+        self.args = args
+        self.layer_id = layer_id
+        C = args.n_embd
+        self.attn_dim = int(getattr(args, "attn_dim", 0)) or C
+        self.n_head = int(getattr(args, "attn_heads", 0)) or max(
+            1, self.attn_dim // args.head_size
+        )
+        if self.attn_dim % self.n_head != 0:
+            raise ValueError(
+                f"attn_dim must be divisible by attn_heads; got {self.attn_dim} and {self.n_head}"
+            )
+        self.head_dim = self.attn_dim // self.n_head
+        self.dropout = float(getattr(args, "attn_dropout", 0.0))
+        self.use_rope = bool(getattr(args, "attn_rope", 1))
+
+        self.qkv = nn.Linear(C, 3 * self.attn_dim, bias=False)
+        self.output = nn.Linear(self.attn_dim, C, bias=False)
+        self.qkv.weight.data.uniform_(-0.5 / (C**0.5), 0.5 / (C**0.5))
+        self.output.weight.data.zero_()
+
+        if self.use_rope:
+            if self.head_dim % 2 != 0:
+                raise ValueError("attention RoPE requires an even attention head dimension")
+            self.rope_theta = float(getattr(args, "rope_theta", 10000.0))
+            inv_freq = 1.0 / (
+                self.rope_theta
+                ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+            )
+            self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+
+    def _apply_rope(self, x):
+        B, T, H, D = x.size()
+        pos = torch.arange(T, device=x.device, dtype=self.rope_inv_freq.dtype)
+        freqs = torch.outer(pos, self.rope_inv_freq.to(device=x.device))
+        cos = freqs.cos().to(dtype=x.dtype).view(1, T, 1, D // 2)
+        sin = freqs.sin().to(dtype=x.dtype).view(1, T, 1, D // 2)
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot = torch.empty_like(x)
+        x_rot[..., 0::2] = x_even * cos - x_odd * sin
+        x_rot[..., 1::2] = x_even * sin + x_odd * cos
+        return x_rot
+
+    @CompileFunction
+    def forward(self, x, v_first):
+        B, T, _ = x.size()
+        q, k, v = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim).unbind(dim=2)
+        if self.use_rope:
+            q = self._apply_rope(q)
+            k = self._apply_rope(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        x = x.transpose(1, 2).contiguous().view(B, T, self.attn_dim)
+        return self.output(x), v_first
 
 
 class Block(nn.Module):
@@ -383,7 +468,10 @@ class Block(nn.Module):
         if self.layer_id == 0:
             self.ln0 = make_norm(args)
 
-        self.att = RWKV_Tmix_x070(args, layer_id)
+        if is_attention_layer(args, layer_id):
+            self.att = CausalSelfAttention(args, layer_id)
+        else:
+            self.att = RWKV_Tmix_x070(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
 
     @CompileFunction
@@ -427,6 +515,20 @@ class RWKV(pl.LightningModule):
             args.rope_dims = 0
         if not hasattr(args, "norm_type"):
             args.norm_type = "layernorm"
+        if not hasattr(args, "learned_shift_state"):
+            args.learned_shift_state = 0
+        if not hasattr(args, "attn_every"):
+            args.attn_every = 0
+        if not hasattr(args, "attn_offset"):
+            args.attn_offset = args.attn_every
+        if not hasattr(args, "attn_heads"):
+            args.attn_heads = 0
+        if not hasattr(args, "attn_dim"):
+            args.attn_dim = 0
+        if not hasattr(args, "attn_dropout"):
+            args.attn_dropout = 0.0
+        if not hasattr(args, "attn_rope"):
+            args.attn_rope = 1
         if not hasattr(args, "dim_att"):
             args.dim_att = args.n_embd
         # Set a sane default when the flag is missing *or* non-positive
@@ -437,6 +539,16 @@ class RWKV(pl.LightningModule):
         assert args.n_embd % 32 == 0
         assert args.dim_att % 32 == 0
         assert args.dim_ffn % 32 == 0
+        if args.attn_dim <= 0:
+            args.attn_dim = args.n_embd
+        if args.attn_heads <= 0:
+            args.attn_heads = max(1, args.attn_dim // args.head_size)
+        if args.attn_dim % args.attn_heads != 0:
+            raise ValueError(
+                f"attn_dim must be divisible by attn_heads; got {args.attn_dim} and {args.attn_heads}"
+            )
+        if bool(args.attn_rope) and (args.attn_dim // args.attn_heads) % 2 != 0:
+            raise ValueError("attention RoPE requires an even attention head dimension")
 
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
 

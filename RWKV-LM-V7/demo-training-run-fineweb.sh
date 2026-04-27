@@ -14,11 +14,24 @@ VOCAB_SIZE="${VOCAB_SIZE:-1892}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"
 ROPE_MODE="${ROPE_MODE:-none}"
 ROPE_THETA="${ROPE_THETA:-10000}"
+ATTN_EVERY="${ATTN_EVERY:-0}"
+ATTN_OFFSET="${ATTN_OFFSET:-0}"
+ATTN_HEADS="${ATTN_HEADS:-0}"
+ATTN_DIM="${ATTN_DIM:-0}"
+ATTN_DROPOUT="${ATTN_DROPOUT:-0.0}"
+ATTN_ROPE="${ATTN_ROPE:-1}"
 ROPE_SUFFIX=""
 if [ "$ROPE_MODE" != "none" ]; then
  ROPE_SUFFIX="-rope${ROPE_MODE}"
 fi
-PROJ_DIR="${PROJ_DIR:-out/fineweb-sp${VOCAB_SIZE}${ROPE_SUFFIX}-L${N_LAYER}-D${N_EMBD}-${MODEL_TYPE}}"
+ATTN_SUFFIX=""
+if [ "$ATTN_EVERY" != "0" ]; then
+ ATTN_SUFFIX="-attne${ATTN_EVERY}"
+ if [ "$ATTN_OFFSET" != "0" ]; then
+  ATTN_SUFFIX="${ATTN_SUFFIX}o${ATTN_OFFSET}"
+ fi
+fi
+PROJ_DIR="${PROJ_DIR:-out/fineweb-sp${VOCAB_SIZE}${ROPE_SUFFIX}${ATTN_SUFFIX}-L${N_LAYER}-D${N_EMBD}-${MODEL_TYPE}}"
 
 M_BSZ="${M_BSZ:-4}"
 LR_INIT="${LR_INIT:-6e-4}"
@@ -80,6 +93,12 @@ python train.py \
  --proj_dir $PROJ_DIR \
  --rope_mode $ROPE_MODE \
  --rope_theta $ROPE_THETA \
+ --attn_every $ATTN_EVERY \
+ --attn_offset $ATTN_OFFSET \
+ --attn_heads $ATTN_HEADS \
+ --attn_dim $ATTN_DIM \
+ --attn_dropout $ATTN_DROPOUT \
+ --attn_rope $ATTN_ROPE \
  --strategy auto \
  --train_stage 0 \
  --tie_embeddings $TIE_EMBEDDINGS \
