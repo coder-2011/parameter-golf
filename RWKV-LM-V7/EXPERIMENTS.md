@@ -138,6 +138,69 @@ Added SP1892 BPB evaluation:
   byte, normal pieces count UTF-8 payload bytes after stripping leading `▁`, and
   leading `▁` contributes a space byte only after non-boundary tokens.
 
+## 2026-04-27 Muon Optimizer Trial, 5 Minutes
+
+| Field | Value |
+| --- | --- |
+| Run dir | `out/fineweb-sp1892-muon-5min-L8-D512-x070-r2` |
+| Checkpoint | `out/fineweb-sp1892-muon-5min-L8-D512-x070-r2/rwkv-final.pth` |
+| Base config | Same SP1892 FineWeb, RWKV x070 8x512, ctx 1024, bf16 as baseline |
+| Optimizer | `--optimizer muon` |
+| Matrix optimizer | `torch.optim.Muon`, `muon_momentum=0.95`, `muon_wd=0.001` |
+| Non-matrix optimizer | AdamW fallback groups using `adam_eps=1e-18` |
+| Strategy | `auto`, single GPU; DeepSpeed is disabled for Muon |
+| Time cap | 300 seconds |
+| Exit token cap | disabled for this run, `my_exit_tokens=0` |
+
+Training command:
+
+```bash
+python3 train.py \
+  --data_file ../data_sp1892/datasets/fineweb10B_sp1892 \
+  --data_type fineweb_u16 \
+  --vocab_size 1892 \
+  --n_layer 8 \
+  --n_embd 512 \
+  --ctx_len 1024 \
+  --micro_bsz 16 \
+  --optimizer muon \
+  --strategy auto \
+  --my_exit_seconds 300 \
+  --my_exit_tokens 0 \
+  --proj_dir out/fineweb-sp1892-muon-5min-L8-D512-x070-r2
+```
+
+Validation command:
+
+```bash
+python3 eval_fineweb_bpb.py \
+  --load_model out/fineweb-sp1892-muon-5min-L8-D512-x070-r2/rwkv-final.pth \
+  --rope_mode none
+```
+
+Validation result:
+
+| Metric | Value |
+| --- | ---: |
+| `val_loss` | 3.33134217 |
+| `val_bpb` | 1.69464814 |
+| Scored tokens | 53,270,528 |
+| Scored bytes | 151,078,006 |
+| Eval stride | 1024, non-overlapping |
+
+Caveats:
+
+- Muon was worse than the no-RoPE AdamW baseline in this 5-minute trial
+  (`1.69464814` vs `1.51916871` BPB).
+- The run uses Lightning manual optimization with multiple optimizers. Logged
+  `global_step`/token counters appear inflated because each optimizer step can
+  advance Lightning's global step. The wall-clock stop and checkpoint are valid,
+  but Muon token/step logs should not be compared directly until this accounting
+  is fixed.
+- `--adam_eps 1e-18` still matters in Muon mode because embeddings, output
+  head, vectors/scalars, norms, and gain-like tensors stay on AdamW; only hidden
+  2D matrix parameters use Muon.
+
 ## 2026-04-26 RoPE Experiment Path
 
 Implemented a default-off RoPE path for RWKV time-mix:
@@ -252,3 +315,31 @@ Checks run:
 - Default-off checks: `train.py --help`, `eval_fineweb_bpb.py --help`,
   `TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"` in both FineWeb run scripts, and
   `bash -n run-fineweb-10min.sh demo-training-run-fineweb.sh`.
+
+## 2026-04-27 Fixed-Step LR Cooldown
+
+Added a default-off fixed-step LR cooldown path for runs that do not use the
+existing token-count LR schedule.
+
+| Flag | Default | Meaning |
+| --- | ---: | --- |
+| `--cooldown_steps` | `0` | Number of final epoch steps over which LR decays from `lr_init` to `lr_final` |
+
+Implementation details:
+
+- `scheduled_lr(args, step)` centralizes LR computation in `src/trainer.py`.
+- Existing warmup behavior is preserved.
+- Existing token-based cosine schedule remains higher priority when
+  `--my_exit_tokens != 0`.
+- When `--my_exit_tokens 0` and `--cooldown_steps > 0`, LR stays at `lr_init`
+  until `epoch_steps - cooldown_steps`, then cosine-decays to `lr_final`.
+- `run-fineweb-10min.sh` and `demo-training-run-fineweb.sh` expose
+  `COOLDOWN_STEPS`, defaulting to `0`.
+
+Checks run:
+
+- `python -m py_compile train.py src/trainer.py tests/test_lr_schedule.py`
+- `python -m unittest tests.test_lr_schedule`
+- `python -m unittest tests.test_norms tests.test_rope tests.test_weight_tying tests.test_lr_schedule`
+- `bash -n run-fineweb-10min.sh demo-training-run-fineweb.sh`
+- `python train.py --help | rg -n -- "--cooldown_steps"`
