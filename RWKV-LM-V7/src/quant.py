@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 QUANT_SCALE_EPS = 2.0**-24
-QUANT_SCALE_DTYPE = torch.float16
 
 
 def signed_quant_max(bits: int) -> int:
@@ -22,6 +21,14 @@ def pack_quantized_tensor(q: torch.Tensor, bits: int) -> torch.Tensor:
     if bits == 8:
         return q.to(torch.int8).contiguous()
     qmax = signed_quant_max(bits)
+    if q.numel() > 0:
+        q_min = int(q.min().item())
+        q_max = int(q.max().item())
+        if q_min < -qmax or q_max > qmax:
+            raise ValueError(
+                f"quantized values out of int{bits} range "
+                f"[-{qmax}, {qmax}]: min={q_min} max={q_max}"
+            )
     flat = (q.detach().cpu().reshape(-1).to(torch.int16).numpy() + qmax).astype(
         np.uint16, copy=False
     )
@@ -55,11 +62,11 @@ def quantize_float_tensor(tensor: torch.Tensor, bits: int) -> tuple[torch.Tensor
     if t32.ndim == 2:
         scale = t32.abs().amax(dim=1).div(qmax).clamp_min(QUANT_SCALE_EPS)
         q = torch.clamp(torch.round(t32 / scale[:, None]), -qmax, qmax).to(torch.int8)
-        return q.contiguous(), scale.to(dtype=QUANT_SCALE_DTYPE).contiguous()
+        return q.contiguous(), scale.contiguous()
 
     scale = t32.abs().amax().div(qmax).clamp_min(QUANT_SCALE_EPS)
     q = torch.clamp(torch.round(t32 / scale), -qmax, qmax).to(torch.int8)
-    return q.contiguous(), scale.to(dtype=QUANT_SCALE_DTYPE).contiguous()
+    return q.contiguous(), scale.contiguous()
 
 
 def quantize_state_dict_int(state_dict: dict[str, torch.Tensor], bits: int) -> dict[str, object]:
@@ -67,7 +74,6 @@ def quantize_state_dict_int(state_dict: dict[str, torch.Tensor], bits: int) -> d
     quantized: dict[str, torch.Tensor] = {}
     scales: dict[str, torch.Tensor] = {}
     shapes: dict[str, tuple[int, ...]] = {}
-    dtypes: dict[str, str] = {}
     passthrough: dict[str, torch.Tensor] = {}
 
     for name, tensor in state_dict.items():
@@ -78,7 +84,6 @@ def quantize_state_dict_int(state_dict: dict[str, torch.Tensor], bits: int) -> d
         quantized[name] = pack_quantized_tensor(q, bits)
         scales[name] = scale
         shapes[name] = tuple(tensor.shape)
-        dtypes[name] = str(tensor.dtype).removeprefix("torch.")
 
     return {
         "__quant_format__": f"rwkv_int{bits}_per_row_2d_packed_v1",
@@ -86,18 +91,8 @@ def quantize_state_dict_int(state_dict: dict[str, torch.Tensor], bits: int) -> d
         "quantized": quantized,
         "scales": scales,
         "shapes": shapes,
-        "dtypes": dtypes,
         "passthrough": passthrough,
     }
-
-
-def _dtype_from_name(name: str) -> torch.dtype:
-    return {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-        "float64": torch.float64,
-    }.get(name, torch.float32)
 
 
 def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -106,7 +101,6 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, torch.Tensor]
     quantized: dict[str, torch.Tensor] = obj["quantized"]
     scales: dict[str, torch.Tensor] = obj["scales"]
     shapes: dict[str, tuple[int, ...]] = obj["shapes"]
-    dtypes: dict[str, str] = obj["dtypes"]
     passthrough: dict[str, torch.Tensor] = obj.get("passthrough", {})
 
     state_dict = {name: tensor for name, tensor in passthrough.items()}
@@ -118,7 +112,7 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, torch.Tensor]
             value = q * scale[:, None]
         else:
             value = q * scale
-        state_dict[name] = value.to(dtype=_dtype_from_name(dtypes[name])).contiguous()
+        state_dict[name] = value.contiguous()
     return state_dict
 
 
