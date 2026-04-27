@@ -6,6 +6,7 @@ modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
+data_sp1892/
 .mypy_cache/
 .venv
 logs/
