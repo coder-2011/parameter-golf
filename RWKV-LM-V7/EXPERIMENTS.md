@@ -460,3 +460,74 @@ Checks run:
 Next comparable run should start with one attention anchor in the 8x512 baseline
 shape, for example `ATTN_EVERY=4 ATTN_OFFSET=4`, then evaluate with matching
 `--attn_every 4 --attn_offset 4`.
+
+## 2026-04-27 Hybrid Attention Anchor Run
+
+Ran the first comparable SDPA hybrid trial: 8x512 baseline shape with one
+attention anchor at layer 4.
+
+| Field | Value |
+| --- | ---: |
+| Shape | `L8-D512`, `dim_att=512`, `dim_ffn=2048`, `head_size=64` |
+| Hybrid config | `attn_every=4`, `attn_offset=4`, `attn_rope=1` |
+| Attention layers | layer 4 only |
+| Params | 29,240,320 |
+| Runtime cap | 300s |
+| Final step | 3,375 |
+| Tokens | 55,296,000 |
+| Avg train loss | 3.28638426 |
+| Throughput near end | ~199 Ktok/s |
+| Checkpoint | `out/fineweb-sp1892-attne4o4-5min-L8-D512-x070/rwkv-final.pth` |
+| Checkpoint size | 56M |
+| Eval val_loss | 2.95717080 |
+| Eval val_bpb | 1.50430779 |
+
+Comparison:
+
+- Previous 8x512 LayerNorm/no-RoPE baseline: `val_bpb=1.51916871`.
+- Hybrid attention anchor improvement: `-0.01486092` BPB.
+- This is the first local RWKV architectural change in this series that clearly
+  beat the no-RoPE baseline under the same 300s-style budget.
+
+Eval command:
+
+```bash
+python3 eval_fineweb_bpb.py \
+  --load_model out/fineweb-sp1892-attne4o4-5min-L8-D512-x070/rwkv-final.pth \
+  --n_layer 8 --n_embd 512 --dim_att 512 --dim_ffn 2048 \
+  --attn_every 4 --attn_offset 4 --attn_rope 1 \
+  --rope_mode none --norm_type layernorm
+```
+
+## 2026-04-27 Partial RoPE for SDPA Attention
+
+Extended the SDPA hybrid attention path so attention RoPE can also be partial.
+It uses the existing `rope_dims` setting:
+
+- `rope_dims=0`: rotate the full attention head dimension.
+- `rope_dims=N`: rotate only the first `N` dimensions of each attention head.
+
+Notes:
+
+- This applies when `attn_rope=1`.
+- `rope_dims` must be positive, even, and no larger than the attention head
+  dimension after default resolution.
+- The same flag still controls RWKV time-mix RoPE when `rope_mode != none`, so
+  a run combining RWKV RoPE and attention RoPE uses one shared partial dimension.
+
+Checks run:
+
+- `python3 -m py_compile src/model.py tests/test_hybrid_attention.py train.py eval_fineweb_bpb.py`
+- `python3 -m unittest tests.test_hybrid_attention tests.test_rope`
+
+Follow-up thorough check:
+
+- Fixed `demo-training-run-fineweb.sh` so it passes `ROPE_DIMS`; before this,
+  demo partial-attention-RoPE smokes would have silently used full attention
+  RoPE.
+- Updated run-directory suffixes to include attention partial-RoPE dims when
+  attention RoPE is enabled.
+- Updated eval output to print `rope_dims` and `attn_rope`.
+- Re-ran static checks, 23 focused tests, a CUDA train smoke with
+  `ATTN_EVERY=1 ATTN_OFFSET=1 ATTN_ROPE=1 ROPE_DIMS=16`, and a matching eval
+  smoke that loaded the checkpoint and reported `rope_dims:16 attn_rope:1`.

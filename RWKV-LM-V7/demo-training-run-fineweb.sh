@@ -11,24 +11,38 @@ N_LAYER="${N_LAYER:-2}"
 N_EMBD="${N_EMBD:-128}"
 CTX_LEN="${CTX_LEN:-512}"
 VOCAB_SIZE="${VOCAB_SIZE:-1892}"
+HEAD_SIZE="${HEAD_SIZE:-64}"
 TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-0}"
 ROPE_MODE="${ROPE_MODE:-none}"
 ROPE_THETA="${ROPE_THETA:-10000}"
+ROPE_DIMS="${ROPE_DIMS:-0}"
 ATTN_EVERY="${ATTN_EVERY:-0}"
 ATTN_OFFSET="${ATTN_OFFSET:-0}"
+ATTN_MODE="${ATTN_MODE:-full}"
 ATTN_HEADS="${ATTN_HEADS:-0}"
 ATTN_DIM="${ATTN_DIM:-0}"
 ATTN_DROPOUT="${ATTN_DROPOUT:-0.0}"
 ATTN_ROPE="${ATTN_ROPE:-1}"
+MOBA_CHUNK_SIZE="${MOBA_CHUNK_SIZE:-256}"
+MOBA_TOPK="${MOBA_TOPK:-4}"
 ROPE_SUFFIX=""
 if [ "$ROPE_MODE" != "none" ]; then
  ROPE_SUFFIX="-rope${ROPE_MODE}"
+ if [ "$ROPE_DIMS" != "0" ]; then
+  ROPE_SUFFIX="${ROPE_SUFFIX}d${ROPE_DIMS}"
+ fi
 fi
 ATTN_SUFFIX=""
 if [ "$ATTN_EVERY" != "0" ]; then
  ATTN_SUFFIX="-attne${ATTN_EVERY}"
+ if [ "$ATTN_MODE" != "full" ]; then
+  ATTN_SUFFIX="${ATTN_SUFFIX}-${ATTN_MODE}c${MOBA_CHUNK_SIZE}k${MOBA_TOPK}"
+ fi
  if [ "$ATTN_OFFSET" != "0" ]; then
   ATTN_SUFFIX="${ATTN_SUFFIX}o${ATTN_OFFSET}"
+ fi
+ if [ "$ATTN_ROPE" != "0" ] && [ "$ROPE_DIMS" != "0" ]; then
+  ATTN_SUFFIX="${ATTN_SUFFIX}rd${ROPE_DIMS}"
  fi
 fi
 PROJ_DIR="${PROJ_DIR:-out/fineweb-sp${VOCAB_SIZE}${ROPE_SUFFIX}${ATTN_SUFFIX}-L${N_LAYER}-D${N_EMBD}-${MODEL_TYPE}}"
@@ -75,7 +89,7 @@ python train.py \
  --epoch_save $EPOCH_SAVE \
  --epoch_steps 128 \
  --grad_cp $GRAD_CP \
- --head_size 64 \
+ --head_size $HEAD_SIZE \
  --load_model "" \
  --lr_final $LR_FINAL \
  --lr_init $LR_INIT \
@@ -93,12 +107,16 @@ python train.py \
  --proj_dir $PROJ_DIR \
  --rope_mode $ROPE_MODE \
  --rope_theta $ROPE_THETA \
+ --rope_dims $ROPE_DIMS \
  --attn_every $ATTN_EVERY \
  --attn_offset $ATTN_OFFSET \
+ --attn_mode $ATTN_MODE \
  --attn_heads $ATTN_HEADS \
  --attn_dim $ATTN_DIM \
  --attn_dropout $ATTN_DROPOUT \
  --attn_rope $ATTN_ROPE \
+ --moba_chunk_size $MOBA_CHUNK_SIZE \
+ --moba_topk $MOBA_TOPK \
  --strategy auto \
  --train_stage 0 \
  --tie_embeddings $TIE_EMBEDDINGS \
