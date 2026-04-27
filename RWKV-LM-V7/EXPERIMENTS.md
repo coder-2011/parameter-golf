@@ -531,3 +531,50 @@ Follow-up thorough check:
 - Re-ran static checks, 23 focused tests, a CUDA train smoke with
   `ATTN_EVERY=1 ATTN_OFFSET=1 ATTN_ROPE=1 ROPE_DIMS=16`, and a matching eval
   smoke that loaded the checkpoint and reported `rope_dims:16 attn_rope:1`.
+
+## 2026-04-27 Candidate Implementations to Add
+
+These are likely-value experiments that were explicitly discussed but not yet
+implemented in this local stack.
+
+- TDT (if available in the current repo) is still not implemented.
+- NgramRez is not implemented.
+- `bigram_hashes` is not implemented.
+- Full `GPTQ+INT6+QAT` pipeline is not implemented.
+- Late QAT has not been tried.
+- XSA had mixed outcomes in other runs; we should run a controlled re-check under
+  5-minute/16 MB constraints.
+- DeepSeek-style MoE variants remain unimplemented.
+- Other MoE variants (beyond current lightweight outputs) remain unimplemented.
+- NgramRes (10TreeMax was likely referring to this) is not implemented.
+- Polar Express is not implemented.
+- PPMD is implemented already.
+- Re-audit Muon optimizer: current implementation may be incorrect and deserves a
+  targeted correctness pass.
+
+Priority is to keep this queue ordered by expected impact/cost:
+
+1. Verify Muon correctness first (lower risk, higher impact if broken).
+2. Add bigram-hash support (small local change, usually high payoff).
+3. Try late QAT + full quantized-eval flow.
+4. Evaluate XSA and Polar Express in a constrained size-aware sweep.
+5. Explore MoE variants (DeepSeek-style and other types) only if 2–4
+   are insufficient.
+- Additional high-priority follow-ups before architecture expansion:
+  - Add EMA and SWA runs under the same 5-minute, 16MB INT6 budget.
+  - Re-check recurrence-style mechanisms (`mean_recurrence`, `mean_backprop_depth`,
+    `recurrence` scheduling knobs if available in the RWKV-V7 stack) and decide
+    whether they are meaningful beyond baseline recurrent-time-mix design.
+  - Verify whether QkNorm is available in this RWKV path and benchmark it if it is.
+  - Extend optimizer sweep (AdamW baseline + alternatives already available in
+    PyTorch / local repo, with a focus on short-run stability under the size cap).
+  - Try gating variants in additional loci (e.g., feedforward/projection gating)
+    to test whether gating placement changes short-run BPB.
+  - Run tokenizer experiments beyond SP1892: Scylla already known from records,
+    and then compare a small set of alternatives under the same compute/data
+    envelope. BPB comparisons remain tokenizer-internal only (do not cross-compare
+    raw BPB between tokenizers without byte normalization controls).
+  - Add/customize CUDA kernels for hotspots in the recurrent/attention path if
+    profiling shows meaningful time in PyTorch fallback paths for our 5-minute runs.
+  - Investigate neural caching variants (if compatible with the RWKV-v7 stack) and
+    benchmark short-run effects before committing to architecture changes.
