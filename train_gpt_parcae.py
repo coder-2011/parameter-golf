@@ -115,11 +115,13 @@ class Hyperparameters:
     ppm_lambda_hi = float(os.environ.get("PPM_LAMBDA_HI", 0.9))
     ppm_lambda_lo = float(os.environ.get("PPM_LAMBDA_LO", 0.05))
     ppm_conf_threshold = float(os.environ.get("PPM_CONF_THRESHOLD", 0.9))
+    ppm_escape_method = os.environ.get("PPM_ESCAPE_METHOD", "d").strip().lower()
     ppm_use_meta_mix = bool(int(os.environ.get("PPM_USE_META_MIX", "0")))
     ppm_token_order = int(os.environ.get("PPM_TOKEN_ORDER", 3))
     ppm_meta_alpha = float(os.environ.get("PPM_META_ALPHA", 0.995))
     ppm_meta_eta = float(os.environ.get("PPM_META_ETA", 2.0))
     ppm_meta_warmup_bytes = int(os.environ.get("PPM_META_WARMUP_BYTES", 4096))
+    context_mix_max_seconds = float(os.environ.get("CONTEXT_MIX_MAX_SECONDS", "0"))
     lzp_enabled = bool(int(os.environ.get("LZP_ENABLED", "0")))
     lzp_subset_tokens = int(os.environ.get("LZP_SUBSET_TOKENS", os.environ.get("PPM_SUBSET_TOKENS", 5_000_000)))
     lzp_orders_str = os.environ.get("LZP_ORDERS", "4,5,6,8")
@@ -976,6 +978,7 @@ def _context_mixture_bpb(
     ppm_lambda_hi: float,
     ppm_lambda_lo: float,
     ppm_conf_threshold: float,
+    ppm_escape_method: str,
     ppm_token_order: int,
     ppm_use_meta_mix: bool,
     ppm_meta_alpha: float,
@@ -989,10 +992,15 @@ def _context_mixture_bpb(
     lzp_min_streak: int,
     lzp_max_streak: int,
     lzp_hit_prob: float,
+    max_seconds: float = 0.0,
     log_fn=None,
 ) -> dict[str, float]:
     log2 = math.log(2.0)
     uniform_byte_logp = math.log(1.0 / 256.0)
+    ppm_escape_method = ppm_escape_method.lower()
+    if ppm_escape_method not in {"c", "d"}:
+        raise ValueError(f"PPM_ESCAPE_METHOD must be c or d, got {ppm_escape_method!r}")
+    deadline = time.perf_counter() + max_seconds if max_seconds > 0.0 else None
     byte_stream, byte_nn_logp = _token_predictions_to_byte_stream(
         target_ids,
         prev_ids,
@@ -1005,6 +1013,9 @@ def _context_mixture_bpb(
     if total_bytes == 0:
         return {
             "bytes": 0.0,
+            "scored_bytes": 0.0,
+            "coverage": 0.0,
+            "cutoff": 0.0,
             "mix_bpb": 0.0,
             "nn_only_bpb": 0.0,
             "ppm_mix_bpb": 0.0,
@@ -1026,20 +1037,26 @@ def _context_mixture_bpb(
             tid = int(token_id)
             log_p = None
             escape_logp = 0.0
+            excluded: set[int] = set()
             wlen = len(token_window)
             for ctx_len in range(min(ppm_token_order, wlen), -1, -1):
                 ctx = tuple(token_window[wlen - ctx_len:]) if ctx_len > 0 else ()
                 counts = token_counts.get(ctx)
                 if counts is None:
                     continue
-                unique = len(counts)
-                total = sum(counts.values())
-                denom = total + unique
-                if tid in counts:
-                    log_p = escape_logp + math.log(counts[tid] / denom)
+                eligible = [(sym, cnt) for sym, cnt in counts.items() if sym not in excluded]
+                unique = len(eligible)
+                if unique == 0:
+                    continue
+                total = sum(cnt for _, cnt in eligible)
+                esc_mass = 0.5 * unique if ppm_escape_method == "d" else float(unique)
+                denom = total + esc_mass
+                cnt = counts.get(tid, 0) if tid not in excluded else 0
+                if cnt > 0:
+                    log_p = escape_logp + math.log(cnt / denom)
                     break
-                if unique > 0:
-                    escape_logp += math.log(unique / denom)
+                escape_logp += math.log(esc_mass / denom)
+                excluded.update(sym for sym, _ in eligible)
             if log_p is None:
                 log_p = escape_logp + uniform_token_logp
             token_ppm_logp[i] = log_p
@@ -1108,8 +1125,13 @@ def _context_mixture_bpb(
     lzp_hits = 0
     lzp_alpha_sum = 0.0
     meta_losses = {"nn": 0.0, "ppm": 0.0, "token_ppm": 0.0, "lzp": 0.0}
+    scored_bytes = 0
+    cutoff_hit = False
 
     for t, byte in enumerate(byte_stream):
+        if deadline is not None and time.perf_counter() >= deadline:
+            cutoff_hit = True
+            break
         nn_logp = byte_nn_logp[t]
         expert_logps = {"nn": nn_logp}
 
@@ -1119,22 +1141,28 @@ def _context_mixture_bpb(
             log_p = None
             saw_context = False
             escape_logp = 0.0
+            excluded: set[int] = set()
             for ctx_len in range(min(ppm_order, len(ppm_window)), -1, -1):
                 ctx = bytes(ppm_window[-ctx_len:]) if ctx_len > 0 else b""
                 counts = ppm_counts.get(ctx)
                 if counts is None:
                     continue
-                unique = len(counts)
-                total = sum(counts.values())
-                denom = total + unique
+                eligible = [(sym, cnt) for sym, cnt in counts.items() if sym not in excluded]
+                unique = len(eligible)
+                if unique == 0:
+                    continue
+                total = sum(cnt for _, cnt in eligible)
+                esc_mass = 0.5 * unique if ppm_escape_method == "d" else float(unique)
+                denom = total + esc_mass
                 if not saw_context:
-                    ppm_confidence = max(counts.values()) / denom
+                    ppm_confidence = max(cnt for _, cnt in eligible) / denom
                     saw_context = True
-                if byte in counts:
-                    log_p = escape_logp + math.log(counts[byte] / denom)
+                cnt = counts.get(byte, 0) if byte not in excluded else 0
+                if cnt > 0:
+                    log_p = escape_logp + math.log(cnt / denom)
                     break
-                if unique > 0:
-                    escape_logp += math.log(unique / denom)
+                escape_logp += math.log(esc_mass / denom)
+                excluded.update(sym for sym, _ in eligible)
             ppm_logp = escape_logp + uniform_byte_logp if log_p is None else log_p
             expert_logps["ppm"] = ppm_logp
             if token_ppm_logp is not None:
@@ -1252,20 +1280,25 @@ def _context_mixture_bpb(
                     lzp_pos_tables[order][slot] = t
         if lzp_fast_orders:
             lzp_context_key = ((lzp_context_key << 8) | byte) & lzp_context_key_mask
+        scored_bytes += 1
 
+    denom_bytes = max(scored_bytes, 1)
     result = {
         "bytes": float(total_bytes),
-        "mix_bpb": mix_nll / total_bytes / log2,
-        "nn_only_bpb": nn_nll / total_bytes / log2,
-        "ppm_mix_bpb": ppm_mix_nll / total_bytes / log2,
-        "ppm_only_bpb": (ppm_nll / total_bytes / log2) if ppm_enabled else 0.0,
-        "lzp_only_bpb": lzp_nll / total_bytes / log2,
-        "lzp_coverage": lzp_predictions / total_bytes,
+        "scored_bytes": float(scored_bytes),
+        "coverage": scored_bytes / total_bytes,
+        "cutoff": float(cutoff_hit),
+        "mix_bpb": mix_nll / denom_bytes / log2,
+        "nn_only_bpb": nn_nll / denom_bytes / log2,
+        "ppm_mix_bpb": ppm_mix_nll / denom_bytes / log2,
+        "ppm_only_bpb": (ppm_nll / denom_bytes / log2) if ppm_enabled else 0.0,
+        "lzp_only_bpb": lzp_nll / denom_bytes / log2,
+        "lzp_coverage": lzp_predictions / denom_bytes,
         "lzp_hit_rate": lzp_hits / max(lzp_predictions, 1),
-        "lzp_avg_alpha": lzp_alpha_sum / total_bytes,
+        "lzp_avg_alpha": lzp_alpha_sum / denom_bytes,
     }
     if token_ppm_logp is not None:
-        result["token_ppm_only_bpb"] = token_ppm_nll / total_bytes / log2
+        result["token_ppm_only_bpb"] = token_ppm_nll / denom_bytes / log2
     if log_fn is not None:
         ppm_extra = (
             f" ppm_mix_bpb:{result['ppm_mix_bpb']:.6f} ppm_only:{result['ppm_only_bpb']:.6f}"
@@ -1285,7 +1318,8 @@ def _context_mixture_bpb(
         )
         mode = "meta" if ppm_use_meta_mix else "binary"
         log_fn(
-            f"context_mix bytes:{total_bytes} mix_bpb:{result['mix_bpb']:.6f} "
+            f"context_mix bytes:{total_bytes} scored_bytes:{scored_bytes} coverage:{result['coverage']:.4f} "
+            f"cutoff:{int(cutoff_hit)} ppm_escape:{ppm_escape_method} mix_bpb:{result['mix_bpb']:.6f} "
             f"nn_only:{result['nn_only_bpb']:.6f}{ppm_extra}{token_extra}{lzp_extra} mode:{mode}"
         )
     return result
@@ -2055,6 +2089,7 @@ def eval_val_sliding(
                 ppm_lambda_hi=args.ppm_lambda_hi,
                 ppm_lambda_lo=args.ppm_lambda_lo,
                 ppm_conf_threshold=args.ppm_conf_threshold,
+                ppm_escape_method=args.ppm_escape_method,
                 ppm_token_order=args.ppm_token_order if args.ppm_use_meta_mix else 0,
                 ppm_use_meta_mix=args.ppm_use_meta_mix,
                 ppm_meta_alpha=args.ppm_meta_alpha,
@@ -2068,6 +2103,7 @@ def eval_val_sliding(
                 lzp_min_streak=args.lzp_min_streak,
                 lzp_max_streak=args.lzp_max_streak,
                 lzp_hit_prob=args.lzp_hit_prob,
+                max_seconds=args.context_mix_max_seconds,
                 log_fn=log_fn,
             )
         elif log_fn is not None:
@@ -4645,10 +4681,14 @@ def main() -> None:
         raise ValueError("PPM_LAMBDA_HI and PPM_LAMBDA_LO must be in [0, 1]")
     if not (0.0 <= args.ppm_conf_threshold <= 1.0):
         raise ValueError("PPM_CONF_THRESHOLD must be in [0, 1]")
+    if args.ppm_escape_method not in {"c", "d"}:
+        raise ValueError(f"PPM_ESCAPE_METHOD must be c or d, got {args.ppm_escape_method!r}")
     if not (0.0 <= args.ppm_meta_alpha < 1.0):
         raise ValueError("PPM_META_ALPHA must be in [0, 1)")
     if args.ppm_meta_eta < 0.0 or args.ppm_meta_warmup_bytes < 0:
         raise ValueError("PPM_META_ETA and PPM_META_WARMUP_BYTES must be non-negative")
+    if args.context_mix_max_seconds < 0.0:
+        raise ValueError("CONTEXT_MIX_MAX_SECONDS must be non-negative")
     if args.lzp_enabled:
         if not args.sliding_window_enabled:
             raise ValueError("LZP_ENABLED=1 requires SLIDING_WINDOW_ENABLED=1")
@@ -5001,7 +5041,8 @@ def main() -> None:
     log0(
         f"sliding:enabled:{args.sliding_window_enabled} stride:{args.eval_stride} "
         f"compile_logits:{args.sliding_compile_logits} ppm_enabled:{args.ppm_enabled} ppm_order:{args.ppm_order} "
-        f"ppm_subset_tokens:{args.ppm_subset_tokens} ppm_meta_mix:{args.ppm_use_meta_mix} "
+        f"ppm_subset_tokens:{args.ppm_subset_tokens} ppm_escape:{args.ppm_escape_method} "
+        f"ppm_meta_mix:{args.ppm_use_meta_mix} context_mix_max_seconds:{args.context_mix_max_seconds:g} "
         f"lzp_enabled:{args.lzp_enabled} lzp_orders:{args.lzp_orders_str} "
         f"lzp_subset_tokens:{args.lzp_subset_tokens} lzp_table_bits:{args.lzp_table_bits} "
         f"lzp_alpha:{args.lzp_alpha_min:g}-{args.lzp_alpha_max:g}"
@@ -5323,11 +5364,14 @@ def main() -> None:
             f"val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}"
         )
         if context_result is not None and args.ppm_enabled:
+            ppm_tag = "partial" if context_result.get("cutoff", 0.0) else "exact"
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ppm_exact "
+                f"final_{quant_format}_zlib_roundtrip_sliding_ppm_{ppm_tag} "
                 f"mix_bpb:{context_result['ppm_mix_bpb']:.8f} "
                 f"ppm_only_bpb:{context_result['ppm_only_bpb']:.8f} "
                 f"nn_only_bpb:{context_result['nn_only_bpb']:.8f} "
+                f"coverage:{context_result['coverage']:.8f} "
+                f"scored_bytes:{int(context_result['scored_bytes'])} "
                 f"subset_tokens:{min(args.ppm_subset_tokens, val_tokens.numel() - 1)}"
             )
         if context_result is not None and args.lzp_enabled:

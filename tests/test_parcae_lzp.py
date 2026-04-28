@@ -70,6 +70,7 @@ def test_lzp_rejects_hash_slot_collision_when_context_bytes_differ():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -105,6 +106,7 @@ def test_lzp_improves_repeated_byte_stream_against_uniform_neural_baseline():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -141,6 +143,7 @@ def test_context_mix_reports_ppm_and_lzp_metrics_together():
         ppm_lambda_hi=0.9,
         ppm_lambda_lo=0.05,
         ppm_conf_threshold=0.9,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -165,6 +168,124 @@ def test_context_mix_reports_ppm_and_lzp_metrics_together():
     assert 0.0 <= result["lzp_hit_rate"] <= 1.0
 
 
+def test_ppm_d_escape_improves_repeated_stream_and_logs_method():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes((b"abracadabra " * 30) + (b"banana " * 30))
+    logs: list[str] = []
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=True,
+        ppm_order=5,
+        ppm_lambda_hi=0.9,
+        ppm_lambda_lo=0.05,
+        ppm_conf_threshold=0.9,
+        ppm_escape_method="d",
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=False,
+        lzp_orders="3",
+        lzp_table_bits=8,
+        lzp_alpha_min=0.0,
+        lzp_alpha_max=0.0,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+        log_fn=logs.append,
+    )
+
+    assert result["cutoff"] == 0.0
+    assert result["coverage"] == 1.0
+    assert result["ppm_only_bpb"] < result["nn_only_bpb"]
+    assert result["ppm_mix_bpb"] < result["nn_only_bpb"]
+    assert any("ppm_escape:d" in line for line in logs)
+
+
+def test_ppm_d_escape_beats_ppm_c_on_low_entropy_repeated_stream():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes(b"abcabcabcabc " * 80)
+
+    def score(method: str) -> float:
+        result = pg._context_mixture_bpb(
+            target,
+            prev,
+            nll,
+            token_bytes,
+            has_space,
+            is_boundary,
+            ppm_enabled=True,
+            ppm_order=6,
+            ppm_lambda_hi=0.9,
+            ppm_lambda_lo=0.05,
+            ppm_conf_threshold=0.9,
+            ppm_escape_method=method,
+            ppm_token_order=0,
+            ppm_use_meta_mix=False,
+            ppm_meta_alpha=0.995,
+            ppm_meta_eta=2.0,
+            ppm_meta_warmup_bytes=0,
+            lzp_enabled=False,
+            lzp_orders="3",
+            lzp_table_bits=8,
+            lzp_alpha_min=0.0,
+            lzp_alpha_max=0.0,
+            lzp_min_streak=0,
+            lzp_max_streak=0,
+            lzp_hit_prob=0.99,
+        )
+        return result["ppm_only_bpb"]
+
+    assert score("d") < score("c")
+
+
+def test_context_mix_cutoff_reports_partial_coverage_and_finite_scores():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes(b"the quick brown fox jumps over the lazy dog " * 5000)
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=True,
+        ppm_order=5,
+        ppm_lambda_hi=0.9,
+        ppm_lambda_lo=0.05,
+        ppm_conf_threshold=0.9,
+        ppm_escape_method="d",
+        ppm_token_order=3,
+        ppm_use_meta_mix=True,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_orders="3,4,5",
+        lzp_table_bits=12,
+        lzp_alpha_min=0.0,
+        lzp_alpha_max=0.20,
+        lzp_min_streak=0,
+        lzp_max_streak=4,
+        lzp_hit_prob=0.99,
+        max_seconds=1e-9,
+    )
+
+    assert result["cutoff"] == 1.0
+    assert result["coverage"] < 1.0
+    assert result["scored_bytes"] < result["bytes"]
+    assert math.isfinite(result["mix_bpb"])
+    assert math.isfinite(result["ppm_mix_bpb"])
+
+
 def test_lzp_disabled_is_neural_equivalent_even_with_repetition():
     token_bytes, has_space, is_boundary = _byte_token_luts()
     target, prev, nll = _ids_from_bytes(b"abcXYZ" * 20)
@@ -181,6 +302,7 @@ def test_lzp_disabled_is_neural_equivalent_even_with_repetition():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -235,6 +357,7 @@ def test_lzp_respects_multibyte_tokens_and_leading_space_bytes():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -272,6 +395,7 @@ def test_lzp_long_order_uses_exact_context_check():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -308,6 +432,7 @@ def test_lzp_streak_gate_can_disable_mixing_without_disabling_diagnostics():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
@@ -355,11 +480,13 @@ def test_eval_val_sliding_lzp_integration_collects_prefix_once_and_logs_metrics(
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
         ppm_meta_eta=2.0,
         ppm_meta_warmup_bytes=0,
+        context_mix_max_seconds=0.0,
         lzp_enabled=True,
         lzp_subset_tokens=24,
         lzp_orders_str="3,4",
@@ -430,11 +557,13 @@ def test_eval_val_sliding_allows_sparse_stride_larger_than_window():
         ppm_lambda_hi=1.0,
         ppm_lambda_lo=1.0,
         ppm_conf_threshold=1.0,
+        ppm_escape_method="d",
         ppm_token_order=0,
         ppm_use_meta_mix=False,
         ppm_meta_alpha=0.995,
         ppm_meta_eta=2.0,
         ppm_meta_warmup_bytes=0,
+        context_mix_max_seconds=0.0,
         lzp_enabled=False,
         lzp_subset_tokens=0,
         lzp_orders_str="3",
