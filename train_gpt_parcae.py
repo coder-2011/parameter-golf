@@ -1026,6 +1026,7 @@ def _context_mixture_bpb(
             "lzp_avg_alpha": 0.0,
         }
 
+    cutoff_hit = False
     token_ppm_logp = None
     if ppm_enabled and ppm_token_order > 0 and len(target_ids) > 0:
         vocab_size = len(token_bytes_lut)
@@ -1034,6 +1035,10 @@ def _context_mixture_bpb(
         token_window: list[int] = []
         token_ppm_logp = [0.0] * len(target_ids)
         for i, token_id in enumerate(target_ids):
+            if deadline is not None and time.perf_counter() >= deadline:
+                cutoff_hit = True
+                token_ppm_logp = None
+                break
             tid = int(token_id)
             log_p = None
             escape_logp = 0.0
@@ -1126,7 +1131,6 @@ def _context_mixture_bpb(
     lzp_alpha_sum = 0.0
     meta_losses = {"nn": 0.0, "ppm": 0.0, "token_ppm": 0.0, "lzp": 0.0}
     scored_bytes = 0
-    cutoff_hit = False
 
     for t, byte in enumerate(byte_stream):
         if deadline is not None and time.perf_counter() >= deadline:
