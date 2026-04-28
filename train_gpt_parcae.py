@@ -223,6 +223,10 @@ class Hyperparameters:
     parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", "-1"))
     parallel_residual_ln_scale = bool(int(os.environ.get("PARALLEL_RESIDUAL_LN_SCALE", "1")))
+    parallel_residual_impl = os.environ.get("PARALLEL_RESIDUAL_IMPL", "immediate")
+    parallel_residual_record_controls = bool(int(os.environ.get("PARALLEL_RESIDUAL_RECORD_CONTROLS", "1")))
+    parallel_residual_tied_norm = bool(int(os.environ.get("PARALLEL_RESIDUAL_TIED_NORM", "0")))
+    parallel_residual_in_fp32 = bool(int(os.environ.get("PARALLEL_RESIDUAL_IN_FP32", "0")))
     attn_res_mode = os.environ.get("ATTN_RES_MODE", "none").strip().lower()
     attn_res_scope = os.environ.get("ATTN_RES_SCOPE", "all").strip().lower()
     attn_res_block_size = int(os.environ.get("ATTN_RES_BLOCK_SIZE", 2))
@@ -3679,6 +3683,31 @@ class TransformerPreNormBlock(nn.Module):
         x = self.attn(self.norm_1(x), freqs_cos, freqs_sin, mask, **kwargs) + x
         return self.mlp(self.norm_2(x)) + x
 
+    def forward_parallel_delayed(
+        self,
+        hidden_states1: Tensor,
+        hidden_states2: Tensor | None,
+        residual: Tensor | None,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None = None,
+        *,
+        tied_norm: bool = False,
+        residual_in_fp32: bool = False,
+        **kwargs,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if not self.parallel_residual or self.record_residual:
+            raise RuntimeError("delayed parallel residual requires simple parallel residual blocks")
+        residual = _accumulate_parallel_residual(hidden_states1, hidden_states2, residual)
+        if residual_in_fp32:
+            residual = residual.float()
+        norm_source = residual.to(dtype=hidden_states1.dtype) if residual_in_fp32 else residual
+        normed1 = self.norm_1(norm_source)
+        normed2 = normed1 if tied_norm else self.norm_2(norm_source)
+        hidden_states1 = self.attn(normed1, freqs_cos, freqs_sin, mask, **kwargs)
+        hidden_states2 = self.mlp(normed2)
+        return hidden_states1, hidden_states2, residual
+
     def forward_attn_res(
         self,
         state: AttentionResidualState,
@@ -3697,6 +3726,22 @@ class TransformerPreNormBlock(nn.Module):
         mlp_input = state.mix(self.attn_res_mlp)
         state.add(self.mlp(self.norm_2(mlp_input)))
         return state.output()
+
+
+def _accumulate_parallel_residual(hidden_states1: Tensor, hidden_states2: Tensor | None, residual: Tensor | None) -> Tensor:
+    branch_sum = hidden_states1 if hidden_states2 is None else hidden_states1 + hidden_states2
+    return branch_sum if residual is None else residual + branch_sum
+
+
+def flush_parallel_residual_stream(
+    hidden_states1: Tensor,
+    hidden_states2: Tensor | None,
+    residual: Tensor | None,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> Tensor:
+    out = _accumulate_parallel_residual(hidden_states1, hidden_states2, residual)
+    return out if output_dtype is None else out.to(dtype=output_dtype)
 
 
 class DiagonalInjection(nn.Module):
@@ -3803,6 +3848,9 @@ class GPT(nn.Module):
         self.residual_mode = h.residual_mode
         self.parallel_residual_scope = h.parallel_residual_scope
         self.parallel_residual_start = h.parallel_residual_start
+        self.parallel_residual_impl = h.parallel_residual_impl
+        self.parallel_residual_tied_norm = h.parallel_residual_tied_norm
+        self.parallel_residual_in_fp32 = h.parallel_residual_in_fp32
         self.attn_res_mode = h.attn_res_mode
         self.attn_res_scope = h.attn_res_scope
         self.attn_res_block_size = h.attn_res_block_size
@@ -3850,6 +3898,19 @@ class GPT(nn.Module):
             raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
         if self.attn_res_mode != "none" and h.gradient_checkpointing:
             raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
+        if self.parallel_residual_impl not in {"immediate", "delayed"}:
+            raise ValueError(f"PARALLEL_RESIDUAL_IMPL must be immediate or delayed, got {self.parallel_residual_impl!r}")
+        if self.parallel_residual_impl == "delayed":
+            if h.residual_mode != "parallel":
+                raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires RESIDUAL_MODE=parallel")
+            if h.parallel_residual_start != -1:
+                raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires PARALLEL_RESIDUAL_START=-1")
+            if h.parallel_residual_record_controls:
+                raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires PARALLEL_RESIDUAL_RECORD_CONTROLS=0")
+            if h.gradient_checkpointing:
+                raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed is not wired for gradient checkpointing yet")
+        elif h.parallel_residual_tied_norm or h.parallel_residual_in_fp32:
+            raise ValueError("PARALLEL_RESIDUAL_TIED_NORM and PARALLEL_RESIDUAL_IN_FP32 require PARALLEL_RESIDUAL_IMPL=delayed")
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -4134,6 +4195,52 @@ class GPT(nn.Module):
             x = block.forward_attn_res(state, freqs_cos, freqs_sin, mask, ve=ve, use_xsa=use_xsa)
         return x
 
+    def _use_delayed_parallel_stack(self, blocks: nn.ModuleList) -> bool:
+        return (
+            self.parallel_residual_impl == "delayed"
+            and len(blocks) > 0
+            and all(
+                isinstance(block, TransformerPreNormBlock)
+                and block.parallel_residual
+                and not block.record_residual
+                and block.attn_res_attn is None
+                for block in blocks
+            )
+        )
+
+    def _forward_delayed_parallel_stack(
+        self,
+        blocks: nn.ModuleList,
+        x: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None,
+        value_embeds: nn.ModuleDict,
+        input_ids: Tensor,
+        base_layer_id: int = 0,
+        total_depth: int | None = None,
+    ) -> Tensor:
+        output_dtype = x.dtype
+        hidden_states1 = x
+        hidden_states2 = None
+        residual = None
+        for i, block in enumerate(blocks):
+            ve = self._embedding(value_embeds[str(i)], input_ids) if str(i) in value_embeds else None
+            use_xsa = self._use_xsa_for_effective_layer(base_layer_id + i, total_depth)
+            hidden_states1, hidden_states2, residual = block.forward_parallel_delayed(
+                hidden_states1,
+                hidden_states2,
+                residual,
+                freqs_cos,
+                freqs_sin,
+                mask,
+                tied_norm=self.parallel_residual_tied_norm,
+                residual_in_fp32=self.parallel_residual_in_fp32,
+                ve=ve,
+                use_xsa=use_xsa,
+            )
+        return flush_parallel_residual_stream(hidden_states1, hidden_states2, residual, output_dtype=output_dtype)
+
     def _use_xsa_for_effective_layer(self, layer_id: int, total_depth: int | None = None) -> bool:
         if self.xsa_last_n <= 0:
             return False
@@ -4209,6 +4316,16 @@ class GPT(nn.Module):
                 self.prelude_value_embeds,
                 input_ids,
             )
+        elif self._use_delayed_parallel_stack(self.prelude):
+            x = self._forward_delayed_parallel_stack(
+                self.prelude,
+                x,
+                outer_freqs_cos,
+                outer_freqs_sin,
+                None,
+                self.prelude_value_embeds,
+                input_ids,
+            )
         else:
             for i, block in enumerate(self.prelude):
                 ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
@@ -4232,6 +4349,18 @@ class GPT(nn.Module):
 
         if self._attn_res_enabled_for("coda"):
             x = self._forward_attn_res_stack(
+                self.coda,
+                x,
+                outer_freqs_cos,
+                outer_freqs_sin,
+                None,
+                self.coda_value_embeds,
+                input_ids,
+                base_layer_id=coda_layer_offset,
+                total_depth=total_depth_int,
+            )
+        elif self._use_delayed_parallel_stack(self.coda):
+            x = self._forward_delayed_parallel_stack(
                 self.coda,
                 x,
                 outer_freqs_cos,
@@ -4425,12 +4554,23 @@ class GPT(nn.Module):
         if input_ids is None:
             raise RuntimeError('current input ids are not set')
         if self.attn_res_mode == "none" and self.xsa_last_n <= 0:
-            for layer_idx, block in enumerate(self.core_block):
-                ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
-                if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
-                else:
-                    x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
+            if self._use_delayed_parallel_stack(self.core_block):
+                x = self._forward_delayed_parallel_stack(
+                    self.core_block,
+                    x,
+                    freqs_cos,
+                    freqs_sin,
+                    mask,
+                    self.core_value_embeds,
+                    input_ids,
+                )
+            else:
+                for layer_idx, block in enumerate(self.core_block):
+                    ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
+                    if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
+                        x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
+                    else:
+                        x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
             return x
         step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
         total_steps_int = int(total_steps.item()) if isinstance(total_steps, torch.Tensor) else int(total_steps)
@@ -4735,6 +4875,19 @@ def main() -> None:
         raise ValueError("RESIDUAL_MODE=parallel requires PARALLEL_RESIDUAL_SCOPE=core or all")
     if args.parallel_residual_start < -1:
         raise ValueError(f"PARALLEL_RESIDUAL_START must be -1 or non-negative, got {args.parallel_residual_start}")
+    if args.parallel_residual_impl not in {"immediate", "delayed"}:
+        raise ValueError(f"PARALLEL_RESIDUAL_IMPL must be immediate or delayed, got {args.parallel_residual_impl!r}")
+    if args.parallel_residual_impl == "delayed":
+        if args.residual_mode != "parallel":
+            raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires RESIDUAL_MODE=parallel")
+        if args.parallel_residual_start != -1:
+            raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires PARALLEL_RESIDUAL_START=-1")
+        if args.parallel_residual_record_controls:
+            raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed requires PARALLEL_RESIDUAL_RECORD_CONTROLS=0")
+        if args.gradient_checkpointing:
+            raise ValueError("PARALLEL_RESIDUAL_IMPL=delayed is not wired for gradient checkpointing yet")
+    elif args.parallel_residual_tied_norm or args.parallel_residual_in_fp32:
+        raise ValueError("PARALLEL_RESIDUAL_TIED_NORM and PARALLEL_RESIDUAL_IN_FP32 require PARALLEL_RESIDUAL_IMPL=delayed")
     if args.attn_res_mode not in {"none", "full", "block"}:
         raise ValueError(f"ATTN_RES_MODE must be none, full, or block, got {args.attn_res_mode!r}")
     if args.attn_res_scope not in {"none", "prelude", "core", "coda", "all"}:
@@ -5074,7 +5227,10 @@ def main() -> None:
         f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
         f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
         f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
-        f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale} "
+        f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale} parallel_residual_impl:{args.parallel_residual_impl} "
+        f"parallel_residual_record_controls:{args.parallel_residual_record_controls} "
+        f"parallel_residual_tied_norm:{args.parallel_residual_tied_norm} "
+        f"parallel_residual_in_fp32:{args.parallel_residual_in_fp32} "
         f"attn_res_mode:{args.attn_res_mode} attn_res_scope:{args.attn_res_scope} "
         f"attn_res_block_size:{args.attn_res_block_size}"
     )

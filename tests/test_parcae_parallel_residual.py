@@ -35,6 +35,10 @@ def _tiny_h() -> pg.Hyperparameters:
     h.parallel_residual_scope = "none"
     h.parallel_residual_start = -1
     h.parallel_residual_ln_scale = True
+    h.parallel_residual_impl = "immediate"
+    h.parallel_residual_record_controls = True
+    h.parallel_residual_tied_norm = False
+    h.parallel_residual_in_fp32 = False
     h.state_init = "like-init"
     h.prelude_norm = False
     h.qk_norm = False
@@ -50,8 +54,6 @@ def _tiny_h() -> pg.Hyperparameters:
     h.monitoring = False
     h.tie_embeddings = True
     h.poe_num_experts = 1
-    h.coda_moe_num_experts = 0
-    h.deepseek_moe_num_base_experts = 0
     h.qat_bits = 0
     h.qat_linear = True
     h.qat_tied_output = True
@@ -383,6 +385,33 @@ def test_record_sequential_block_matches_reference_formula():
     assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
 
 
+def test_delayed_parallel_block_stream_matches_immediate_parallel_stack():
+    torch.manual_seed(321)
+    block0 = _block(parallel_residual=True, record_residual=False)
+    block1 = _block(parallel_residual=True, record_residual=False)
+    x = torch.randn(2, 5, 16)
+    freqs_cos, freqs_sin = _freqs()
+
+    expected = block1(block0(x, freqs_cos, freqs_sin), freqs_cos, freqs_sin)
+    hidden1, hidden2, residual = block0.forward_parallel_delayed(
+        x,
+        None,
+        None,
+        freqs_cos,
+        freqs_sin,
+    )
+    hidden1, hidden2, residual = block1.forward_parallel_delayed(
+        hidden1,
+        hidden2,
+        residual,
+        freqs_cos,
+        freqs_sin,
+    )
+    actual = pg.flush_parallel_residual_stream(hidden1, hidden2, residual, output_dtype=x.dtype)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_parallel_residual_scope_and_start_use_physical_layer_indices():
     h = _tiny_h()
     h.residual_mode = "parallel"
@@ -521,6 +550,59 @@ def test_parallel_residual_quantized_state_dict_loads_strictly():
     assert restored_state["core_block.0.attn_scale"].dtype == torch.float32
     assert restored_state["core_block.0.mlp_scale"].dtype == torch.float32
     assert restored_state["core_block.0.resid_mix"].dtype == torch.float32
+
+
+def test_delayed_parallel_residual_gpt_matches_immediate_without_record_controls():
+    torch.manual_seed(987)
+    h = _tiny_h()
+    h.residual_mode = "parallel"
+    h.parallel_residual_scope = "core"
+    h.parallel_residual_record_controls = False
+    immediate = pg.GPT(h)
+
+    h_delayed = _tiny_h()
+    h_delayed.residual_mode = "parallel"
+    h_delayed.parallel_residual_scope = "core"
+    h_delayed.parallel_residual_record_controls = False
+    h_delayed.parallel_residual_impl = "delayed"
+    delayed = pg.GPT(h_delayed)
+    delayed.load_state_dict(immediate.state_dict(), strict=True)
+    immediate.eval()
+    delayed.eval()
+
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    steps = torch.tensor([0, 1])
+    expected = immediate.forward_logits(input_ids, num_steps_pair=steps)
+    actual = delayed.forward_logits(input_ids, num_steps_pair=steps)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_delayed_parallel_residual_tied_norm_and_fp32_stream_are_finite():
+    torch.manual_seed(654)
+    h = _tiny_h()
+    h.residual_mode = "parallel"
+    h.parallel_residual_scope = "core"
+    h.parallel_residual_record_controls = False
+    h.parallel_residual_impl = "delayed"
+    h.parallel_residual_tied_norm = True
+    h.parallel_residual_in_fp32 = True
+    model = pg.GPT(h)
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.core_block[0].norm_1.weight.grad is not None
+    assert torch.isfinite(model.core_block[0].norm_1.weight.grad).all()
+    assert model.core_block[0].norm_2.weight.grad is None
 
 
 def test_ema_state_matches_record_update_formula():
