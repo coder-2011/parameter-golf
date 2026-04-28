@@ -1,8 +1,10 @@
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -161,6 +163,244 @@ def test_context_mix_reports_ppm_and_lzp_metrics_together():
     assert math.isfinite(result["lzp_only_bpb"])
     assert 0.0 <= result["lzp_coverage"] <= 1.0
     assert 0.0 <= result["lzp_hit_rate"] <= 1.0
+
+
+def test_lzp_disabled_is_neural_equivalent_even_with_repetition():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes(b"abcXYZ" * 20)
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=False,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=False,
+        lzp_orders="3,4,5",
+        lzp_table_bits=10,
+        lzp_alpha_min=1.0,
+        lzp_alpha_max=1.0,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+    )
+
+    assert result["lzp_coverage"] == 0.0
+    assert result["lzp_hit_rate"] == 0.0
+    assert math.isclose(result["lzp_only_bpb"], result["nn_only_bpb"])
+    assert math.isclose(result["mix_bpb"], result["nn_only_bpb"])
+
+
+def test_lzp_respects_multibyte_tokens_and_leading_space_bytes():
+    token_bytes = [b"", b"ab", b"c"]
+    has_space = np.array([False, True, False], dtype=np.bool_)
+    is_boundary = np.array([True, False, False], dtype=np.bool_)
+    target = np.array([1, 2, 1, 2, 1, 2, 1, 2], dtype=np.int64)
+    prev = np.empty_like(target)
+    prev[0] = 0
+    prev[1:] = target[:-1]
+    nll = np.full(target.shape, math.log(256.0), dtype=np.float64)
+
+    byte_stream, byte_logp = pg._token_predictions_to_byte_stream(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+    )
+    assert bytes(byte_stream) == b"abc abc abc abc"
+    assert len(byte_stream) == len(byte_logp)
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=False,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_orders="4",
+        lzp_table_bits=8,
+        lzp_alpha_min=1.0,
+        lzp_alpha_max=1.0,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+    )
+
+    assert result["bytes"] == len(byte_stream)
+    assert result["lzp_coverage"] > 0.25
+    assert result["mix_bpb"] < result["nn_only_bpb"]
+
+
+def test_lzp_long_order_uses_exact_context_check():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    repeated = b"abcdefghijklZ" * 4
+    target, prev, nll = _ids_from_bytes(repeated)
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=False,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_orders="12",
+        lzp_table_bits=10,
+        lzp_alpha_min=0.5,
+        lzp_alpha_max=0.5,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+    )
+
+    assert result["lzp_coverage"] > 0.2
+    assert result["lzp_hit_rate"] > 0.9
+    assert result["mix_bpb"] < result["nn_only_bpb"]
+
+
+def test_lzp_streak_gate_can_disable_mixing_without_disabling_diagnostics():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes(b"abcXYZ" * 16)
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=False,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_orders="3",
+        lzp_table_bits=10,
+        lzp_alpha_min=0.0,
+        lzp_alpha_max=0.0,
+        lzp_min_streak=99,
+        lzp_max_streak=99,
+        lzp_hit_prob=0.99,
+    )
+
+    assert result["lzp_coverage"] > 0.5
+    assert result["lzp_hit_rate"] > 0.8
+    assert result["lzp_avg_alpha"] == 0.0
+    assert math.isclose(result["mix_bpb"], result["nn_only_bpb"])
+
+
+def test_eval_val_sliding_lzp_integration_collects_prefix_once_and_logs_metrics():
+    class UniformModel:
+        def __init__(self, vocab_size: int):
+            self.vocab_size = vocab_size
+            self.training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self):
+            self.training = True
+
+        def forward_logits(self, input_ids):
+            shape = (*input_ids.shape, self.vocab_size)
+            return torch.zeros(shape, dtype=torch.float32, device=input_ids.device)
+
+    args = SimpleNamespace(
+        train_seq_len=8,
+        eval_stride=4,
+        sliding_compile_logits=False,
+        ppm_enabled=False,
+        ppm_subset_tokens=0,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_subset_tokens=24,
+        lzp_orders_str="3,4",
+        lzp_table_bits=8,
+        lzp_alpha_min=0.25,
+        lzp_alpha_max=0.50,
+        lzp_min_streak=0,
+        lzp_max_streak=2,
+        lzp_hit_prob=0.99,
+        val_byte_count_override=0,
+    )
+    data = (b"abcXYZ" * 6)
+    val_tokens = torch.tensor(list(data), dtype=torch.int64)
+    base_bytes_lut = torch.ones(256, dtype=torch.int16)
+    has_space_lut = torch.zeros(256, dtype=torch.bool)
+    boundary_lut = torch.zeros(256, dtype=torch.bool)
+    token_bytes = [bytes([i]) for i in range(256)]
+    logs: list[str] = []
+
+    loss, bpb, context_result = pg.eval_val_sliding(
+        args,
+        UniformModel(256),
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_space_lut,
+        is_boundary_token_lut=boundary_lut,
+        token_bytes_lut=token_bytes,
+        log_fn=logs.append,
+        batch_seqs=2,
+    )
+
+    assert math.isclose(loss, math.log(256.0), rel_tol=1e-6)
+    assert math.isclose(bpb, 8.0, rel_tol=1e-6)
+    assert context_result is not None
+    assert context_result["bytes"] == args.lzp_subset_tokens
+    assert context_result["lzp_coverage"] > 0.25
+    assert any("context_mix bytes:24" in line and "lzp_only:" in line for line in logs)
+    assert any("context_mix_time:" in line and "subset_tokens:24" in line for line in logs)
 
 
 if __name__ == "__main__":
