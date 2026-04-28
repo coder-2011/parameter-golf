@@ -39,7 +39,22 @@ def test_lzp_context_match_uses_prediction_position_as_context_end():
 
 def test_lzp_rejects_hash_slot_collision_when_context_bytes_differ():
     token_bytes, has_space, is_boundary = _byte_token_luts()
-    target, prev, nll = _ids_from_bytes(bytes([0, 0, 1, 2, 2, 7]))
+    table_mask = 1
+    first_context_key = (0 << 8) | 0
+    colliding_context_key = (0 << 8) | 1
+    assert pg._lzp_slot_from_context_key(first_context_key, table_mask) == pg._lzp_slot_from_context_key(
+        colliding_context_key,
+        table_mask,
+    )
+    assert pg._lzp_slot_from_context_key((0 << 8) | 2, table_mask) != pg._lzp_slot_from_context_key(
+        first_context_key,
+        table_mask,
+    )
+    assert pg._lzp_slot_from_context_key((2 << 8) | 0, table_mask) != pg._lzp_slot_from_context_key(
+        first_context_key,
+        table_mask,
+    )
+    target, prev, nll = _ids_from_bytes(bytes([0, 0, 2, 0, 1, 7]))
 
     result = pg._context_mixture_bpb(
         target,

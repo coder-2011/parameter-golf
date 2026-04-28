@@ -674,7 +674,9 @@ def _mix_two_logps(logp_a: float, logp_b: float, weight_b: float) -> float:
         return logp_a
     if weight_b >= 1.0:
         return logp_b
-    return _logsumexp([math.log1p(-weight_b) + logp_a, math.log(weight_b) + logp_b])
+    a = math.log1p(-weight_b) + logp_a
+    b = math.log(weight_b) + logp_b
+    return max(a, b) + math.log1p(math.exp(-abs(a - b)))
 
 
 def _rolling_hash_prefix(byte_stream: list[int], base: int, max_order: int) -> tuple[np.ndarray, np.ndarray]:
@@ -695,6 +697,17 @@ def _rolling_hash_prefix(byte_stream: list[int], base: int, max_order: int) -> t
 def _rolling_context_hash(prefix: np.ndarray, powers: np.ndarray, end: int, order: int) -> np.uint64:
     mask64 = (1 << 64) - 1
     return np.uint64((int(prefix[end]) - ((int(prefix[end - order]) * int(powers[order])) & mask64)) & mask64)
+
+
+def _lzp_slot_from_context_key(key: int, table_mask: int) -> int:
+    mask64 = (1 << 64) - 1
+    x = key & mask64
+    x ^= x >> 33
+    x = (x * 0xff51afd7ed558ccd) & mask64
+    x ^= x >> 33
+    x = (x * 0xc4ceb9fe1a85ec53) & mask64
+    x ^= x >> 33
+    return x & table_mask
 
 
 def _lzp_context_matches(byte_stream: list[int], pred_pos: int, cur_pos: int, order: int) -> bool:
@@ -1023,9 +1036,21 @@ def _context_mixture_bpb(
         order: np.full(lzp_table_size, -1, dtype=np.int32)
         for order in lzp_order_list
     }
+    lzp_fast_orders = [order for order in lzp_order_list if order <= 8]
+    lzp_long_orders = [order for order in lzp_order_list if order > 8]
+    lzp_context_masks = {
+        order: (1 << (8 * order)) - 1
+        for order in lzp_fast_orders
+    }
+    lzp_key_tables = {
+        order: np.zeros(lzp_table_size, dtype=np.uint64)
+        for order in lzp_fast_orders
+    }
+    lzp_context_key = 0
+    lzp_context_key_mask = (1 << (8 * max(lzp_fast_orders))) - 1 if lzp_fast_orders else 0
     lzp_streaks = {order: 0 for order in lzp_order_list}
-    if lzp_order_list:
-        max_lzp_order = max(lzp_order_list)
+    if lzp_long_orders:
+        max_lzp_order = max(lzp_long_orders)
         lzp_prefix1, lzp_pow1 = _rolling_hash_prefix(byte_stream, 257, max_lzp_order)
     else:
         lzp_prefix1 = lzp_pow1 = None
@@ -1084,11 +1109,19 @@ def _context_mixture_bpb(
             for order in lzp_order_list:
                 pred = None
                 if t >= order:
-                    h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
-                    slot = int(h1) & lzp_table_mask
-                    pred_pos = int(lzp_pos_tables[order][slot])
-                    if _lzp_context_matches(byte_stream, pred_pos, t, order):
-                        pred = byte_stream[pred_pos]
+                    if order <= 8:
+                        context_key = lzp_context_key & lzp_context_masks[order]
+                        slot = _lzp_slot_from_context_key(context_key, lzp_table_mask)
+                        pred_pos = int(lzp_pos_tables[order][slot])
+                        if pred_pos >= order and pred_pos < t and int(lzp_key_tables[order][slot]) == context_key:
+                            pred = byte_stream[pred_pos]
+                    else:
+                        h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
+                        slot = int(h1) & lzp_table_mask
+                        pred_pos = int(lzp_pos_tables[order][slot])
+                        if _lzp_context_matches(byte_stream, pred_pos, t, order):
+                            pred = byte_stream[pred_pos]
+                    if pred is not None:
                         votes, streak, best_order = pred_stats.get(pred, (0, 0, 0))
                         pred_stats[pred] = (
                             votes + 1,
@@ -1167,9 +1200,17 @@ def _context_mixture_bpb(
             else:
                 lzp_streaks[order] = 0
             if t >= order:
-                h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
-                slot = int(h1) & lzp_table_mask
-                lzp_pos_tables[order][slot] = t
+                if order <= 8:
+                    context_key = lzp_context_key & lzp_context_masks[order]
+                    slot = _lzp_slot_from_context_key(context_key, lzp_table_mask)
+                    lzp_key_tables[order][slot] = np.uint64(context_key)
+                    lzp_pos_tables[order][slot] = t
+                else:
+                    h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
+                    slot = int(h1) & lzp_table_mask
+                    lzp_pos_tables[order][slot] = t
+        if lzp_fast_orders:
+            lzp_context_key = ((lzp_context_key << 8) | byte) & lzp_context_key_mask
 
     result = {
         "bytes": float(total_bytes),
@@ -4444,6 +4485,7 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
+    weight_average_priority = "ema" if args.ema_enabled else ("swa" if args.swa_enabled else "none")
 
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -4702,7 +4744,7 @@ def main() -> None:
         f"weight_average:ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay:g} "
         f"ema_update_every:{args.ema_update_every} "
         f"swa_enabled:{args.swa_enabled} swa_start_frac:{args.swa_start_frac:g} "
-        f"swa_every:{args.swa_every} priority:{'ema' if args.ema_enabled else 'swa'}"
+        f"swa_every:{args.swa_every} priority:{weight_average_priority}"
     )
     log0(
         f"ttt:enabled:{args.ttt_enabled} stride:{args.eval_stride} chunk_tokens:{args.ttt_chunk_tokens} "
