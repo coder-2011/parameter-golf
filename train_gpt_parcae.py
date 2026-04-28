@@ -41,74 +41,12 @@ try:
 except Exception:
     LigerGELUMulFunction = None
 
+try:
+    from liger_kernel.transformers import LigerCrossEntropyLoss
+except Exception:
+    LigerCrossEntropyLoss = None
+
 USE_TRITON_RMSNORM = False
-
-if triton is not None:
-    @triton.jit
-    def _liger_ce_forward_kernel(
-        logits_ptr,
-        target_ptr,
-        loss_ptr,
-        grad_ptr,
-        inv_n,
-        n_cols: tl.constexpr,
-        ignore_index: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        row = tl.program_id(0).to(tl.int64)
-        offsets = tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_cols
-        y = tl.load(target_ptr + row)
-        row_start = row * n_cols
-        x = tl.load(logits_ptr + row_start + offsets, mask=mask, other=-float("inf")).to(tl.float32)
-
-        if y == ignore_index:
-            tl.store(loss_ptr + row, 0.0)
-            tl.store(grad_ptr + row_start + offsets, 0.0, mask=mask)
-            return
-
-        row_max = tl.max(x, axis=0)
-        exp_x = tl.exp(x - row_max)
-        denom = tl.sum(exp_x, axis=0)
-        y_logit = tl.load(logits_ptr + row_start + y).to(tl.float32)
-        loss = (row_max + tl.log(denom) - y_logit) * inv_n
-        grad = (exp_x / denom - tl.where(offsets == y, 1.0, 0.0)) * inv_n
-
-        tl.store(loss_ptr + row, loss)
-        tl.store(grad_ptr + row_start + offsets, grad, mask=mask)
-else:
-    _liger_ce_forward_kernel = None
-
-
-class LigerCrossEntropyFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, logits: Tensor, target: Tensor, ignore_index: int, n_non_ignore: int) -> Tensor:
-        flat_logits = logits.reshape(-1, logits.size(-1)).contiguous()
-        flat_target = target.reshape(-1).contiguous()
-
-        n_rows, n_cols = flat_logits.shape
-        block_size = triton.next_power_of_2(n_cols)
-        loss_buf = torch.empty(n_rows, device=flat_logits.device, dtype=torch.float32)
-        grad = torch.empty_like(flat_logits)
-        _liger_ce_forward_kernel[(n_rows,)](
-            flat_logits,
-            flat_target,
-            loss_buf,
-            grad,
-            inv_n=1.0 / n_non_ignore,
-            n_cols=n_cols,
-            ignore_index=ignore_index,
-            BLOCK_SIZE=block_size,
-            num_warps=8,
-        )
-        ctx.save_for_backward(grad)
-        ctx.logits_shape = logits.shape
-        return loss_buf.sum()
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None]:
-        (grad,) = ctx.saved_tensors
-        return (grad * grad_output).reshape(ctx.logits_shape), None, None, None
 
 
 def liger_cross_entropy(
@@ -116,20 +54,24 @@ def liger_cross_entropy(
     target: Tensor,
     ignore_index: int = -100,
     assume_no_ignore: bool = False,
+    preserve_input: bool = False,
+    softcap: float | None = None,
 ) -> Tensor:
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_target = target.reshape(-1)
-    if (
-        _liger_ce_forward_kernel is None
-        or flat_logits.device.type != "cuda"
-        or not torch.is_floating_point(flat_logits)
-        or triton.next_power_of_2(flat_logits.size(-1)) > 65536
-    ):
-        return F.cross_entropy(flat_logits.float(), flat_target, ignore_index=ignore_index)
+    if LigerCrossEntropyLoss is None or flat_logits.device.type != "cuda" or not torch.is_floating_point(flat_logits):
+        logits_f = flat_logits.float()
+        if softcap is not None:
+            logits_f = softcap * torch.tanh(logits_f / softcap)
+        return F.cross_entropy(logits_f, flat_target, ignore_index=ignore_index)
     n_non_ignore = flat_target.numel() if assume_no_ignore else int((flat_target != ignore_index).sum().item())
     if n_non_ignore == 0:
-        return F.cross_entropy(flat_logits.float(), flat_target, ignore_index=ignore_index)
-    return LigerCrossEntropyFunction.apply(logits, target, ignore_index, n_non_ignore)
+        logits_f = flat_logits.float()
+        if softcap is not None:
+            logits_f = softcap * torch.tanh(logits_f / softcap)
+        return F.cross_entropy(logits_f, flat_target, ignore_index=ignore_index)
+    ce_input = flat_logits.clone() if preserve_input else flat_logits
+    return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=softcap)(ce_input, flat_target)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -1602,7 +1544,11 @@ def eval_val_sliding_hashed_ngram(
                             ent_bins = np.digitize(entropy, ent_edges).astype(np.int32)
                         else:
                             entropy = np.zeros(seg_len, dtype=np.float64)
-                            per_token_alpha = np.full(seg_len, args.ngram_eval_alpha, dtype=np.float64)
+                            per_token_alpha = np.full(
+                                seg_len,
+                                float(getattr(args, "ngram_eval_alpha", 0.30)),
+                                dtype=np.float64,
+                            )
                             ent_bins = np.ones(seg_len, dtype=np.int32)
                     else:
                         entropy = np.zeros(seg_len, dtype=np.float64)
@@ -1823,12 +1769,13 @@ def eval_val_sliding(
 ) -> tuple[float, float, dict[str, float] | None, dict[str, float] | None]:
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
-    ngram_enabled = args.ngram_eval_order >= 2
-    chunk_tokens = int(args.ngram_chunk_tokens) if ngram_enabled else total_tokens
+    ngram_order = int(getattr(args, "ngram_eval_order", 0))
+    ngram_enabled = ngram_order >= 2
+    chunk_tokens = int(getattr(args, "ngram_chunk_tokens", total_tokens)) if ngram_enabled else total_tokens
     context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, args.eval_stride, chunk_tokens)
     all_window_starts = [ws for windows in chunk_windows for ws in windows]
     if ngram_enabled:
-        batch_seqs = args.ngram_batch_seqs
+        batch_seqs = int(getattr(args, "ngram_batch_seqs", batch_seqs))
     logits_fn = (
         torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
         if getattr(args, "sliding_compile_logits", False)
@@ -1853,33 +1800,36 @@ def eval_val_sliding(
 
     ngram_result = None
     if ngram_enabled:
-        if args.ngram_mix_mode != "expert":
-            raise ValueError(f"NGRAM_MIX_MODE only supports expert, got {args.ngram_mix_mode!r}")
-        min_order = max(args.ngram_eval_min_order, 2)
-        max_order = max(args.ngram_eval_order, min_order)
-        adaptive = args.ngram_eval_adaptive
-        alpha_min = args.ngram_eval_alpha_min
-        alpha_max = args.ngram_eval_alpha_max
-        ent_center = args.ngram_eval_entropy_center
-        ent_scale = args.ngram_eval_entropy_scale
+        ngram_mix_mode = getattr(args, "ngram_mix_mode", "expert")
+        if ngram_mix_mode != "expert":
+            raise ValueError(f"NGRAM_MIX_MODE only supports expert, got {ngram_mix_mode!r}")
+        min_order = max(int(getattr(args, "ngram_eval_min_order", 2)), 2)
+        max_order = max(ngram_order, min_order)
+        adaptive = bool(getattr(args, "ngram_eval_adaptive", True))
+        alpha_min = float(getattr(args, "ngram_eval_alpha_min", 0.05))
+        alpha_max = float(getattr(args, "ngram_eval_alpha_max", 0.60))
+        ent_center = float(getattr(args, "ngram_eval_entropy_center", 4.0))
+        ent_scale = float(getattr(args, "ngram_eval_entropy_scale", 2.0))
         fixed_order_mults = None
-        if args.ngram_order_mults_str:
+        ngram_order_mults_str = getattr(args, "ngram_order_mults_str", "")
+        if ngram_order_mults_str:
             fixed_order_mults = np.array(
-                [float(x) for x in args.ngram_order_mults_str.split(",") if x.strip()],
+                [float(x) for x in ngram_order_mults_str.split(",") if x.strip()],
                 dtype=np.float64,
             )
             if fixed_order_mults.size == 0:
                 fixed_order_mults = None
         val_np = val_tokens.detach().cpu().numpy()
-        buckets = int(args.ngram_eval_buckets)
+        buckets = int(getattr(args, "ngram_eval_buckets", 4_194_304))
+        expert_topk = int(getattr(args, "ngram_expert_topk", 8))
         candidate_vocab_size = int(getattr(args, "vocab_size", int(val_np.max()) + 1 if val_np.size else 1))
         ctx_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
         candidate_ids = {
-            n: np.full((buckets, args.ngram_expert_topk), -1, dtype=np.int32)
+            n: np.full((buckets, expert_topk), -1, dtype=np.int32)
             for n in range(min_order, max_order + 1)
         }
         candidate_counts = {
-            n: np.zeros((buckets, args.ngram_expert_topk), dtype=np.uint32)
+            n: np.zeros((buckets, expert_topk), dtype=np.uint32)
             for n in range(min_order, max_order + 1)
         }
         mask = np.uint64(buckets - 1)
@@ -1899,16 +1849,17 @@ def eval_val_sliding(
             s = 0 if ws == 0 else context_size
             total_ngram_scored_tokens += float(max(wlen - s, 0))
         ngram_start_time = time.perf_counter()
+        ngram_eval_max_seconds = float(getattr(args, "ngram_eval_max_seconds", 0.0))
         ngram_deadline = (
-            ngram_start_time + args.ngram_eval_max_seconds
-            if args.ngram_eval_max_seconds > 0.0
+            ngram_start_time + ngram_eval_max_seconds
+            if ngram_eval_max_seconds > 0.0
             else None
         )
         ngram_cutoff_hit = False
         if rank == 0 and log_fn is not None:
             log_fn(
                 f"ngram_eval:fused chunks:{len(chunk_windows)} chunk_tokens:{chunk_tokens} "
-                f"windows:{len(all_window_starts)} shared_tables:1 mode:{args.ngram_mix_mode}"
+                f"windows:{len(all_window_starts)} shared_tables:1 mode:{ngram_mix_mode}"
             )
 
     model.eval()
@@ -1996,7 +1947,7 @@ def eval_val_sliding(
                                 ctx_hash ^= tok * primes[k % len(primes)]
                             ctx_key = (ctx_hash & mask).astype(np.int64)
                             ctx_counts = ctx_tables[n][ctx_key].astype(np.float64)
-                            has_data = ctx_counts >= float(args.ngram_eval_min_count)
+                            has_data = ctx_counts >= float(getattr(args, "ngram_eval_min_count", 2))
                             if has_data.any():
                                 hit_idx = valid_idx[has_data]
                                 ng_matched[hit_idx] = True
@@ -2006,7 +1957,7 @@ def eval_val_sliding(
 
                         if ng_matched.any():
                             matched_idx = np.nonzero(ng_matched)[0]
-                            if adaptive and args.ngram_entropy_shift:
+                            if adaptive and bool(getattr(args, "ngram_entropy_shift", False)):
                                 matched_orders = ng_order[matched_idx].astype(np.float64)
                                 shifted_centers = ent_center - 0.25 * (matched_orders - float(min_order))
                                 shifted_sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropy[matched_idx] - shifted_centers)))
@@ -2031,8 +1982,8 @@ def eval_val_sliding(
                                 candidate_ids=candidate_ids,
                                 candidate_counts=candidate_counts,
                                 vocab_size=vocab_size,
-                                boost_scale=args.ngram_expert_boost_scale,
-                                max_boost=args.ngram_expert_max_boost,
+                                boost_scale=float(getattr(args, "ngram_expert_boost_scale", 0.25)),
+                                max_boost=float(getattr(args, "ngram_expert_max_boost", 4.0)),
                             )
                             expert_contexts_used += contexts_used
                             expert_target_hits += target_hits
@@ -2140,8 +2091,9 @@ def eval_val_sliding(
         ng_token_count = float(ng_token_t.item())
         ng_byte_count = float(ng_byte_t.item())
         ng_coverage = ng_token_count / max(total_ngram_scored_tokens, 1.0)
-        if args.val_byte_count_override > 0 and ng_coverage >= 0.999999:
-            ng_byte_count = float(args.val_byte_count_override)
+        val_byte_count_override = float(getattr(args, "val_byte_count_override", 0.0))
+        if val_byte_count_override > 0 and ng_coverage >= 0.999999:
+            ng_byte_count = val_byte_count_override
         ng_val_loss = ng_loss_sum / max(ng_token_count, 1.0)
         ng_val_bpb = ng_val_loss / math.log(2.0) * (ng_token_count / max(ng_byte_count, 1.0))
         hit_rate = expert_target_hits_t.item() / max(expert_contexts_t.item(), 1.0)
@@ -2158,13 +2110,13 @@ def eval_val_sliding(
         if rank == 0 and log_fn is not None:
             if ngram_cutoff_hit:
                 log_fn(
-                    f"ngram_eval:fused_cutoff max_seconds:{args.ngram_eval_max_seconds:.1f} "
+                    f"ngram_eval:fused_cutoff max_seconds:{ngram_eval_max_seconds:.1f} "
                     f"coverage:{ng_coverage * 100.0:.2f}% elapsed:{ngram_result['elapsed']:.0f}s"
                 )
             log_fn(
                 f"ngram_expert:fused contexts:{expert_contexts_t.item():.0f} "
                 f"target_hits:{expert_target_hits_t.item():.0f} hit_rate:{hit_rate:.4f} "
-                f"topk:{args.ngram_expert_topk} boost_scale:{args.ngram_expert_boost_scale:g}"
+                f"topk:{expert_topk} boost_scale:{float(getattr(args, 'ngram_expert_boost_scale', 0.25)):g}"
             )
 
     model.train()
@@ -4207,12 +4159,24 @@ class GPT(nn.Module):
         for head in self.poe_heads:
             logits_proj = logits_proj + head(x)
         logits_proj = logits_proj.float() * self.logit_scale
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits = (
+            self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            if return_logits or labels is None or not self.liger_ce
+            else None
+        )
 
         if labels is not None:
             if self.liger_ce:
-                loss = liger_cross_entropy(logits, labels, assume_no_ignore=True)
+                loss = liger_cross_entropy(
+                    logits_proj,
+                    labels,
+                    assume_no_ignore=True,
+                    preserve_input=return_logits,
+                    softcap=self.logit_softcap,
+                )
             else:
+                if logits is None:
+                    raise RuntimeError("expected logits for PyTorch cross entropy")
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1), reduction='mean')
         else:
             loss = torch.zeros((), device=input_ids.device)
@@ -4987,7 +4951,7 @@ def main() -> None:
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
     log0(f"rmsnorm:triton_enabled:{args.triton_rmsnorm} triton_available:{triton is not None}")
-    log0(f"liger_ce:enabled:{args.liger_ce} triton_available:{triton is not None}")
+    log0(f"liger_ce:enabled:{args.liger_ce} real_liger_available:{LigerCrossEntropyLoss is not None}")
     attn_res_params = sum(
         p.numel()
         for module in base_model.modules()
