@@ -160,6 +160,71 @@ def test_liger_style_gated_mlp_is_wired_into_gpt():
     assert torch.isfinite(model.core_block[0].mlp.gate_proj.weight.grad).all()
 
 
+def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():
+    torch.manual_seed(123)
+    original = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=True,
+        qk_bias=True,
+        clip_qkv=3.0,
+        rope_dims=4,
+    )
+    legacy_state = original.state_dict()
+    qkv = legacy_state.pop("c_qkv.weight")
+    q_w, k_w, v_w = qkv.split((original.q_dim, original.kv_dim, original.kv_dim), dim=0)
+    legacy_state["c_q.weight"] = q_w
+    legacy_state["c_k.weight"] = k_w
+    legacy_state["c_v.weight"] = v_w
+
+    restored = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=True,
+        qk_bias=True,
+        clip_qkv=3.0,
+        rope_dims=4,
+    )
+    restored.load_state_dict(legacy_state, strict=True)
+
+    x = torch.randn(2, 5, 16)
+    freqs_cos, freqs_sin = pg.precompute_freqs_cos_sin(4, 5, 10000.0)
+    mask = torch.zeros(1, 1, 5, 5)
+    expected = original(x, freqs_cos, freqs_sin, mask=mask)
+    actual = restored(x, freqs_cos, freqs_sin, mask=mask)
+
+    assert "c_qkv.weight" in restored.state_dict()
+    assert "c_q.weight" not in restored.state_dict()
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_packed_qkv_is_wired_into_gpt_forward():
+    h = _tiny_h()
+    model = pg.GPT(h)
+
+    assert model.prelude[0].attn.c_qkv is not None
+    assert model.core_block[0].attn.c_qkv is not None
+
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+
+
 def test_xsa_efficient_matches_explicit_gqa_projection():
     attn = pg.ParcaeCausalSelfAttention(
         dim=16,
@@ -405,7 +470,7 @@ def test_control_tensors_restore_to_fp32_after_bfloat16_cast():
     params = dict(model.named_parameters())
     for name in control_names:
         assert params[name].dtype == torch.float32
-    assert params["core_block.0.attn.c_q.weight"].dtype == torch.bfloat16
+    assert params["core_block.0.attn.c_qkv.weight"].dtype == torch.bfloat16
 
 
 def test_parallel_residual_tiny_forward_backward_has_finite_control_grads():

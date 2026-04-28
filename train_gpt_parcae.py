@@ -3519,20 +3519,29 @@ class ParcaeCausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError('head_dim must be even for RoPE')
         self.dim = dim
+        self.q_dim = num_heads * self.head_dim
+        self.kv_dim = num_kv_heads * self.head_dim
         if rope_dims <= 0 or rope_dims > self.head_dim or rope_dims % 2 != 0:
             raise ValueError(f"rope_dims must be a positive even value <= head_dim; got {rope_dims} for head_dim={self.head_dim}")
         self.rope_dims = rope_dims
         self.qk_norm = qk_norm
         self.clip_qkv = clip_qkv
-        self.c_q = CastedLinear(dim, num_heads * self.head_dim, bias=False)
-        self.c_k = CastedLinear(dim, num_kv_heads * self.head_dim, bias=False)
-        self.c_v = CastedLinear(dim, num_kv_heads * self.head_dim, bias=False)
+        self.c_qkv = CastedLinear(dim, self.q_dim + 2 * self.kv_dim, bias=False)
         self.c_proj = CastedLinear(dim, dim, bias=False)
         self.q_bias = nn.Parameter(torch.zeros(1, 1, self.n_head, self.head_dim)) if qk_bias else None
         self.k_bias = nn.Parameter(torch.zeros(1, 1, self.n_kv_head, self.head_dim)) if qk_bias else None
         self.ve_gate_channels = min(32, dim)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_id, n_layer) else None
         self.use_xsa = False
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        qkv_key = prefix + "c_qkv.weight"
+        q_key = prefix + "c_q.weight"
+        k_key = prefix + "c_k.weight"
+        v_key = prefix + "c_v.weight"
+        if qkv_key not in state_dict and all(key in state_dict for key in (q_key, k_key, v_key)):
+            state_dict[qkv_key] = torch.cat((state_dict.pop(q_key), state_dict.pop(k_key), state_dict.pop(v_key)), dim=0)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         bsz, seqlen, num_heads, head_dim = y.shape
@@ -3544,9 +3553,10 @@ class ParcaeCausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).view(bsz, seqlen, self.n_head, self.head_dim)
-        k = self.c_k(x).view(bsz, seqlen, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(bsz, seqlen, self.n_kv_head, self.head_dim)
+        q, k, v = self.c_qkv(x).split((self.q_dim, self.kv_dim, self.kv_dim), dim=-1)
+        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+        k = k.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+        v = v.view(bsz, seqlen, self.n_kv_head, self.head_dim)
 
         ve = kwargs.get('ve')
         if ve is not None and self.ve_gate is not None:
@@ -5048,7 +5058,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_backend:flash_attn4_wrapper has_flash_attn:{HAS_FLASH_ATTN}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} qkv_projection:packed")
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
         f"liger_geglu_available:{LigerGELUMulFunction is not None}"
