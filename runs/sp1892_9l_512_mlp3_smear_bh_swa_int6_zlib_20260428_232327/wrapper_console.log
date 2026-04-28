@@ -1,0 +1,58 @@
+logs/sp1892_9l_512_mlp3_smear_bh_swa_int6_zlib_20260428_232327.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model
+train_loader:dataset:fineweb10B_sp1892 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_*.bin tokens:53270528
+model_params:22813257
+world_size:1 grad_accum_steps:8
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 matrix_lr:0.02 scalar_lr:0.02
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:300.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:1/20000 train_loss:7.5426 train_time:2156ms step_avg:2155.93ms
+step:2/20000 train_loss:8.5422 train_time:4263ms step_avg:2131.38ms
+step:3/20000 train_loss:8.5287 train_time:6380ms step_avg:2126.58ms
+step:4/20000 train_loss:8.3491 train_time:8632ms step_avg:2157.88ms
+step:5/20000 train_loss:8.3028 train_time:10815ms step_avg:2162.91ms
+step:6/20000 train_loss:8.1422 train_time:13061ms step_avg:2176.86ms
+step:7/20000 train_loss:7.9783 train_time:15160ms step_avg:2165.72ms
+step:8/20000 train_loss:7.8179 train_time:17260ms step_avg:2157.47ms
+step:9/20000 train_loss:7.6494 train_time:19366ms step_avg:2151.83ms
+step:10/20000 train_loss:7.5194 train_time:21478ms step_avg:2147.84ms
+swa:start step:50
+step:100/20000 train_loss:5.7827 train_time:212064ms step_avg:2120.64ms
+step:142/20000 val_loss:5.7634 val_bpb:2.9318 train_time:301708ms step_avg:2124.70ms
+stopping_early: wallclock_cap train_time:301708ms step:142/20000
+peak memory allocated: 18397 MiB reserved: 18660 MiB
+swa:applying averaged 2 checkpoints
+Serialized model: 88302299 bytes
+Code size: 52243 bytes
+Total submission size: 88354542 bytes
+Serialized model int6+zlib: 16683515 bytes
+Total submission size int8+zlib: 16735758 bytes
+final_eval_mode:sliding_window stride:64 batch_seqs:32
+  sliding_eval [  0.0%] 32/832352 windows running_bpb=2.904959
+  sliding_eval [  0.2%] 1632/832352 windows running_bpb=2.996124
+  sliding_eval [  0.4%] 3232/832352 windows running_bpb=2.947706
+  sliding_eval [  0.6%] 4832/832352 windows running_bpb=2.974611
+Terminated
+RUN_EXIT:143
