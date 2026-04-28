@@ -3,6 +3,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+TRAIN_PID=""
+
+# Kill only this script's training process tree on exit.
+cleanup() {
+    if [[ -n "${TRAIN_PID}" ]]; then
+        pkill -TERM -P "${TRAIN_PID}" 2>/dev/null || true
+        kill -TERM "${TRAIN_PID}" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -P "${TRAIN_PID}" 2>/dev/null || true
+        kill -KILL "${TRAIN_PID}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
 # Unique run ID per invocation
 RUN_ID="autoresearch_$(date +%Y%m%d_%H%M%S)_$$"
 LOGFILE="logs/${RUN_ID}.txt"
@@ -100,14 +114,20 @@ export EMA_ENABLED=${EMA_ENABLED:-0}
 export EMA=${EMA:-0}
 export EMA_DECAY=${EMA_DECAY:-0.997}
 export EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
-export SWA_ENABLED=${SWA_ENABLED:-0}
+export SWA_ENABLED=${SWA_ENABLED:-1}
 export SWA_START_FRAC=${SWA_START_FRAC:-0.2}
 export SWA_EVERY=${SWA_EVERY:-50}
 export QAT_BITS=${QAT_BITS:-0}
 export QAT_START_STEP=${QAT_START_STEP:-500}
 export QAT_LINEAR=${QAT_LINEAR:-1}
 export QAT_TIED_OUTPUT=${QAT_TIED_OUTPUT:-1}
-export QUANT_BITS=${QUANT_BITS:-8}
+if [[ -z "${QUANT_BITS:-}" ]]; then
+    if [[ -n "${QAT_BITS:-}" && "${QAT_BITS}" -gt 0 ]]; then
+        export QUANT_BITS="${QAT_BITS}"
+    else
+        export QUANT_BITS=8
+    fi
+fi
 export GPTQ_ENABLED=${GPTQ_ENABLED:-0}
 export GPTQ_CALIBRATION_BATCHES=32
 export GPTQ_RESERVE_SECONDS=12
@@ -197,7 +217,16 @@ export TTT_GRAD_CLIP=1.0
 export SEED=${SEED:-1337}
 
 # Run training
-"${PYTHON_BIN}" train_gpt_parcae.py
+"${PYTHON_BIN}" train_gpt_parcae.py &
+TRAIN_PID=$!
+set +e
+wait "${TRAIN_PID}"
+TRAIN_STATUS=$?
+set -e
+TRAIN_PID=""
+if [[ "${TRAIN_STATUS}" -ne 0 ]]; then
+    exit "${TRAIN_STATUS}"
+fi
 
 # Parse exact roundtrip BPB and other metrics from log
 if [[ ! -f "${LOGFILE}" ]]; then
