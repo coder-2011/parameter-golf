@@ -54,6 +54,8 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
+    sliding_compile_logits = bool(int(os.environ.get("SLIDING_COMPILE_LOGITS", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     val_byte_count_override = float(os.environ.get("VAL_BYTE_COUNT_OVERRIDE", "0"))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
@@ -63,6 +65,37 @@ class Hyperparameters:
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ppm_enabled = bool(int(os.environ.get("PPM_ENABLED", "0")))
+    ppm_order = int(os.environ.get("PPM_ORDER", 5))
+    ppm_subset_tokens = int(os.environ.get("PPM_SUBSET_TOKENS", 5_000_000))
+    ppm_lambda_hi = float(os.environ.get("PPM_LAMBDA_HI", 0.9))
+    ppm_lambda_lo = float(os.environ.get("PPM_LAMBDA_LO", 0.05))
+    ppm_conf_threshold = float(os.environ.get("PPM_CONF_THRESHOLD", 0.9))
+    ppm_use_meta_mix = bool(int(os.environ.get("PPM_USE_META_MIX", "0")))
+    ppm_token_order = int(os.environ.get("PPM_TOKEN_ORDER", 3))
+    ppm_meta_alpha = float(os.environ.get("PPM_META_ALPHA", 0.995))
+    ppm_meta_eta = float(os.environ.get("PPM_META_ETA", 2.0))
+    ppm_meta_warmup_bytes = int(os.environ.get("PPM_META_WARMUP_BYTES", 4096))
+    ngram_eval_order = int(os.environ.get("NGRAM_EVAL_ORDER", 0))
+    ngram_eval_min_order = int(os.environ.get("NGRAM_EVAL_MIN_ORDER", 2))
+    ngram_eval_alpha = float(os.environ.get("NGRAM_EVAL_ALPHA", 0.30))
+    ngram_eval_adaptive = bool(int(os.environ.get("NGRAM_EVAL_ADAPTIVE", "1")))
+    ngram_eval_alpha_min = float(os.environ.get("NGRAM_EVAL_ALPHA_MIN", 0.05))
+    ngram_eval_alpha_max = float(os.environ.get("NGRAM_EVAL_ALPHA_MAX", 0.60))
+    ngram_eval_entropy_center = float(os.environ.get("NGRAM_EVAL_ENTROPY_CENTER", 4.0))
+    ngram_eval_entropy_scale = float(os.environ.get("NGRAM_EVAL_ENTROPY_SCALE", 2.0))
+    ngram_eval_min_count = int(os.environ.get("NGRAM_EVAL_MIN_COUNT", 2))
+    ngram_eval_buckets = int(os.environ.get("NGRAM_EVAL_BUCKETS", 4_194_304))
+    ngram_eval_max_seconds = float(os.environ.get("NGRAM_EVAL_MAX_SECONDS", 0.0))
+    ngram_entropy_shift = bool(int(os.environ.get("NGRAM_ENTROPY_SHIFT", "0")))
+    ngram_order_mults_str = os.environ.get("NGRAM_ORDER_MULTS", "")
+    ngram_cubric_cadence = int(os.environ.get("NGRAM_CUBRIC_CADENCE", os.environ.get("CUBRIC_CADENCE", 0)))
+    ngram_chunk_tokens = int(os.environ.get("NGRAM_CHUNK_TOKENS", 1_048_576))
+    ngram_batch_seqs = int(os.environ.get("NGRAM_BATCH_SEQS", 128))
+    ngram_mix_mode = os.environ.get("NGRAM_MIX_MODE", "linear").strip().lower()
+    ngram_expert_topk = int(os.environ.get("NGRAM_EXPERT_TOPK", 8))
+    ngram_expert_boost_scale = float(os.environ.get("NGRAM_EXPERT_BOOST_SCALE", 0.25))
+    ngram_expert_max_boost = float(os.environ.get("NGRAM_EXPERT_MAX_BOOST", 12.0))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -132,6 +165,9 @@ class Hyperparameters:
     parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", "-1"))
     parallel_residual_ln_scale = bool(int(os.environ.get("PARALLEL_RESIDUAL_LN_SCALE", "1")))
+    attn_res_mode = os.environ.get("ATTN_RES_MODE", "none").strip().lower()
+    attn_res_scope = os.environ.get("ATTN_RES_SCOPE", "all").strip().lower()
+    attn_res_block_size = int(os.environ.get("ATTN_RES_BLOCK_SIZE", 2))
     state_init = os.environ.get("STATE_INIT", "like-init")
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
@@ -356,6 +392,58 @@ def build_sentencepiece_luts_np(
     return base_bytes_np, has_leading_space_np, is_boundary_token_np
 
 
+def build_sentencepiece_token_bytes_lut(sp: spm.SentencePieceProcessor, vocab_size: int) -> list[bytes]:
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    token_bytes = [b""] * table_size
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        if sp.is_byte(token_id):
+            piece = sp.id_to_piece(token_id)
+            try:
+                token_bytes[token_id] = bytes([int(piece[3:-1], 16)])
+            except ValueError:
+                token_bytes[token_id] = b""
+            continue
+        piece = sp.id_to_piece(token_id)
+        if piece.startswith("▁"):
+            piece = piece[1:]
+        token_bytes[token_id] = piece.encode("utf-8")
+    return token_bytes
+
+
+def build_tokenmonster_token_bytes_lut(tokenizer_path: str, vocab_size: int) -> list[bytes]:
+    try:
+        import tokenmonster
+    except ImportError as exc:
+        raise RuntimeError("PPM byte reconstruction for tokenmonster requires the tokenmonster package") from exc
+    try:
+        vocab = tokenmonster.load(tokenizer_path)
+    except Exception:
+        with open(tokenizer_path, "rb") as f:
+            vocab = tokenmonster.new(f.read())
+    encoding = "latin-1" if str(vocab.charset()) == "None" else "utf-8"
+    decoder = vocab.decoder()
+    token_bytes = [b""] * vocab_size
+    for token_id in range(vocab_size):
+        try:
+            token_bytes[token_id] = decoder.decode([token_id]).encode(encoding)
+        except Exception:
+            token_bytes[token_id] = b""
+    return token_bytes
+
+
+def load_token_bytes_lut(tokenizer_path: str, tokenizer_metadata: dict[str, object], vocab_size: int) -> list[bytes]:
+    tokenizer_kind = tokenizer_metadata.get("tokenizer_kind")
+    if tokenizer_kind == "sentencepiece":
+        sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
+        return build_sentencepiece_token_bytes_lut(sp, vocab_size)
+    if tokenizer_kind == "tokenmonster":
+        return build_tokenmonster_token_bytes_lut(tokenizer_path, vocab_size)
+    raise ValueError(f"PPM byte reconstruction does not support tokenizer_kind={tokenizer_kind!r}")
+
+
 def load_tokenizer_meta_luts_np(
     meta_path: Path, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
@@ -519,6 +607,686 @@ def _window_batch(
     return x, y, wlens
 
 
+def _ppm_mixture_bpb(
+    target_ids: np.ndarray,
+    prev_ids: np.ndarray,
+    nll_nats: np.ndarray,
+    token_bytes_lut: list[bytes],
+    has_leading_space_lut_np: np.ndarray,
+    is_boundary_token_lut_np: np.ndarray,
+    *,
+    order: int = 5,
+    lambda_hi: float = 0.9,
+    lambda_lo: float = 0.05,
+    conf_threshold: float = 0.9,
+    token_order: int = 0,
+    use_meta_mix: bool = False,
+    meta_alpha: float = 0.995,
+    meta_eta: float = 2.0,
+    meta_warmup_bytes: int = 4096,
+    log_fn=None,
+    log_prefix: str = "ppm_mix",
+) -> tuple[float, float, float]:
+    log2 = math.log(2.0)
+    uniform_byte_logp = math.log(1.0 / 256.0)
+    vocab_size = len(token_bytes_lut)
+    uniform_token_logp = math.log(1.0 / vocab_size) if vocab_size > 0 else 0.0
+    num_tokens = len(target_ids)
+
+    token_ppm_logp = None
+    if token_order > 0 and num_tokens > 0:
+        token_counts: dict[tuple[int, ...], dict[int, int]] = {}
+        token_window: list[int] = []
+        token_ppm_logp = [0.0] * num_tokens
+        for i in range(num_tokens):
+            tid = int(target_ids[i])
+            log_p = None
+            escape_logp = 0.0
+            wlen = len(token_window)
+            for ctx_len in range(min(token_order, wlen), -1, -1):
+                ctx = tuple(token_window[wlen - ctx_len:]) if ctx_len > 0 else ()
+                counts = token_counts.get(ctx)
+                if counts is None:
+                    continue
+                unique = len(counts)
+                total = sum(counts.values())
+                denom = total + unique
+                if tid in counts:
+                    log_p = escape_logp + math.log(counts[tid] / denom)
+                    break
+                if unique > 0:
+                    escape_logp += math.log(unique / denom)
+            if log_p is None:
+                log_p = escape_logp + uniform_token_logp
+            token_ppm_logp[i] = log_p
+            for ctx_len in range(0, min(token_order, wlen) + 1):
+                ctx = tuple(token_window[wlen - ctx_len:]) if ctx_len > 0 else ()
+                counts = token_counts.setdefault(ctx, {})
+                counts[tid] = counts.get(tid, 0) + 1
+            token_window.append(tid)
+            if len(token_window) > token_order:
+                del token_window[0]
+
+    byte_stream: list[int] = []
+    byte_nn_logp: list[float] = []
+    byte_token_ppm_logp: list[float] = [] if token_ppm_logp is not None else []
+    for i in range(num_tokens):
+        tid = int(target_ids[i])
+        pid = int(prev_ids[i])
+        token_bytes = token_bytes_lut[tid] if 0 <= tid < len(token_bytes_lut) else b""
+        has_space = bool(has_leading_space_lut_np[tid]) if 0 <= tid < len(has_leading_space_lut_np) else False
+        prev_is_boundary = pid < 0 or (bool(is_boundary_token_lut_np[pid]) if pid < len(is_boundary_token_lut_np) else True)
+        include_space = has_space and not prev_is_boundary
+        num_bytes = len(token_bytes) + (1 if include_space else 0)
+        if num_bytes == 0:
+            continue
+        per_byte_logp = -float(nll_nats[i]) / num_bytes
+        per_byte_token_ppm = token_ppm_logp[i] / num_bytes if token_ppm_logp is not None else 0.0
+        if include_space:
+            byte_stream.append(32)
+            byte_nn_logp.append(per_byte_logp)
+            if token_ppm_logp is not None:
+                byte_token_ppm_logp.append(per_byte_token_ppm)
+        for byte in token_bytes:
+            byte_stream.append(byte)
+            byte_nn_logp.append(per_byte_logp)
+            if token_ppm_logp is not None:
+                byte_token_ppm_logp.append(per_byte_token_ppm)
+
+    total_bytes = len(byte_stream)
+    if total_bytes == 0:
+        return 0.0, 0.0, 0.0
+
+    context_counts: dict[bytes, dict[int, int]] = {}
+    mix_nll = 0.0
+    byte_ppm_nll = 0.0
+    nn_nll = 0.0
+    token_ppm_nll = 0.0
+    meta_loss_nn = 0.0
+    meta_loss_byte_ppm = 0.0
+    meta_loss_token_ppm = 0.0
+    num_experts = 3 if use_meta_mix and token_ppm_logp is not None else 2 if use_meta_mix else 0
+    uniform_expert_log_weight = -math.log(num_experts) if num_experts > 0 else 0.0
+    window = bytearray()
+
+    for t, byte in enumerate(byte_stream):
+        ppm_logp = None
+        confidence = 0.0
+        saw_context = False
+        escape_logp = 0.0
+        for ctx_len in range(min(order, len(window)), -1, -1):
+            ctx = bytes(window[-ctx_len:]) if ctx_len > 0 else b""
+            counts = context_counts.get(ctx)
+            if counts is None:
+                continue
+            unique = len(counts)
+            total = sum(counts.values())
+            denom = total + unique
+            if not saw_context:
+                confidence = max(counts.values()) / denom
+                saw_context = True
+            if byte in counts:
+                ppm_logp = escape_logp + math.log(counts[byte] / denom)
+                break
+            if unique > 0:
+                escape_logp += math.log(unique / denom)
+        if ppm_logp is None:
+            ppm_logp = escape_logp + uniform_byte_logp
+
+        nn_logp = byte_nn_logp[t]
+        token_logp = byte_token_ppm_logp[t] if token_ppm_logp is not None else None
+        if use_meta_mix:
+            if t < meta_warmup_bytes:
+                log_w_nn = uniform_expert_log_weight
+                log_w_byte = uniform_expert_log_weight
+                log_w_token = uniform_expert_log_weight if token_logp is not None else None
+            else:
+                score_nn = -meta_eta * meta_loss_nn
+                score_byte = -meta_eta * meta_loss_byte_ppm
+                if token_logp is not None:
+                    score_token = -meta_eta * meta_loss_token_ppm
+                    normalizer = max(score_nn, score_byte, score_token)
+                    log_z = normalizer + math.log(
+                        math.exp(score_nn - normalizer)
+                        + math.exp(score_byte - normalizer)
+                        + math.exp(score_token - normalizer)
+                    )
+                    log_w_token = score_token - log_z
+                else:
+                    normalizer = max(score_nn, score_byte)
+                    log_z = normalizer + math.log(
+                        math.exp(score_nn - normalizer) + math.exp(score_byte - normalizer)
+                    )
+                    log_w_token = None
+                log_w_nn = score_nn - log_z
+                log_w_byte = score_byte - log_z
+            log_terms = [log_w_nn + nn_logp, log_w_byte + ppm_logp]
+            if log_w_token is not None and token_logp is not None:
+                log_terms.append(log_w_token + token_logp)
+            max_term = max(log_terms)
+            log_mix = max_term + math.log(sum(math.exp(term - max_term) for term in log_terms))
+            meta_loss_nn = meta_alpha * meta_loss_nn + (1.0 - meta_alpha) * -nn_logp
+            meta_loss_byte_ppm = meta_alpha * meta_loss_byte_ppm + (1.0 - meta_alpha) * -ppm_logp
+            if token_logp is not None:
+                meta_loss_token_ppm = meta_alpha * meta_loss_token_ppm + (1.0 - meta_alpha) * -token_logp
+        else:
+            lam = lambda_lo if confidence >= conf_threshold else lambda_hi
+            if lam <= 0.0:
+                log_mix = ppm_logp
+            elif lam >= 1.0:
+                log_mix = nn_logp
+            else:
+                a = math.log(lam) + nn_logp
+                b = math.log(1.0 - lam) + ppm_logp
+                log_mix = max(a, b) + math.log1p(math.exp(-abs(a - b)))
+
+        mix_nll -= log_mix
+        byte_ppm_nll -= ppm_logp
+        nn_nll -= nn_logp
+        if token_logp is not None:
+            token_ppm_nll -= token_logp
+        for ctx_len in range(0, min(order, len(window)) + 1):
+            ctx = bytes(window[-ctx_len:]) if ctx_len > 0 else b""
+            counts = context_counts.setdefault(ctx, {})
+            counts[byte] = counts.get(byte, 0) + 1
+        window.append(byte)
+        if len(window) > order:
+            del window[0]
+
+    mix_bpb = mix_nll / total_bytes / log2
+    ppm_bpb = byte_ppm_nll / total_bytes / log2
+    nn_bpb = nn_nll / total_bytes / log2
+    if log_fn is not None:
+        token_extra = (
+            f" token_ppm_only={token_ppm_nll / total_bytes / log2:.6f}"
+            if token_ppm_logp is not None
+            else ""
+        )
+        mode = "meta" if use_meta_mix else "binary"
+        log_fn(
+            f"{log_prefix} bytes:{total_bytes} mix_bpb:{mix_bpb:.6f} "
+            f"ppm_only:{ppm_bpb:.6f} nn_only:{nn_bpb:.6f}{token_extra} mode:{mode}"
+        )
+    return mix_bpb, ppm_bpb, nn_bpb
+
+
+def _ngram_bulk_update(
+    token_ids: np.ndarray,
+    start: int,
+    end: int,
+    ctx_tables: dict[int, np.ndarray],
+    full_tables: dict[int, np.ndarray],
+    min_order: int,
+    max_order: int,
+    primes: np.ndarray,
+    mask: np.uint64,
+    candidate_ids: dict[int, np.ndarray] | None = None,
+    candidate_counts: dict[int, np.ndarray] | None = None,
+    vocab_size: int | None = None,
+) -> None:
+    """Update hashed n-gram count tables from a contiguous token range."""
+    t = token_ids[start:end].astype(np.uint64, copy=False)
+    n = len(t)
+    for order in range(min_order, max_order + 1):
+        if n < order:
+            continue
+        ctx_width = order - 1
+        ngram_count = n - order + 1
+        ctx_hash = np.zeros(ngram_count, dtype=np.uint64)
+        for k in range(ctx_width):
+            ctx_hash ^= t[k:ngram_count + k] * primes[k % len(primes)]
+        ctx_key = (ctx_hash & mask).astype(np.int64)
+        tgt = t[ctx_width:]
+        full_key = ((ctx_hash ^ (tgt * primes[ctx_width % len(primes)])) & mask).astype(np.int64)
+        ctx_tables[order] += np.bincount(ctx_key, minlength=len(ctx_tables[order])).astype(np.uint32)
+        full_tables[order] += np.bincount(full_key, minlength=len(full_tables[order])).astype(np.uint32)
+        if candidate_ids is not None and candidate_counts is not None and vocab_size is not None:
+            _ngram_candidate_bulk_update(
+                ctx_key,
+                tgt.astype(np.int64),
+                candidate_ids[order],
+                candidate_counts[order],
+                vocab_size,
+            )
+
+
+def _ngram_candidate_bulk_update(
+    ctx_key: np.ndarray,
+    target_ids: np.ndarray,
+    candidate_ids: np.ndarray,
+    candidate_counts: np.ndarray,
+    vocab_size: int,
+) -> None:
+    """Approximate per-context heavy hitters for sparse n-gram expert candidates."""
+    if len(ctx_key) == 0:
+        return
+    pair_keys, pair_counts = np.unique(ctx_key.astype(np.int64) * vocab_size + target_ids, return_counts=True)
+    for pair_key, pair_count in zip(pair_keys, pair_counts, strict=True):
+        row = int(pair_key // vocab_size)
+        token_id = int(pair_key % vocab_size)
+        ids = candidate_ids[row]
+        counts = candidate_counts[row]
+        hit = np.nonzero(ids == token_id)[0]
+        if hit.size:
+            slot = int(hit[0])
+            counts[slot] = min(int(counts[slot]) + int(pair_count), np.iinfo(np.uint32).max)
+            continue
+        empty = np.nonzero(ids < 0)[0]
+        if empty.size:
+            slot = int(empty[0])
+            ids[slot] = token_id
+            counts[slot] = min(int(pair_count), np.iinfo(np.uint32).max)
+            continue
+        slot = int(np.argmin(counts))
+        if int(pair_count) > int(counts[slot]):
+            counts[slot] = min(int(pair_count), np.iinfo(np.uint32).max)
+            ids[slot] = token_id
+
+
+def _ngram_apply_sparse_expert(
+    seg_model_p: np.ndarray,
+    log_probs_np: np.ndarray,
+    target_ids: np.ndarray,
+    matched_idx: np.ndarray,
+    alpha: np.ndarray,
+    ng_order: np.ndarray,
+    ng_ctx_key: np.ndarray,
+    ng_ctx_count: np.ndarray,
+    candidate_ids: dict[int, np.ndarray],
+    candidate_counts: dict[int, np.ndarray],
+    vocab_size: int,
+    boost_scale: float,
+    max_boost: float,
+) -> tuple[int, int]:
+    """Apply normalized sparse residual logit boosts from n-gram candidate tables."""
+    contexts_used = 0
+    target_hits = 0
+    uniform_prob = 1.0 / max(vocab_size, 1)
+    for j, a in zip(matched_idx, alpha, strict=True):
+        if a <= 0.0:
+            continue
+        order = int(ng_order[j])
+        row = int(ng_ctx_key[j])
+        ctx_count = float(ng_ctx_count[j])
+        ids = candidate_ids[order][row]
+        counts = candidate_counts[order][row].astype(np.float64)
+        valid = (ids >= 0) & (ids < vocab_size) & (counts > 0)
+        if not valid.any() or ctx_count <= 0.0:
+            continue
+        cand_ids = ids[valid].astype(np.int64)
+        cand_probs = np.minimum(counts[valid], ctx_count) / ctx_count
+        boosts = np.log(np.maximum(cand_probs / uniform_prob, 1e-30))
+        boosts = np.clip(boosts, 0.0, max_boost)
+        if not np.any(boosts > 0.0):
+            continue
+        scaled = np.clip(float(a) * boost_scale * boosts, 0.0, max_boost)
+        weights = np.exp(scaled)
+        base_cand_probs = np.exp(log_probs_np[j, cand_ids])
+        normalizer = 1.0 + float(np.sum(base_cand_probs * (weights - 1.0)))
+        if normalizer <= 0.0:
+            continue
+        target_weight = 1.0
+        target_matches = cand_ids == int(target_ids[j])
+        if target_matches.any():
+            target_weight = float(np.max(weights[target_matches]))
+            target_hits += 1
+        seg_model_p[j] = seg_model_p[j] * target_weight / normalizer
+        contexts_used += 1
+    return contexts_used, target_hits
+
+
+def eval_val_sliding_hashed_ngram(
+    args: Hyperparameters,
+    model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log_fn=None,
+) -> tuple[float, float, float]:
+    """Sliding validation mixed with a causal chunked hashed n-gram predictor."""
+    seq_len = args.train_seq_len
+    stride = args.eval_stride
+    total_tokens = val_tokens.numel() - 1
+    min_order = max(args.ngram_eval_min_order, 2)
+    max_order = max(args.ngram_eval_order, min_order)
+    adaptive = args.ngram_eval_adaptive
+    alpha_min = args.ngram_eval_alpha_min
+    alpha_max = args.ngram_eval_alpha_max
+    ent_center = args.ngram_eval_entropy_center
+    ent_scale = args.ngram_eval_entropy_scale
+    chunk_tokens = int(args.ngram_chunk_tokens)
+    mix_mode = args.ngram_mix_mode
+    use_sparse_expert = mix_mode == "expert"
+
+    context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, stride, chunk_tokens)
+    all_window_starts = [ws for windows in chunk_windows for ws in windows]
+    total_scored_tokens = 0.0
+    for ws in all_window_starts:
+        wlen = min(ws + seq_len, total_tokens) - ws
+        s = 0 if ws == 0 else context_size
+        total_scored_tokens += float(max(wlen - s, 0))
+
+    fixed_order_mults = None
+    if args.ngram_order_mults_str:
+        fixed_order_mults = np.array(
+            [float(x) for x in args.ngram_order_mults_str.split(",") if x.strip()],
+            dtype=np.float64,
+        )
+        if fixed_order_mults.size == 0:
+            fixed_order_mults = None
+
+    val_np = val_tokens.detach().cpu().numpy()
+    buckets = int(args.ngram_eval_buckets)
+    candidate_vocab_size = int(getattr(args, "vocab_size", int(val_np.max()) + 1 if val_np.size else 1))
+    ctx_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
+    full_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
+    candidate_ids = None
+    candidate_counts = None
+    if use_sparse_expert:
+        candidate_ids = {
+            n: np.full((buckets, args.ngram_expert_topk), -1, dtype=np.int32)
+            for n in range(min_order, max_order + 1)
+        }
+        candidate_counts = {
+            n: np.zeros((buckets, args.ngram_expert_topk), dtype=np.uint32)
+            for n in range(min_order, max_order + 1)
+        }
+    mask = np.uint64(buckets - 1)
+    primes = np.array(
+        [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
+         np.uint64(131071), np.uint64(174763), np.uint64(233017)],
+        dtype=np.uint64,
+    )
+
+    num_ent_bins = 3
+    num_cnt_bins = 3
+    ent_edges = np.array([ent_center - 1.0, ent_center + 1.0], dtype=np.float64)
+    cnt_edges = np.array([5.0, 50.0], dtype=np.float64)
+    total_cells = num_ent_bins * num_cnt_bins
+    cubric_enabled = args.ngram_cubric_cadence > 0 and fixed_order_mults is None
+    cubric_steps = 0
+    if cubric_enabled:
+        warm = {2: 0.45, 3: 0.30, 4: 0.45, 5: 1.88, 6: 2.00, 7: 2.00, 8: 2.00, 9: 2.00}
+        cubric_alpha_mult = {
+            n: [warm.get(n, 1.0)] * total_cells for n in range(min_order, max_order + 1)
+        }
+        cubric_hits = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
+        cubric_beats = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
+
+    logits_fn = (
+        torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
+        if getattr(args, "sliding_compile_logits", False)
+        else model.forward_logits
+    )
+    loss_sum = 0.0
+    token_count = 0.0
+    byte_count = 0.0
+    expert_contexts_used = 0.0
+    expert_target_hits = 0.0
+    t0 = time.perf_counter()
+    deadline = t0 + args.ngram_eval_max_seconds if args.ngram_eval_max_seconds > 0.0 else None
+    cutoff_hit = False
+
+    if rank == 0 and log_fn is not None:
+        log_fn(
+            f"ngram_eval:chunks:{len(chunk_windows)} chunk_tokens:{chunk_tokens} "
+            f"windows:{len(all_window_starts)} shared_tables:1 mode:{mix_mode}"
+        )
+
+    model.eval()
+    with torch.inference_mode():
+        for chunk_idx, windows in enumerate(chunk_windows):
+            if deadline is not None and time.perf_counter() >= deadline:
+                cutoff_hit = True
+                break
+            if not windows:
+                continue
+
+            my_start, my_end = _rank_bounds(len(windows), rank, world_size)
+            my_windows = windows[my_start:my_end]
+            for batch_start in range(0, len(my_windows), args.ngram_batch_seqs):
+                batch_ws = my_windows[batch_start:batch_start + args.ngram_batch_seqs]
+                x, y, wlens = _window_batch(val_tokens, batch_ws, seq_len, total_tokens, device)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    logits = logits_fn(x)
+                logits_f = logits.float()
+                vocab_size = logits_f.size(-1)
+                nll = F.cross_entropy(
+                    logits_f.reshape(-1, logits_f.size(-1)),
+                    y.reshape(-1),
+                    reduction="none",
+                ).reshape_as(y)
+
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else context_size
+                    seg_len = wlen - s
+                    if seg_len <= 0:
+                        continue
+
+                    seg_nll = nll[i, s:wlen].to(torch.float64).cpu().numpy()
+                    seg_model_p = np.exp(-seg_nll)
+                    log_probs_np = None
+                    if adaptive or use_sparse_expert:
+                        log_probs = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                        if use_sparse_expert:
+                            log_probs_np = log_probs.cpu().numpy()
+                        if adaptive:
+                            probs = log_probs.exp()
+                            entropy = -(probs * log_probs).sum(dim=-1).cpu().numpy()
+                            sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropy - ent_center)))
+                            per_token_alpha = alpha_min + (alpha_max - alpha_min) * sig
+                            ent_bins = np.digitize(entropy, ent_edges).astype(np.int32)
+                        else:
+                            entropy = np.zeros(seg_len, dtype=np.float64)
+                            per_token_alpha = np.full(seg_len, args.ngram_eval_alpha, dtype=np.float64)
+                            ent_bins = np.ones(seg_len, dtype=np.int32)
+                    else:
+                        entropy = np.zeros(seg_len, dtype=np.float64)
+                        per_token_alpha = np.full(seg_len, args.ngram_eval_alpha, dtype=np.float64)
+                        ent_bins = np.ones(seg_len, dtype=np.int32)
+
+                    global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+                    p_ng = np.zeros(seg_len, dtype=np.float64)
+                    ng_matched = np.zeros(seg_len, dtype=np.bool_)
+                    ng_order = np.zeros(seg_len, dtype=np.int32)
+                    ng_ctx_key = np.zeros(seg_len, dtype=np.int64)
+                    ng_ctx_count = np.zeros(seg_len, dtype=np.float64)
+                    tgt_np = val_np[global_j].astype(np.uint64)
+
+                    for n in range(max_order, min_order - 1, -1):
+                        ctx_width = n - 1
+                        valid = (global_j >= ctx_width) & (~ng_matched)
+                        if not valid.any():
+                            continue
+                        valid_idx = np.nonzero(valid)[0]
+                        jv = global_j[valid_idx]
+                        ctx_hash = np.zeros(len(jv), dtype=np.uint64)
+                        for k in range(ctx_width):
+                            tok = val_np[jv - (ctx_width - k)].astype(np.uint64)
+                            ctx_hash ^= tok * primes[k % len(primes)]
+                        ctx_key = (ctx_hash & mask).astype(np.int64)
+                        full_key = ((ctx_hash ^ (tgt_np[valid_idx] * primes[ctx_width % len(primes)])) & mask).astype(np.int64)
+                        ctx_counts = ctx_tables[n][ctx_key].astype(np.float64)
+                        full_counts = full_tables[n][full_key].astype(np.float64)
+                        has_data = ctx_counts >= float(args.ngram_eval_min_count)
+                        if has_data.any():
+                            hit_idx = valid_idx[has_data]
+                            p = np.minimum(full_counts, ctx_counts) / np.maximum(ctx_counts, 1.0)
+                            p_ng[hit_idx] = np.clip(p[has_data], 0.0, 1.0)
+                            ng_matched[hit_idx] = True
+                            ng_order[hit_idx] = n
+                            ng_ctx_key[hit_idx] = ctx_key[has_data]
+                            ng_ctx_count[hit_idx] = ctx_counts[has_data]
+
+                    if ng_matched.any():
+                        matched_idx = np.nonzero(ng_matched)[0]
+                        if adaptive and args.ngram_entropy_shift:
+                            matched_orders = ng_order[matched_idx].astype(np.float64)
+                            shifted_centers = ent_center - 0.25 * (matched_orders - float(min_order))
+                            shifted_sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropy[matched_idx] - shifted_centers)))
+                            per_token_alpha[matched_idx] = alpha_min + (alpha_max - alpha_min) * shifted_sig
+
+                        if fixed_order_mults is not None:
+                            a = per_token_alpha[matched_idx].copy()
+                            mult_idx = np.clip(ng_order[matched_idx] - min_order, 0, len(fixed_order_mults) - 1)
+                            a *= fixed_order_mults[mult_idx]
+                            np.clip(a, 0.0, 0.95, out=a)
+                        elif cubric_enabled:
+                            a = per_token_alpha[matched_idx].copy()
+                            matched_ent_bins = ent_bins[matched_idx]
+                            matched_cnt_bins = np.digitize(ng_ctx_count[matched_idx], cnt_edges).astype(np.int32)
+                            for n in range(min_order, max_order + 1):
+                                order_mask = ng_order[matched_idx] == n
+                                if not order_mask.any():
+                                    continue
+                                for eb in range(num_ent_bins):
+                                    for cb in range(num_cnt_bins):
+                                        cell = eb * num_cnt_bins + cb
+                                        cell_mask = order_mask & (matched_ent_bins == eb) & (matched_cnt_bins == cb)
+                                        if cell_mask.any():
+                                            idx = matched_idx[cell_mask]
+                                            cubric_hits[n][cell] += int(cell_mask.sum())
+                                            cubric_beats[n][cell] += int((p_ng[idx] > seg_model_p[idx]).sum())
+                                            a[cell_mask] *= cubric_alpha_mult[n][cell]
+                            np.clip(a, 0.0, 0.95, out=a)
+                        else:
+                            a = per_token_alpha[matched_idx]
+                        if use_sparse_expert:
+                            contexts_used, target_hits = _ngram_apply_sparse_expert(
+                                seg_model_p=seg_model_p,
+                                log_probs_np=log_probs_np,
+                                target_ids=y[i, s:wlen].detach().cpu().numpy().astype(np.int64),
+                                matched_idx=matched_idx,
+                                alpha=a,
+                                ng_order=ng_order,
+                                ng_ctx_key=ng_ctx_key,
+                                ng_ctx_count=ng_ctx_count,
+                                candidate_ids=candidate_ids,
+                                candidate_counts=candidate_counts,
+                                vocab_size=vocab_size,
+                                boost_scale=args.ngram_expert_boost_scale,
+                                max_boost=args.ngram_expert_max_boost,
+                            )
+                            expert_contexts_used += contexts_used
+                            expert_target_hits += target_hits
+                        else:
+                            seg_model_p[matched_idx] = (1.0 - a) * seg_model_p[matched_idx] + a * p_ng[matched_idx]
+
+                    seg_nll = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
+                    loss_sum += float(seg_nll.sum())
+                    token_count += float(seg_len)
+                    byte_count += float(
+                        _token_byte_sum(
+                            x[i, s:wlen],
+                            y[i, s:wlen],
+                            base_bytes_lut,
+                            has_leading_space_lut,
+                            is_boundary_token_lut,
+                        ).item()
+                    )
+
+            chunk_start = chunk_idx * chunk_tokens
+            chunk_end = min((chunk_idx + 1) * chunk_tokens, total_tokens)
+            _ngram_bulk_update(
+                val_np,
+                chunk_start,
+                chunk_end + 1,
+                ctx_tables,
+                full_tables,
+                min_order,
+                max_order,
+                primes,
+                mask,
+                candidate_ids=candidate_ids,
+                candidate_counts=candidate_counts,
+                vocab_size=candidate_vocab_size if use_sparse_expert else None,
+            )
+
+            if cubric_enabled:
+                rates = []
+                for n in range(min_order, max_order + 1):
+                    for cell in range(total_cells):
+                        if cubric_hits[n][cell] >= 8:
+                            rates.append(cubric_beats[n][cell] / cubric_hits[n][cell])
+                if len(rates) >= 4:
+                    avg_rate = sum(rates) / len(rates)
+                    for n in range(min_order, max_order + 1):
+                        for cell in range(total_cells):
+                            if cubric_hits[n][cell] >= 8:
+                                rate = cubric_beats[n][cell] / cubric_hits[n][cell]
+                                if rate > avg_rate + 0.05:
+                                    cubric_alpha_mult[n][cell] = min(cubric_alpha_mult[n][cell] * 1.03, 2.0)
+                                elif rate < avg_rate - 0.05:
+                                    cubric_alpha_mult[n][cell] = max(cubric_alpha_mult[n][cell] * 0.97, 0.3)
+                cubric_steps += 1
+                cubric_hits = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
+                cubric_beats = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
+                if rank == 0 and log_fn is not None and cubric_steps % max(args.ngram_cubric_cadence, 1) == 0:
+                    parts = []
+                    for n in range(min_order, max_order + 1):
+                        avg_mult = sum(cubric_alpha_mult[n]) / len(cubric_alpha_mult[n])
+                        parts.append(f"o{n}:avg={avg_mult:.2f}")
+                    log_fn(f"ngram_cubric:step:{cubric_steps} {' '.join(parts)}")
+
+            if rank == 0 and log_fn is not None and (chunk_idx < 3 or chunk_idx % 10 == 0 or chunk_idx == len(chunk_windows) - 1):
+                elapsed = time.perf_counter() - t0
+                cur_bpb = (loss_sum / max(token_count, 1.0)) / math.log(2.0) * (
+                    token_count / max(byte_count, 1.0)
+                )
+                log_fn(f"ngram_eval:chunk:{chunk_idx + 1}/{len(chunk_windows)} bpb:{cur_bpb:.6f} t:{elapsed:.0f}s")
+
+    loss_t = torch.tensor(loss_sum, device=device, dtype=torch.float64)
+    token_t = torch.tensor(token_count, device=device, dtype=torch.float64)
+    byte_t = torch.tensor(byte_count, device=device, dtype=torch.float64)
+    expert_contexts_t = torch.tensor(expert_contexts_used, device=device, dtype=torch.float64)
+    expert_target_hits_t = torch.tensor(expert_target_hits, device=device, dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(expert_contexts_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(expert_target_hits_t, op=dist.ReduceOp.SUM)
+
+    loss_sum = float(loss_t.item())
+    token_count = float(token_t.item())
+    byte_count = float(byte_t.item())
+    coverage = token_count / max(total_scored_tokens, 1.0)
+    if args.val_byte_count_override > 0 and coverage >= 0.999999:
+        byte_count = float(args.val_byte_count_override)
+    val_loss = loss_sum / max(token_count, 1.0)
+    val_bpb = val_loss / math.log(2.0) * (token_count / max(byte_count, 1.0))
+
+    if rank == 0 and log_fn is not None:
+        if cutoff_hit:
+            log_fn(
+                f"ngram_eval:cutoff max_seconds:{args.ngram_eval_max_seconds:.1f} "
+                f"coverage:{coverage * 100.0:.2f}% elapsed:{time.perf_counter() - t0:.0f}s"
+            )
+        if use_sparse_expert:
+            hit_rate = expert_target_hits_t.item() / max(expert_contexts_t.item(), 1.0)
+            log_fn(
+                f"ngram_expert:contexts:{expert_contexts_t.item():.0f} "
+                f"target_hits:{expert_target_hits_t.item():.0f} hit_rate:{hit_rate:.4f} "
+                f"topk:{args.ngram_expert_topk} boost_scale:{args.ngram_expert_boost_scale:g}"
+            )
+        if cubric_enabled:
+            log_fn(
+                f"ngram_cubric:final steps:{cubric_steps} "
+                f"cells:{total_cells}x{max_order - min_order + 1}"
+            )
+            for n in range(min_order, max_order + 1):
+                row = " ".join(f"{m:.2f}" for m in cubric_alpha_mult[n])
+                log_fn(f"ngram_cubric:o{n} [{row}]")
+
+    model.train()
+    return float(val_loss), float(val_bpb), float(coverage)
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -581,6 +1349,129 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    token_bytes_lut: list[bytes] | None,
+    log_fn=None,
+    batch_seqs: int = 32,
+) -> tuple[float, float, tuple[float, float, float] | None]:
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, args.eval_stride, total_tokens)
+    window_starts = chunk_windows[0] if chunk_windows else []
+    my_start, my_end = _rank_bounds(len(window_starts), rank, world_size)
+    my_windows = window_starts[my_start:my_end]
+    logits_fn = (
+        torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
+        if getattr(args, "sliding_compile_logits", False)
+        else model.forward_logits
+    )
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    collect_ppm = args.ppm_enabled
+    ppm_limit = min(max(int(args.ppm_subset_tokens), 0), total_tokens)
+    if collect_ppm and ppm_limit <= 0:
+        collect_ppm = False
+    if collect_ppm and token_bytes_lut is None:
+        raise ValueError("PPM_ENABLED=1 requires token byte reconstruction support")
+    if collect_ppm:
+        pos_nll = torch.full((ppm_limit,), float("nan"), dtype=torch.float64, device=device)
+        pos_tgt = torch.zeros((ppm_limit,), dtype=torch.int64, device=device)
+        pos_prev = torch.zeros((ppm_limit,), dtype=torch.int64, device=device)
+        pos_written = torch.zeros((ppm_limit,), dtype=torch.int32, device=device)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_start in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[batch_start:batch_start + batch_seqs]
+            x, y, wlens = _window_batch(val_tokens, batch_ws, seq_len, total_tokens, device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits = logits_fn(x)
+            nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
+            for i, ws in enumerate(batch_ws):
+                s = 0 if ws == 0 else context_size
+                wlen = wlens[i]
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                byte_count += _token_byte_sum(
+                    x[i, s:wlen],
+                    y[i, s:wlen],
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                if collect_ppm:
+                    start_pos = ws + s
+                    end_pos = ws + wlen
+                    if start_pos < ppm_limit:
+                        write_end = min(end_pos, ppm_limit)
+                        n_write = write_end - start_pos
+                        pos_nll[start_pos:write_end] = scored_nll[:n_write]
+                        pos_tgt[start_pos:write_end] = y[i, s:s + n_write]
+                        pos_prev[start_pos:write_end] = x[i, s:s + n_write]
+                        pos_written[start_pos:write_end] += 1
+
+    ppm_result = None
+    if dist.is_available() and dist.is_initialized() and collect_ppm:
+        pos_nll = torch.nan_to_num(pos_nll, nan=0.0)
+        dist.all_reduce(pos_nll, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pos_tgt, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pos_prev, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pos_written, op=dist.ReduceOp.SUM)
+
+    sliding_loss, sliding_bpb = _validation_result(args, loss_sum, token_count, byte_count)
+    if collect_ppm and (not dist.is_available() or not dist.is_initialized() or rank == 0):
+        t0 = time.perf_counter()
+        written_np = pos_written.detach().cpu().numpy()
+        bad = np.flatnonzero(written_np != 1)
+        usable = ppm_limit
+        if bad.size > 0:
+            usable = int(bad[0])
+            if log_fn is not None:
+                log_fn(
+                    f"ppm_mix:prefix_trim usable_tokens:{usable} requested:{ppm_limit} "
+                    f"first_bad_pos:{int(bad[0])} writes:{int(written_np[bad[0]])}"
+                )
+        if usable > 0:
+            has_leading_np = has_leading_space_lut.detach().cpu().numpy().astype(bool)
+            is_boundary_np = is_boundary_token_lut.detach().cpu().numpy().astype(bool)
+            ppm_result = _ppm_mixture_bpb(
+                target_ids=pos_tgt[:usable].detach().cpu().numpy().astype(np.int64),
+                prev_ids=pos_prev[:usable].detach().cpu().numpy().astype(np.int64),
+                nll_nats=pos_nll[:usable].detach().cpu().numpy().astype(np.float64),
+                token_bytes_lut=token_bytes_lut,
+                has_leading_space_lut_np=has_leading_np,
+                is_boundary_token_lut_np=is_boundary_np,
+                order=args.ppm_order,
+                lambda_hi=args.ppm_lambda_hi,
+                lambda_lo=args.ppm_lambda_lo,
+                conf_threshold=args.ppm_conf_threshold,
+                token_order=args.ppm_token_order if args.ppm_use_meta_mix else 0,
+                use_meta_mix=args.ppm_use_meta_mix,
+                meta_alpha=args.ppm_meta_alpha,
+                meta_eta=args.ppm_meta_eta,
+                meta_warmup_bytes=args.ppm_meta_warmup_bytes,
+                log_fn=log_fn,
+            )
+        elif log_fn is not None:
+            log_fn(f"ppm_mix:skipped usable_tokens:{usable} requested:{ppm_limit}")
+        if log_fn is not None:
+            log_fn(f"ppm_mix_time:{time.perf_counter() - t0:.1f}s subset_tokens:{usable}")
+
+    model.train()
+    return sliding_loss, sliding_bpb, ppm_result
 
 
 def eval_val_ttt(
@@ -697,7 +1588,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res",
     ).split(",")
     if pattern
 )
@@ -1228,7 +2119,24 @@ class DistributedTokenLoader:
         self._overlap_token: Tensor | None = None
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        denominator = self.world_size * grad_accum_steps
+        if denominator <= 0:
+            raise ValueError(
+                f"world_size * grad_accum_steps must be positive, got "
+                f"world_size={self.world_size} grad_accum_steps={grad_accum_steps}"
+            )
+        if global_tokens % denominator != 0:
+            raise ValueError(
+                f"global_tokens={global_tokens} must be divisible by "
+                f"world_size * grad_accum_steps={denominator}"
+            )
+        local_tokens = global_tokens // denominator
+        if local_tokens % seq_len != 0:
+            raise ValueError(
+                f"local_tokens={local_tokens} must be divisible by seq_len={seq_len}; "
+                f"got global_tokens={global_tokens}, world_size={self.world_size}, "
+                f"grad_accum_steps={grad_accum_steps}"
+            )
         global_span = local_tokens * self.world_size
         if self._overlap_token is None:
             chunk = self.stream.take(global_span + 1)
@@ -1540,6 +2448,80 @@ class LaurelLowRank(nn.Module):
         return self.scale.to(dtype=x.dtype) * y
 
 
+class AttentionResidualMixer(nn.Module):
+    """Single learned depth-wise softmax query from Attention Residuals."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.pseudo_query = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, sources: list[Tensor]) -> Tensor:
+        if not sources:
+            raise ValueError("AttentionResidualMixer requires at least one source")
+        stacked = torch.stack(sources, dim=0)
+        with torch.autocast(enabled=False, device_type=stacked.device.type):
+            values = stacked.float()
+            keys = F.rms_norm(values, (values.size(-1),), eps=self.eps)
+            logits = torch.einsum("d,nbtd->nbt", self.pseudo_query.float(), keys)
+            weights = F.softmax(logits, dim=0)
+            mixed = torch.einsum("nbt,nbtd->btd", weights, values)
+        return mixed.to(dtype=stacked.dtype)
+
+
+class AttentionResidualState:
+    """Runtime source cache for Full or Block Attention Residuals."""
+
+    def __init__(self, root: Tensor, mode: str, block_size: int):
+        if mode not in {"full", "block"}:
+            raise ValueError(f"AttentionResidualState mode must be full or block, got {mode!r}")
+        if block_size <= 0:
+            raise ValueError(f"ATTN_RES_BLOCK_SIZE must be positive, got {block_size}")
+        self.mode = mode
+        self.block_size = block_size
+        if mode == "full":
+            self.sources: list[Tensor] = [root]
+        else:
+            self.blocks: list[Tensor] = [root]
+            self.partial: Tensor | None = None
+            self.layers_in_block = 0
+
+    def _maybe_close_block(self) -> None:
+        if self.mode == "block" and self.partial is not None and self.layers_in_block >= self.block_size:
+            self.blocks.append(self.partial)
+            self.partial = None
+            self.layers_in_block = 0
+
+    def _source_list(self) -> list[Tensor]:
+        if self.mode == "full":
+            return self.sources
+        self._maybe_close_block()
+        return self.blocks if self.partial is None else [*self.blocks, self.partial]
+
+    def mix(self, mixer: AttentionResidualMixer) -> Tensor:
+        return mixer(self._source_list())
+
+    def add(self, output: Tensor) -> None:
+        if self.mode == "full":
+            self.sources.append(output)
+            return
+        self.partial = output if self.partial is None else self.partial + output
+        self.layers_in_block += 1
+
+    def output(self) -> Tensor:
+        if self.mode == "full":
+            out = self.sources[0]
+            for source in self.sources[1:]:
+                out = out + source
+            return out
+        self._maybe_close_block()
+        sources = self.blocks if self.partial is None else [*self.blocks, self.partial]
+        out = sources[0]
+        for source in sources[1:]:
+            out = out + source
+        return out
+
+
 class BaseMLP(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
@@ -1809,6 +2791,7 @@ class TransformerPreNormBlock(nn.Module):
         laurel_rank: int = 0,
         laurel_scale_init: float = 0.01,
         laurel_norm: bool = True,
+        attn_res_enabled: bool = False,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -1835,6 +2818,8 @@ class TransformerPreNormBlock(nn.Module):
             if laurel_rank > 0
             else None
         )
+        self.attn_res_attn = AttentionResidualMixer(dim) if attn_res_enabled else None
+        self.attn_res_mlp = AttentionResidualMixer(dim) if attn_res_enabled else None
         if record_residual:
             self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1867,6 +2852,24 @@ class TransformerPreNormBlock(nn.Module):
         x = self.attn(self.norm_1(x), freqs_cis, mask, **kwargs) + x
         x = self.mlp(self.norm_2(x)) + x
         return self._add_laurel(x, x_in)
+
+    def forward_attn_res(
+        self,
+        state: AttentionResidualState,
+        freqs_cis: Tensor,
+        mask: Tensor | None = None,
+        **kwargs,
+    ) -> Tensor:
+        if self.attn_res_attn is None or self.attn_res_mlp is None:
+            raise RuntimeError("forward_attn_res called on a block without Attention Residuals enabled")
+        if self.record_residual or self.parallel_residual or self.laurel is not None:
+            raise RuntimeError("Attention Residuals are mutually exclusive with parallel residuals and LAuReL")
+        attn_input = state.mix(self.attn_res_attn)
+        attn_out = self.attn(self.norm_1(attn_input), freqs_cis, mask, **kwargs)
+        state.add(attn_out)
+        mlp_input = state.mix(self.attn_res_mlp)
+        state.add(self.mlp(self.norm_2(mlp_input)))
+        return state.output()
 
 
 class DiagonalInjection(nn.Module):
@@ -1942,6 +2945,13 @@ def _get_injection_method(injection_type: str, state_dim: int, input_dim: int, s
     raise ValueError(f'Invalid injection type: {injection_type}')
 
 
+def _split_num_steps_pair(num_steps_pair: Tensor, device: torch.device) -> tuple[Tensor, Tensor]:
+    if num_steps_pair.ndim == 0 or len(num_steps_pair) <= 1:
+        return num_steps_pair, torch.tensor(0, device=device)
+    num_steps_no_grad, num_steps_with_grad = num_steps_pair
+    return num_steps_no_grad, num_steps_with_grad
+
+
 class GPT(nn.Module):
     def __init__(self, h: Hyperparameters):
         super().__init__()
@@ -1966,6 +2976,9 @@ class GPT(nn.Module):
         self.residual_mode = h.residual_mode
         self.parallel_residual_scope = h.parallel_residual_scope
         self.parallel_residual_start = h.parallel_residual_start
+        self.attn_res_mode = h.attn_res_mode
+        self.attn_res_scope = h.attn_res_scope
+        self.attn_res_block_size = h.attn_res_block_size
         self.lockstep_n = h.lockstep_n
         self.lockstep_k = h.lockstep_k
         self.state_init = h.state_init
@@ -1994,6 +3007,20 @@ class GPT(nn.Module):
         self.laurel_rank = h.laurel_rank
         self.laurel_scale_init = h.laurel_scale_init
         self.laurel_norm = h.laurel_norm
+        valid_attn_res_modes = {"none", "full", "block"}
+        valid_attn_res_scopes = {"none", "prelude", "core", "coda", "all"}
+        if self.attn_res_mode not in valid_attn_res_modes:
+            raise ValueError(f"ATTN_RES_MODE must be one of {sorted(valid_attn_res_modes)}, got {self.attn_res_mode!r}")
+        if self.attn_res_scope not in valid_attn_res_scopes:
+            raise ValueError(f"ATTN_RES_SCOPE must be one of {sorted(valid_attn_res_scopes)}, got {self.attn_res_scope!r}")
+        if self.attn_res_block_size <= 0:
+            raise ValueError(f"ATTN_RES_BLOCK_SIZE must be positive, got {self.attn_res_block_size}")
+        if self.attn_res_mode != "none" and self.attn_res_scope == "none":
+            raise ValueError("ATTN_RES_MODE requires ATTN_RES_SCOPE to be prelude, core, coda, or all")
+        if self.attn_res_mode != "none" and h.residual_mode != "sequential":
+            raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
+        if self.attn_res_mode != "none" and h.gradient_checkpointing:
+            raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
         valid_laurel_scopes = {"none", "prelude", "core", "coda", "all"}
         if self.laurel_scope not in valid_laurel_scopes:
             raise ValueError(f"LAUREL_SCOPE must be one of {sorted(valid_laurel_scopes)}, got {self.laurel_scope!r}")
@@ -2003,6 +3030,8 @@ class GPT(nn.Module):
             raise ValueError("LAUREL_RANK > 0 requires LAUREL_SCOPE to be prelude, core, coda, or all")
         if self.laurel_scope != "none" and self.laurel_rank == 0:
             raise ValueError("LAUREL_SCOPE is enabled but LAUREL_RANK is 0")
+        if self.attn_res_mode != "none" and self.laurel_scope != "none":
+            raise ValueError("Attention Residuals are mutually exclusive with LAUREL_SCOPE")
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -2069,6 +3098,7 @@ class GPT(nn.Module):
                 laurel_rank=self._laurel_rank_for("prelude"),
                 laurel_scale_init=h.laurel_scale_init,
                 laurel_norm=h.laurel_norm,
+                attn_res_enabled=self._attn_res_enabled_for("prelude"),
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -2103,6 +3133,7 @@ class GPT(nn.Module):
                 laurel_rank=self._laurel_rank_for("core"),
                 laurel_scale_init=h.laurel_scale_init,
                 laurel_norm=h.laurel_norm,
+                attn_res_enabled=self._attn_res_enabled_for("core"),
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -2136,6 +3167,7 @@ class GPT(nn.Module):
                 laurel_rank=self._laurel_rank_for("coda"),
                 laurel_scale_init=h.laurel_scale_init,
                 laurel_norm=h.laurel_norm,
+                attn_res_enabled=self._attn_res_enabled_for("coda"),
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -2220,6 +3252,9 @@ class GPT(nn.Module):
             weight = fake_quant_weight_ste(weight, self.qat_bits)
         return F.embedding(input_ids, weight)
 
+    def _attn_res_enabled_for(self, scope: str) -> bool:
+        return self.attn_res_mode != "none" and self.attn_res_scope in {scope, "all"}
+
     def _laurel_rank_for(self, scope: str) -> int:
         return self.laurel_rank if self.laurel_scope in {scope, "all"} else 0
 
@@ -2273,6 +3308,21 @@ class GPT(nn.Module):
     def _checkpoint(self, fn, *args, **kwargs):
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False, **kwargs)
 
+    def _forward_attn_res_stack(
+        self,
+        blocks: nn.ModuleList,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor | None,
+        value_embeds: nn.ModuleDict,
+        input_ids: Tensor,
+    ) -> Tensor:
+        state = AttentionResidualState(x, self.attn_res_mode, self.attn_res_block_size)
+        for i, block in enumerate(blocks):
+            ve = self._embedding(value_embeds[str(i)], input_ids) if str(i) in value_embeds else None
+            x = block.forward_attn_res(state, freqs_cis, mask, ve=ve)
+        return x
+
     def _set_qat_enabled(self) -> bool:
         enabled = self.qat_bits > 0 and self.step >= self.qat_start_step
         if enabled != self._qat_enabled:
@@ -2302,9 +3352,19 @@ class GPT(nn.Module):
         self._current_input_ids = input_ids
 
         x = input_embeds
-        for i, block in enumerate(self.prelude):
-            ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
-            x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
+        if self._attn_res_enabled_for("prelude"):
+            x = self._forward_attn_res_stack(
+                self.prelude,
+                x,
+                outer_freqs_cis,
+                None,
+                self.prelude_value_embeds,
+                input_ids,
+            )
+        else:
+            for i, block in enumerate(self.prelude):
+                ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
+                x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
 
         if self.prelude_norm_layer is not None:
             x = self.prelude_norm_layer(x)
@@ -2314,12 +3374,22 @@ class GPT(nn.Module):
         x = self.project_out(x)
         x_rec_projected = x
 
-        for i, block in enumerate(self.coda):
-            ve = self._embedding(self.coda_value_embeds[str(i)], input_ids) if str(i) in self.coda_value_embeds else None
-            if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
-                x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
-            else:
-                x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
+        if self._attn_res_enabled_for("coda"):
+            x = self._forward_attn_res_stack(
+                self.coda,
+                x,
+                outer_freqs_cis,
+                None,
+                self.coda_value_embeds,
+                input_ids,
+            )
+        else:
+            for i, block in enumerate(self.coda):
+                ve = self._embedding(self.coda_value_embeds[str(i)], input_ids) if str(i) in self.coda_value_embeds else None
+                if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
+                    x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
+                else:
+                    x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve)
         if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
             x = self._checkpoint(self.final_norm, x)
         else:
@@ -2375,10 +3445,8 @@ class GPT(nn.Module):
         if self.recurrent_iteration_method == 'per-batch':
             if num_steps_pair is None:
                 num_steps_no_grad, num_steps_with_grad = self.randomized_iteration_sampler()
-            elif len(num_steps_pair) > 1:
-                num_steps_no_grad, num_steps_with_grad = num_steps_pair
             else:
-                num_steps_no_grad, num_steps_with_grad = num_steps_pair, torch.tensor(0, device=input_embeds.device)
+                num_steps_no_grad, num_steps_with_grad = _split_num_steps_pair(num_steps_pair, input_embeds.device)
             num_steps_no_grad_int = int(num_steps_no_grad.item()) if isinstance(num_steps_no_grad, torch.Tensor) else int(num_steps_no_grad)
             num_steps_with_grad_int = int(num_steps_with_grad.item()) if isinstance(num_steps_with_grad, torch.Tensor) else int(num_steps_with_grad)
             n_per_sample = None
@@ -2395,14 +3463,8 @@ class GPT(nn.Module):
                 num_steps_with_grad_int = int(k_per_sample.max().item())
                 num_steps_no_grad = n_per_sample.float().mean().to(torch.long)
                 num_steps_with_grad = k_per_sample.float().mean().to(torch.long)
-            elif len(num_steps_pair) > 1:
-                num_steps_no_grad, num_steps_with_grad = num_steps_pair
-                num_steps_no_grad_int = int(num_steps_no_grad.item()) if isinstance(num_steps_no_grad, torch.Tensor) else int(num_steps_no_grad)
-                num_steps_with_grad_int = int(num_steps_with_grad.item()) if isinstance(num_steps_with_grad, torch.Tensor) else int(num_steps_with_grad)
-                n_per_sample = None
-                k_per_sample = None
             else:
-                num_steps_no_grad, num_steps_with_grad = num_steps_pair, torch.tensor(0, device=input_embeds.device)
+                num_steps_no_grad, num_steps_with_grad = _split_num_steps_pair(num_steps_pair, input_embeds.device)
                 num_steps_no_grad_int = int(num_steps_no_grad.item()) if isinstance(num_steps_no_grad, torch.Tensor) else int(num_steps_no_grad)
                 num_steps_with_grad_int = int(num_steps_with_grad.item()) if isinstance(num_steps_with_grad, torch.Tensor) else int(num_steps_with_grad)
                 n_per_sample = None
@@ -2453,6 +3515,15 @@ class GPT(nn.Module):
         input_ids = self._current_input_ids
         if input_ids is None:
             raise RuntimeError('current input ids are not set')
+        if self._attn_res_enabled_for("core"):
+            return self._forward_attn_res_stack(
+                self.core_block,
+                x,
+                freqs_cis,
+                mask,
+                self.core_value_embeds,
+                input_ids,
+            )
         for layer_idx, block in enumerate(self.core_block):
             ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
@@ -2731,8 +3802,73 @@ def main() -> None:
         raise ValueError("RESIDUAL_MODE=parallel requires PARALLEL_RESIDUAL_SCOPE=core or all")
     if args.parallel_residual_start < -1:
         raise ValueError(f"PARALLEL_RESIDUAL_START must be -1 or non-negative, got {args.parallel_residual_start}")
+    if args.attn_res_mode not in {"none", "full", "block"}:
+        raise ValueError(f"ATTN_RES_MODE must be none, full, or block, got {args.attn_res_mode!r}")
+    if args.attn_res_scope not in {"none", "prelude", "core", "coda", "all"}:
+        raise ValueError(
+            "ATTN_RES_SCOPE must be none, prelude, core, coda, or all; "
+            f"got {args.attn_res_scope!r}"
+        )
+    if args.attn_res_block_size <= 0:
+        raise ValueError(f"ATTN_RES_BLOCK_SIZE must be positive, got {args.attn_res_block_size}")
+    if args.attn_res_mode != "none":
+        if args.attn_res_scope == "none":
+            raise ValueError("ATTN_RES_MODE requires ATTN_RES_SCOPE to be prelude, core, coda, or all")
+        if args.residual_mode != "sequential":
+            raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
+        if args.laurel_scope != "none":
+            raise ValueError("Attention Residuals are mutually exclusive with LAUREL_SCOPE")
+        if args.gradient_checkpointing:
+            raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
     if not (0 < args.eval_stride <= args.train_seq_len):
         raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
+    if args.ppm_enabled and not args.sliding_window_enabled:
+        raise ValueError("PPM_ENABLED=1 requires SLIDING_WINDOW_ENABLED=1")
+    if args.ppm_order < 0 or args.ppm_token_order < 0:
+        raise ValueError("PPM_ORDER and PPM_TOKEN_ORDER must be non-negative")
+    if args.ppm_subset_tokens < 0:
+        raise ValueError(f"PPM_SUBSET_TOKENS must be non-negative, got {args.ppm_subset_tokens}")
+    if not (0.0 <= args.ppm_lambda_hi <= 1.0 and 0.0 <= args.ppm_lambda_lo <= 1.0):
+        raise ValueError("PPM_LAMBDA_HI and PPM_LAMBDA_LO must be in [0, 1]")
+    if not (0.0 <= args.ppm_conf_threshold <= 1.0):
+        raise ValueError("PPM_CONF_THRESHOLD must be in [0, 1]")
+    if not (0.0 <= args.ppm_meta_alpha < 1.0):
+        raise ValueError("PPM_META_ALPHA must be in [0, 1)")
+    if args.ppm_meta_eta < 0.0 or args.ppm_meta_warmup_bytes < 0:
+        raise ValueError("PPM_META_ETA and PPM_META_WARMUP_BYTES must be non-negative")
+    if args.ngram_eval_order < 0 or args.ngram_eval_order == 1:
+        raise ValueError(f"NGRAM_EVAL_ORDER must be 0 or >=2, got {args.ngram_eval_order}")
+    if args.ngram_eval_min_order < 2:
+        raise ValueError(f"NGRAM_EVAL_MIN_ORDER must be >=2, got {args.ngram_eval_min_order}")
+    if args.ngram_eval_order >= 2 and args.ngram_eval_min_order > args.ngram_eval_order:
+        raise ValueError("NGRAM_EVAL_MIN_ORDER must be <= NGRAM_EVAL_ORDER")
+    if not (0.0 <= args.ngram_eval_alpha <= 1.0):
+        raise ValueError("NGRAM_EVAL_ALPHA must be in [0, 1]")
+    if not (0.0 <= args.ngram_eval_alpha_min <= args.ngram_eval_alpha_max <= 1.0):
+        raise ValueError("NGRAM_EVAL_ALPHA_MIN/MAX must satisfy 0 <= min <= max <= 1")
+    if args.ngram_eval_entropy_scale < 0.0:
+        raise ValueError("NGRAM_EVAL_ENTROPY_SCALE must be non-negative")
+    if args.ngram_eval_min_count < 1:
+        raise ValueError("NGRAM_EVAL_MIN_COUNT must be positive")
+    if args.ngram_eval_buckets <= 0 or args.ngram_eval_buckets & (args.ngram_eval_buckets - 1):
+        raise ValueError("NGRAM_EVAL_BUCKETS must be a positive power of two")
+    if args.ngram_eval_max_seconds < 0.0:
+        raise ValueError("NGRAM_EVAL_MAX_SECONDS must be non-negative")
+    if args.ngram_chunk_tokens <= 0 or args.ngram_batch_seqs <= 0:
+        raise ValueError("NGRAM_CHUNK_TOKENS and NGRAM_BATCH_SEQS must be positive")
+    if args.ngram_cubric_cadence < 0:
+        raise ValueError("NGRAM_CUBRIC_CADENCE must be non-negative")
+    if args.ngram_mix_mode not in {"linear", "expert"}:
+        raise ValueError(f"NGRAM_MIX_MODE must be linear or expert, got {args.ngram_mix_mode!r}")
+    if args.ngram_expert_topk <= 0:
+        raise ValueError("NGRAM_EXPERT_TOPK must be positive")
+    if args.ngram_expert_boost_scale < 0.0 or args.ngram_expert_max_boost <= 0.0:
+        raise ValueError("NGRAM_EXPERT_BOOST_SCALE must be non-negative and NGRAM_EXPERT_MAX_BOOST must be positive")
+    if args.ngram_order_mults_str:
+        try:
+            [float(x) for x in args.ngram_order_mults_str.split(",") if x.strip()]
+        except ValueError as exc:
+            raise ValueError("NGRAM_ORDER_MULTS must be a comma-separated list of floats") from exc
     if args.ttt_chunk_tokens <= 0:
         raise ValueError(f"TTT_CHUNK_TOKENS must be positive, got {args.ttt_chunk_tokens}")
     if args.ttt_epochs < 0:
@@ -2850,6 +3986,10 @@ def main() -> None:
     )
     if tokenizer_metadata.get("tokenizer_kind") == "tokenmonster" and args.val_byte_count_override <= 0:
         log0("warning:tokenmonster_byte_count_override_missing bpb_uses_metadata_bytes")
+    token_bytes_lut = None
+    if args.ppm_enabled:
+        token_bytes_lut = load_token_bytes_lut(args.tokenizer_path, tokenizer_metadata, args.vocab_size)
+        log0(f"ppm:token_byte_lut_loaded entries:{len(token_bytes_lut)}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -2972,7 +4112,9 @@ def main() -> None:
         f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
         f"swiglu_scale:{args.injection_swiglu_scale:g} residual_mode:{args.residual_mode} "
         f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
-        f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale}"
+        f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale} "
+        f"attn_res_mode:{args.attn_res_mode} attn_res_scope:{args.attn_res_scope} "
+        f"attn_res_block_size:{args.attn_res_block_size}"
     )
     laurel_params = sum(
         p.numel()
@@ -2983,6 +4125,16 @@ def main() -> None:
     log0(
         f"laurel:scope:{args.laurel_scope} rank:{args.laurel_rank} "
         f"scale_init:{args.laurel_scale_init:g} norm:{args.laurel_norm} params:{laurel_params}"
+    )
+    attn_res_params = sum(
+        p.numel()
+        for module in base_model.modules()
+        if isinstance(module, AttentionResidualMixer)
+        for p in module.parameters()
+    )
+    log0(
+        f"attn_res:mode:{args.attn_res_mode} scope:{args.attn_res_scope} "
+        f"block_size:{args.attn_res_block_size} params:{attn_res_params}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -3014,6 +4166,19 @@ def main() -> None:
         f"epochs:{args.ttt_epochs} lr:{args.ttt_lr:g} momentum:{args.ttt_momentum:g} "
         f"grad_clip:{args.ttt_grad_clip:g}"
     )
+    log0(
+        f"sliding:enabled:{args.sliding_window_enabled} stride:{args.eval_stride} "
+        f"compile_logits:{args.sliding_compile_logits} ppm_enabled:{args.ppm_enabled} ppm_order:{args.ppm_order} "
+        f"ppm_subset_tokens:{args.ppm_subset_tokens} ppm_meta_mix:{args.ppm_use_meta_mix}"
+    )
+    if args.ngram_eval_order >= 2:
+        log0(
+            f"ngram_eval:order:{args.ngram_eval_order} min_order:{args.ngram_eval_min_order} "
+            f"alpha:{args.ngram_eval_alpha:g} adaptive:{args.ngram_eval_adaptive} "
+            f"min_count:{args.ngram_eval_min_count} buckets:{args.ngram_eval_buckets} "
+            f"chunk_tokens:{args.ngram_chunk_tokens} mix_mode:{args.ngram_mix_mode} "
+            f"expert_topk:{args.ngram_expert_topk} expert_boost_scale:{args.ngram_expert_boost_scale:g}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -3265,6 +4430,80 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_{quant_format}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.sliding_window_enabled:
+        torch.cuda.synchronize()
+        t_slide = time.perf_counter()
+        sw_val_loss, sw_val_bpb, ppm_result = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            token_bytes_lut,
+            log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_{quant_format}_zlib_roundtrip_sliding_window val_loss:{sw_val_loss:.4f} "
+            f"val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
+        )
+        log0(
+            f"final_{quant_format}_zlib_roundtrip_sliding_window_exact "
+            f"val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}"
+        )
+        if ppm_result is not None:
+            ppm_mix_bpb, ppm_only_bpb, ppm_nn_bpb = ppm_result
+            log0(
+                f"final_{quant_format}_zlib_roundtrip_sliding_ppm_exact "
+                f"mix_bpb:{ppm_mix_bpb:.8f} ppm_only_bpb:{ppm_only_bpb:.8f} "
+                f"nn_only_bpb:{ppm_nn_bpb:.8f} subset_tokens:{min(args.ppm_subset_tokens, val_tokens.numel() - 1)}"
+            )
+
+    if args.ngram_eval_order >= 2:
+        if distributed:
+            dist.barrier()
+        torch.cuda.synchronize()
+        t_ngram = time.perf_counter()
+        ng_val_loss, ng_val_bpb, ng_coverage = eval_val_sliding_hashed_ngram(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        torch.cuda.synchronize()
+        ng_elapsed_ms = 1000.0 * (time.perf_counter() - t_ngram)
+        if ng_coverage >= 0.999999:
+            log0(
+                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order} "
+                f"val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
+                f"stride:{args.eval_stride} eval_time:{ng_elapsed_ms:.0f}ms"
+            )
+            log0(
+                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
+                f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}"
+            )
+        else:
+            log0(
+                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
+                f"val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
+                f"coverage:{ng_coverage:.4f} stride:{args.eval_stride} eval_time:{ng_elapsed_ms:.0f}ms"
+            )
+            log0(
+                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
+                f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f} coverage:{ng_coverage:.8f}"
+            )
 
     if args.ttt_enabled:
         torch.cuda.synchronize()

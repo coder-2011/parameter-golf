@@ -389,6 +389,22 @@ Current Scylla leaderboard from this session:
 | 9 | Eff8 prelude/coda + XSA3 | 1.70473223 | More effective layers plus XSA hurt |
 | 10 | Coda MoE4 top-1 | 1.71156502 | Worse |
 
+### PPM vs non-PPM 300s control run
+
+To keep it comparable to prior entries, both runs below use one shared wall-clock budget and identical core settings,
+except `PPM_ENABLED` and `SLIDING_WINDOW_ENABLED`.
+
+| Run | `PPM_ENABLED` | Final int8+zlib BPB | Val BPB (corrected) | Final exact loss | Steps | Train time (ms) | int8+zlib bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `logs/exp_compare_parcae_fp10B_base_20260427.txt` | `0` | `1.7077` | `1.7077` | `2.88341485` | `2016` | `300043` | `4,899,938` |
+| `logs/exp_compare_parcae_fp10B_ppm_20260427.txt` | `1` | `1.7073` | `1.7073` | `2.88273369` | `2007` | `300022` | `4,899,513` |
+
+Observations:
+
+- PPM enabled run ended on wall-clock at 300s with slightly lower final corrected BPB than non-PPM in this short-budget setup.
+- Non-sliding final eval is the same baseline metric used in earlier entries (`final_int8_zlib_roundtrip`).
+- The PPM run also reported sliding-window final metrics and ppm mix quality (`mix_bpb:1.52126125`, `ppm_only_bpb:2.36868718`, `nn_only_bpb:1.67512907`) on a 5M-token subset.
+
 ### BigramHash bucket-size sweep on current PoE best
 
 A focused sweep was run on the best current-scaffold PoE config (`POE_NUM_EXPERTS=3`, `POE_HEAD_LR=0.002`) with varying `BIGRAM_HASH_BUCKETS`.

@@ -1,0 +1,9 @@
+RESULT regular loss=3.43219292 bpb=2.03245938 eval_s=1.208
+RESULT sliding loss=3.42742927 bpb=2.02963847 eval_s=1.541
+RESULT ppm mix_bpb=1.87242597 ppm_only_bpb=2.85301933 nn_only_bpb=2.02723069 eval_s=4.590
+RESULT ngram_linear loss=3.03494136 bpb=1.79721688 coverage=1.00000000 eval_s=2.848
+RESULT ngram_expert_scale_0.05 loss=3.42579086 bpb=2.02866824 coverage=1.00000000 eval_s=14.144
+RESULT ngram_expert_scale_0.1 loss=3.42452745 bpb=2.02792008 coverage=1.00000000 eval_s=14.149
+RESULT ngram_expert_scale_0.25 loss=3.42326677 bpb=2.02717354 coverage=1.00000000 eval_s=14.313
+RESULT ngram_expert_scale_0.5 loss=3.43147500 bpb=2.03203425 coverage=1.00000000 eval_s=14.193
+RESULT ngram_expert_scale_1 loss=3.50193093 bpb=2.07375650 coverage=1.00000000 eval_s=14.206

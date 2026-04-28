@@ -1,0 +1,60 @@
+logs/ngram_linear.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model vocab_size=1024 byte_count_override:0
+train_loader:dataset:data train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/runs/feature_ablation_1min_20260427_095805/data/fineweb_val_*.bin tokens:262144
+model_params:4033729
+world_size:1 grad_accum_steps:8
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:4 num_kv_heads:2
+bigram_hash:buckets:4096 dim:128 heads:2 gate:True scale_init:0.05
+parcae:prelude:1 core:2 coda:1 recurrent_dim:256 recurrence:2/1 iteration:per-batch sampling:fixed injection:diagonal swiglu_scale:0 residual_mode:sequential parallel_residual_scope:none parallel_residual_start:-1 parallel_residual_ln_scale:True
+laurel:scope:none rank:0 scale_init:0.01 norm:True params:0
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 poe_experts:1 poe_extra_heads:0 poe_head_lr:0.008 matrix_lr:0.04 scalar_lr:0.04 muon_steps:5 muon_wd:0.095 muon_row_normalize:True
+qat:bits:0 start_step:500 linear:True tied_output:True export_bits:8
+gptq:enabled:False calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:16384 train_seq_len:512 iterations:1000000 warmup_steps:100 max_wallclock_seconds:60.000
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:True stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_meta_mix:False
+ngram_eval:order:5 min_order:2 alpha:0.3 adaptive:True min_count:1 buckets:262144 chunk_tokens:32768 mix_mode:linear expert_topk:8
+seed:1337
+warmup_step:10/100
+warmup_step:20/100
+warmup_step:30/100
+warmup_step:40/100
+warmup_step:50/100
+warmup_step:60/100
+warmup_step:70/100
+warmup_step:80/100
+warmup_step:90/100
+warmup_step:100/100
+step:1/1000000 train_loss:6.9322 train_time:145ms step_avg:144.88ms
+step:2/1000000 train_loss:6.7355 train_time:297ms step_avg:148.59ms
+step:3/1000000 train_loss:6.8641 train_time:451ms step_avg:150.40ms
+step:4/1000000 train_loss:8.2539 train_time:602ms step_avg:150.52ms
+step:5/1000000 train_loss:6.9838 train_time:754ms step_avg:150.81ms
+step:6/1000000 train_loss:6.3814 train_time:904ms step_avg:150.62ms
+step:7/1000000 train_loss:6.1542 train_time:1057ms step_avg:150.96ms
+step:8/1000000 train_loss:6.1756 train_time:1208ms step_avg:150.94ms
+step:9/1000000 train_loss:6.2187 train_time:1358ms step_avg:150.86ms
+step:10/1000000 train_loss:5.9287 train_time:1509ms step_avg:150.93ms
+step:100/1000000 train_loss:4.0345 train_time:14595ms step_avg:145.95ms
+step:200/1000000 train_loss:3.7514 train_time:30358ms step_avg:151.79ms
+step:300/1000000 train_loss:3.4967 train_time:46081ms step_avg:153.60ms
+step:389/1000000 val_loss:3.4506 val_bpb:2.0434 train_time:60034ms step_avg:154.33ms
+stopping_early: wallclock_cap train_time:60034ms step:389/1000000
+peak memory allocated: 1028 MiB reserved: 1812 MiB
+Serialized model int8+zlib: 4506058 bytes (payload:5210498 raw_torch:5228030 payload_ratio:1.55x)
+Total submission size int8+zlib: 4707895 bytes
+final_int8_zlib_roundtrip val_loss:3.4505 val_bpb:2.0433 eval_time:137ms
+final_int8_zlib_roundtrip_exact val_loss:3.45052820 val_bpb:2.04331708
+final_int8_zlib_roundtrip_sliding_window val_loss:3.4460 val_bpb:2.0406 stride:64 eval_time:1532ms
+final_int8_zlib_roundtrip_sliding_window_exact val_loss:3.44600328 val_bpb:2.04063753
+ngram_eval:chunks:8 chunk_tokens:32768 windows:4089 shared_tables:1 mode:linear
+ngram_eval:chunk:1/8 bpb:2.086781 t:0s
+ngram_eval:chunk:2/8 bpb:2.094884 t:1s
+ngram_eval:chunk:3/8 bpb:2.094515 t:1s
+ngram_eval:chunk:8/8 bpb:1.805458 t:3s
+final_int8_zlib_roundtrip_sliding_ngram5 val_loss:3.0489 val_bpb:1.8055 stride:64 eval_time:2902ms
+final_int8_zlib_roundtrip_sliding_ngram5_exact val_loss:3.04885886 val_bpb:1.80545848
