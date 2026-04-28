@@ -46,9 +46,6 @@ try:
 except Exception:
     LigerCrossEntropyLoss = None
 
-USE_TRITON_RMSNORM = False
-
-
 def liger_cross_entropy(
     logits: Tensor,
     target: Tensor,
@@ -237,7 +234,6 @@ class Hyperparameters:
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
-    triton_rmsnorm = USE_TRITON_RMSNORM
     gradient_checkpointing = bool(int(os.environ.get("GRADIENT_CHECKPOINTING", "0")))
     activation_checkpoint_impl = os.environ.get("ACTIVATION_CHECKPOINT_IMPL", "none")
     lockstep_n = bool(int(os.environ.get("LOCKSTEP_N", "0")))
@@ -5235,7 +5231,6 @@ def main() -> None:
         f"attn_res_block_size:{args.attn_res_block_size}"
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
-    log0(f"rmsnorm:triton_enabled:{args.triton_rmsnorm} triton_available:{triton is not None}")
     log0(f"liger_ce:enabled:{args.liger_ce} real_liger_available:{LigerCrossEntropyLoss is not None}")
     attn_res_params = sum(
         p.numel()
