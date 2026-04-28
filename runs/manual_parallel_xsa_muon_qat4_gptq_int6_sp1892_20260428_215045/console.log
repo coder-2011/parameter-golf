@@ -1,0 +1,149 @@
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] Graph break from `Tensor.item()`, consider setting:
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] or:
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] to include these operations in the captured graph.
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] 
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] Graph break: from user code at:
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4262, in update_recurrent_state
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]     return self.core_block_forward(x, input_embeds, freqs_cos, freqs_sin, mask, step, total_steps, x0)
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4381, in core_block_forward
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0]     step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] 
+W0428 21:47:00.536000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [3/0] 
+W0428 21:48:56.918000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [16/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:48:56.918000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [16/8]    function: 'torch_dynamo_resume_in_forward_at_110' (/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torchao/quantization/qat/linear.py:110)
+W0428 21:48:56.918000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [16/8]    last reason: 16/7: tensor '___stack0' dtype mismatch. expected BFloat16, actual Float
+W0428 21:48:56.918000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [16/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:48:56.918000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [16/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0428 21:49:09.310000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [12/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:49:09.310000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [12/8]    function: 'forward' (/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torchao/quantization/qat/fake_quantizer.py:202)
+W0428 21:49:09.310000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [12/8]    last reason: 12/2: expected type of 'x' to be a tensor type, ' but found <class 'torch.nn.parameter.Parameter'>
+W0428 21:49:09.310000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [12/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:49:09.310000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [12/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0428 21:54:22.506000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [11/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:54:22.506000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [11/8]    function: 'forward' (/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torchao/quantization/qat/linear.py:108)
+W0428 21:54:22.506000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [11/8]    last reason: 11/1: GLOBAL_STATE changed: grad_mode 
+W0428 21:54:22.506000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [11/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:54:22.506000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [11/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0428 21:54:59.248000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [27/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:54:59.248000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [27/8]    function: 'torch_dynamo_resume_in_forward_at_3409' (/workspace/parameter-golf/train_gpt_parcae.py:3409)
+W0428 21:54:59.248000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [27/8]    last reason: 27/7: tensor '___stack0' size mismatch at index 2. expected 768, actual 512
+W0428 21:54:59.248000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [27/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:54:59.248000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [27/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8]    function: 'forward_parallel_delayed' (/workspace/parameter-golf/train_gpt_parcae.py:3535)
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8]    last reason: 33/7: kwargs['use_xsa'] == False                               # hidden_states1 = self.attn(normed1, freqs_cos, freqs_sin, mask, **kwargs)  # train_gpt_parcae.py:3556 in forward_parallel_delayed
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8] User stack trace:
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 3556, in forward_parallel_delayed
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8]     hidden_states1 = self.attn(normed1, freqs_cos, freqs_sin, mask, **kwargs)
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:56:28.133000 441499 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [33/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+logs/manual_parallel_xsa_muon_qat4_gptq_int6_sp1892_20260428_215045.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0
+train_loader:dataset:fineweb10B_sp1892 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_*.bin tokens:53271040
+model_params:6535617
+world_size:1 grad_accum_steps:8
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:4 num_kv_heads:2 qkv_projection:packed
+mlp:outer:BaseMLP recurrent:BaseMLP liger_geglu_available:False
+bigram_hash:buckets:8192 dim:128 heads:2 gate:True scale_init:0.05
+parcae:prelude:1 core:2 coda:1 recurrent_dim:256 recurrence:2/1 iteration:per-batch sampling:fixed injection:diagonal residual_mode:parallel parallel_residual_scope:core parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:delayed parallel_residual_record_controls:False parallel_residual_tied_norm:True parallel_residual_in_fp32:True attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_4 active_effective_layers:[2, 3, 4, 5]
+liger_ce:enabled:False real_liger_available:False
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 poe_experts:3 poe_extra_heads:2 poe_head_lr:0.002 matrix_lr:0.04 scalar_lr:0.04 muon_steps:5 muon_wd:0.095 muon_row_normalize:True
+qat:bits:4 start_step:500 backend:torchao group_size:32 activation_bits:8 linear:True tied_output:True export_bits:6
+gptq:enabled:True calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:16384 train_seq_len:512 iterations:1000000 warmup_steps:500 max_wallclock_seconds:300.000
+weight_average:ema_enabled:True ema_decay:0.997 ema_update_every:4 swa_enabled:False swa_start_frac:0.2 swa_every:50 priority:ema
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+gptq:reserved_wallclock:12.000s train_cap:288000ms
+warmup_step:10/501 train_step:9
+warmup_step:20/501 train_step:19
+warmup_step:30/501 train_step:29
+warmup_step:40/501 train_step:39
+warmup_step:50/501 train_step:49
+warmup_step:60/501 train_step:59
+warmup_step:70/501 train_step:69
+warmup_step:80/501 train_step:79
+warmup_step:90/501 train_step:89
+warmup_step:100/501 train_step:99
+warmup_step:110/501 train_step:109
+warmup_step:120/501 train_step:119
+warmup_step:130/501 train_step:129
+warmup_step:140/501 train_step:139
+warmup_step:150/501 train_step:149
+warmup_step:160/501 train_step:159
+warmup_step:170/501 train_step:169
+warmup_step:180/501 train_step:179
+warmup_step:190/501 train_step:189
+warmup_step:200/501 train_step:199
+warmup_step:210/501 train_step:209
+warmup_step:220/501 train_step:219
+warmup_step:230/501 train_step:229
+warmup_step:240/501 train_step:239
+warmup_step:250/501 train_step:249
+warmup_step:260/501 train_step:259
+warmup_step:270/501 train_step:269
+warmup_step:280/501 train_step:279
+warmup_step:290/501 train_step:289
+warmup_step:300/501 train_step:299
+warmup_step:310/501 train_step:309
+warmup_step:320/501 train_step:319
+warmup_step:330/501 train_step:329
+warmup_step:340/501 train_step:339
+warmup_step:350/501 train_step:349
+warmup_step:360/501 train_step:359
+warmup_step:370/501 train_step:369
+warmup_step:380/501 train_step:379
+warmup_step:390/501 train_step:389
+warmup_step:400/501 train_step:399
+warmup_step:410/501 train_step:409
+warmup_step:420/501 train_step:419
+warmup_step:430/501 train_step:429
+warmup_step:440/501 train_step:439
+warmup_step:450/501 train_step:449
+warmup_step:460/501 train_step:459
+warmup_step:470/501 train_step:469
+warmup_step:480/501 train_step:479
+warmup_step:490/501 train_step:489
+warmup_step:500/501 train_step:499
+warmup_step:501/501 train_step:500
+step:1/1000000 train_loss:7.5494 train_time:151ms step_avg:150.72ms
+step:2/1000000 train_loss:7.2092 train_time:324ms step_avg:161.83ms
+step:3/1000000 train_loss:12.4835 train_time:488ms step_avg:162.51ms
+step:4/1000000 train_loss:11.6847 train_time:652ms step_avg:163.10ms
+step:5/1000000 train_loss:9.6878 train_time:824ms step_avg:164.76ms
+step:6/1000000 train_loss:9.6872 train_time:985ms step_avg:164.19ms
+step:7/1000000 train_loss:9.7050 train_time:1145ms step_avg:163.62ms
+step:8/1000000 train_loss:10.1389 train_time:1317ms step_avg:164.58ms
+step:9/1000000 train_loss:8.5055 train_time:1479ms step_avg:164.28ms
+step:10/1000000 train_loss:8.1758 train_time:1638ms step_avg:163.85ms
+step:100/1000000 train_loss:4.4166 train_time:13640ms step_avg:136.40ms
+step:200/1000000 train_loss:4.1139 train_time:26421ms step_avg:132.10ms
+step:300/1000000 train_loss:3.9168 train_time:39087ms step_avg:130.29ms
+step:400/1000000 train_loss:3.7392 train_time:52001ms step_avg:130.00ms
+step:500/1000000 train_loss:3.8715 train_time:64915ms step_avg:129.83ms
+step:600/1000000 train_loss:3.7293 train_time:102716ms step_avg:171.19ms
+step:700/1000000 train_loss:3.7561 train_time:140736ms step_avg:201.05ms
+step:800/1000000 train_loss:3.8553 train_time:179292ms step_avg:224.11ms
+step:900/1000000 train_loss:3.5000 train_time:218151ms step_avg:242.39ms
+step:1000/1000000 train_loss:3.4437 train_time:253724ms step_avg:253.72ms
+step:1092/1000000 val_loss:3.4177 val_bpb:1.7386 train_time:288081ms step_avg:263.81ms
+stopping_early: wallclock_cap train_time:288081ms step:1092/1000000
+peak memory allocated: 1797 MiB reserved: 3602 MiB
+ema:applying EMA weights
+qat:converting TorchAO fake-quant modules before artifact export
+gptq:collecting Hessians from calibration batches
+gptq:collected 15 Hessians in 974ms
+Serialized model gptq_int6+zlib: 5157330 bytes (payload:5578970 raw_torch:5597051 payload_ratio:2.34x)
+gptq:quantized_tensors:15 fallback_tensors:1
+Total submission size gptq_int6+zlib: 5408924 bytes
+final_gptq_int6_zlib_roundtrip val_loss:3.6180 val_bpb:1.8405 eval_time:41632ms
+final_gptq_int6_zlib_roundtrip_exact val_loss:3.61796905 val_bpb:1.84045398
