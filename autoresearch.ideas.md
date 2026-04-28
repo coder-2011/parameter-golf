@@ -17,14 +17,11 @@ Context: strict 300s wall-clock, SP1024, dim=384 batch=131k compile=1 SWA=1. Bes
 - Multiple top leaderboard entries (PR #1019, #549, #287, #198) use XSA (cross-slot attention). `XSA_LAST_N=3` or `=4` on the deepest layers is the typical pattern.
 - Low risk, code-complete.
 
-### D. LAuReL low-rank residual
-- `LAUREL_SCOPE=coda LAUREL_RANK=32 LAUREL_SCALE_INIT=0.01` is the typical placement. Cheap params.
-
-### E. Different optimizer settings
+### D. Different optimizer settings
 - `MUON_WD=0.04` (vs default 0.095) is used by multiple leaderboard entries (jfprincz, thwu1, aruniyer).
 - `MUON_MOMENTUM=0.90` worth a quick test.
 
-### F. NGRAM eval mixer
+### E. NGRAM eval mixer
 - `NGRAM_EVAL_ORDER=5 NGRAM_MIX_MODE=expert` — eval-only, doesn't change trained model. Separate metric to watch: `final_..._ngram..._exact`.
 
 ## Medium priority

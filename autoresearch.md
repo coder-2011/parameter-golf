@@ -112,7 +112,6 @@ the saved artifact. They are controlled by env vars and can mix with each other.
 | Feature | Env vars | Description |
 |---------|----------|-------------|
 | **DeepSeek MoE coda** | `DEEPSEEK_MOE_NUM_BASE_EXPERTS>0`, `DEEPSEEK_MOE_ACTIVE_EXPERTS`, `DEEPSEEK_MOE_SHARED_EXPERTS` | Replaces coda MLPs with DeepSeek-style routed + shared experts. Default-off. |
-| **LAuReL low-rank residual** | `LAUREL_SCOPE=prelude\|core\|coda\|all`, `LAUREL_RANK>0`, `LAUREL_SCALE_INIT=0.01` | Adds `scale * RMSNorm(right(left(block_input)))` to block output. Default-off. |
 | **Parallel residual** | `RESIDUAL_MODE=parallel`, `PARALLEL_RESIDUAL_SCOPE=core` | Recurrent core blocks compute `x + attn(norm1(x)) + mlp(norm2(x))`. Default `sequential`. |
 | **SwiGLU reinjection** | `INJECTION_TYPE=swiglu-add`, `INJECTION_SWIGLU_SCALE=0.1` | Nonlinear token/BigramHash reinjection into recurrent state. At scale `0.1` it hurt; zero scale preserves old behavior. |
 | **RoPE variants** | `ROPE_DIMS=32`, `OUTER_ROPE_DIMS`, `RECURRENT_ROPE_DIMS` | Partial RoPE in different scopes. `ROPE_DIMS=32` is best tested for seq1024. |

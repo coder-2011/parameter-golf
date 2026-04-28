@@ -49,8 +49,6 @@ def _tiny_h() -> pg.Hyperparameters:
     h.monitoring = False
     h.tie_embeddings = True
     h.poe_num_experts = 1
-    h.laurel_scope = "none"
-    h.laurel_rank = 0
     h.coda_moe_num_experts = 0
     h.deepseek_moe_num_base_experts = 0
     h.qat_bits = 0

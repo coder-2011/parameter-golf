@@ -46,15 +46,6 @@ This file tracks issues noticed during local audits. Keep entries distinct; upda
 - Notes: This may be an acceptable challenge-specific simplification for small coda-only experiments.
 - Suggested fix: Rename or document it as DeepSeek-style/simplified MoE. If exact DeepSeek comparison is the goal, add the missing gate features and a dedicated routing parity test.
 
-### LAuReL implementation covers only the low-rank local variant
-
-- Status: open
-- Severity: low
-- Location: `LaurelLowRank`
-- Evidence: The LAuReL paper describes a family of learned augmented residual layers, including residual-weight, low-rank, and previous-activation variants. The local implementation is only a scaled low-rank residual add-on with optional norm.
-- Observed impact: The feature is likely behaving as intended, but it should not be interpreted as the full LAuReL family or Gemma3n-style implementation.
-- Suggested fix: Document the feature as the local low-rank LAuReL variant, or add separate config names if adding residual-weight or previous-activation variants later.
-
 ### `num_steps_pair` scalar tensor path fails
 
 - Status: open

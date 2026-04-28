@@ -254,11 +254,6 @@ class Hyperparameters:
     recurrent_rope_dims = int(os.environ.get("RECURRENT_ROPE_DIMS", rope_dims))
     recurrent_layer_rope_dims = os.environ.get("RECURRENT_LAYER_ROPE_DIMS", "")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    laurel_scope = os.environ.get("LAUREL_SCOPE", "none")
-    laurel_rank = int(os.environ.get("LAUREL_RANK", 0))
-    laurel_scale_init = float(os.environ.get("LAUREL_SCALE_INIT", "0.01"))
-    laurel_norm = bool(int(os.environ.get("LAUREL_NORM", "1")))
-
     # Parcae-style recurrent architecture.
     n_layers_in_prelude = int(os.environ.get("N_LAYERS_IN_PRELUDE", 1))
     n_layers_in_recurrent_block = int(os.environ.get("N_LAYERS_IN_RECURRENT_BLOCK", 4))
@@ -3183,25 +3178,6 @@ class ParcaeRMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), self.weight.to(dtype=x.dtype), self.eps)
 
 
-class LaurelLowRank(nn.Module):
-    def __init__(self, dim: int, rank: int, scale_init: float, use_norm: bool):
-        super().__init__()
-        if rank <= 0:
-            raise ValueError(f"LAUREL_RANK must be positive when enabled, got {rank}")
-        self.left = CastedLinear(dim, rank, bias=False)
-        self.right = CastedLinear(rank, dim, bias=False)
-        self.norm = ParcaeRMSNorm(dim) if use_norm else None
-        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
-        nn.init.normal_(self.left.weight, mean=0.0, std=1.0 / math.sqrt(dim))
-        nn.init.normal_(self.right.weight, mean=0.0, std=1.0 / math.sqrt(rank))
-
-    def forward(self, x: Tensor) -> Tensor:
-        y = self.right(self.left(x))
-        if self.norm is not None:
-            y = self.norm(y)
-        return self.scale.to(dtype=x.dtype) * y
-
-
 class AttentionResidualMixer(nn.Module):
     """Single learned depth-wise softmax query from Attention Residuals."""
 
@@ -3553,9 +3529,6 @@ class TransformerPreNormBlock(nn.Module):
         record_residual: bool,
         ln_scale: bool,
         residual_layer_idx: int,
-        laurel_rank: int = 0,
-        laurel_scale_init: float = 0.01,
-        laurel_norm: bool = True,
         attn_res_enabled: bool = False,
     ):
         super().__init__()
@@ -3578,20 +3551,12 @@ class TransformerPreNormBlock(nn.Module):
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
         self.mlp = mlp_cls(dim, hidden_dim)
-        self.laurel = (
-            LaurelLowRank(dim, laurel_rank, laurel_scale_init, laurel_norm)
-            if laurel_rank > 0
-            else None
-        )
         self.attn_res_attn = AttentionResidualMixer(dim) if attn_res_enabled else None
         self.attn_res_mlp = AttentionResidualMixer(dim) if attn_res_enabled else None
         if record_residual:
             self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-
-    def _add_laurel(self, x_out: Tensor, x_in: Tensor) -> Tensor:
-        return x_out + self.laurel(x_in) if self.laurel is not None else x_out
 
     def forward(
         self,
@@ -3612,19 +3577,14 @@ class TransformerPreNormBlock(nn.Module):
             mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
             if self.parallel_residual:
                 mlp_out = self.mlp(self.norm_2(x_in) * self.ln_scale_factor)
-                x_out = x_in + attn_scale * attn_out + mlp_scale * mlp_out
-                return self._add_laurel(x_out, x_in)
+                return x_in + attn_scale * attn_out + mlp_scale * mlp_out
             x_out = x_in + attn_scale * attn_out
-            x_out = x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
-            return self._add_laurel(x_out, x_in)
+            return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
         if self.parallel_residual:
             x0 = x
-            x_out = x0 + self.attn(self.norm_1(x0), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
-            return self._add_laurel(x_out, x0)
-        x_in = x
+            return x0 + self.attn(self.norm_1(x0), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
         x = self.attn(self.norm_1(x), freqs_cos, freqs_sin, mask, **kwargs) + x
-        x = self.mlp(self.norm_2(x)) + x
-        return self._add_laurel(x, x_in)
+        return self.mlp(self.norm_2(x)) + x
 
     def forward_attn_res(
         self,
@@ -3636,8 +3596,8 @@ class TransformerPreNormBlock(nn.Module):
     ) -> Tensor:
         if self.attn_res_attn is None or self.attn_res_mlp is None:
             raise RuntimeError("forward_attn_res called on a block without Attention Residuals enabled")
-        if self.record_residual or self.parallel_residual or self.laurel is not None:
-            raise RuntimeError("Attention Residuals are mutually exclusive with parallel residuals and LAuReL")
+        if self.record_residual or self.parallel_residual:
+            raise RuntimeError("Attention Residuals are mutually exclusive with parallel residuals")
         attn_input = state.mix(self.attn_res_attn)
         attn_out = self.attn(self.norm_1(attn_input), freqs_cos, freqs_sin, mask, **kwargs)
         state.add(attn_out)
@@ -3779,10 +3739,6 @@ class GPT(nn.Module):
         self.deepseek_moe_shared_experts = h.deepseek_moe_shared_experts
         self.deepseek_moe_active_experts = h.deepseek_moe_active_experts
         self.poe_num_experts = h.poe_num_experts
-        self.laurel_scope = h.laurel_scope
-        self.laurel_rank = h.laurel_rank
-        self.laurel_scale_init = h.laurel_scale_init
-        self.laurel_norm = h.laurel_norm
         self.xsa_last_n = h.xsa_last_n
         if self.xsa_last_n < 0:
             raise ValueError(f"XSA_LAST_N must be non-negative, got {self.xsa_last_n}")
@@ -3800,17 +3756,6 @@ class GPT(nn.Module):
             raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
         if self.attn_res_mode != "none" and h.gradient_checkpointing:
             raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
-        valid_laurel_scopes = {"none", "prelude", "core", "coda", "all"}
-        if self.laurel_scope not in valid_laurel_scopes:
-            raise ValueError(f"LAUREL_SCOPE must be one of {sorted(valid_laurel_scopes)}, got {self.laurel_scope!r}")
-        if self.laurel_rank < 0:
-            raise ValueError(f"LAUREL_RANK must be non-negative, got {self.laurel_rank}")
-        if self.laurel_scope == "none" and self.laurel_rank > 0:
-            raise ValueError("LAUREL_RANK > 0 requires LAUREL_SCOPE to be prelude, core, coda, or all")
-        if self.laurel_scope != "none" and self.laurel_rank == 0:
-            raise ValueError("LAUREL_SCOPE is enabled but LAUREL_RANK is 0")
-        if self.attn_res_mode != "none" and self.laurel_scope != "none":
-            raise ValueError("Attention Residuals are mutually exclusive with LAUREL_SCOPE")
         self.total_effective_layers = self.n_layers_in_prelude + self.n_layers_in_recurrent_block + self.n_layers_in_coda
         self.expected_depth = self.n_layers_in_prelude + self.n_layers_in_coda + self.n_layers_in_recurrent_block * self.mean_recurrence
         self.coda_layer_offset = self.n_layers_in_prelude + self.n_layers_in_recurrent_block * self.mean_recurrence
@@ -3875,9 +3820,6 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i,
-                laurel_rank=self._laurel_rank_for("prelude"),
-                laurel_scale_init=h.laurel_scale_init,
-                laurel_norm=h.laurel_norm,
                 attn_res_enabled=self._attn_res_enabled_for("prelude"),
             )
             for i in range(self.n_layers_in_prelude)
@@ -3910,9 +3852,6 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope in {"core", "all"},
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude,
-                laurel_rank=self._laurel_rank_for("core"),
-                laurel_scale_init=h.laurel_scale_init,
-                laurel_norm=h.laurel_norm,
                 attn_res_enabled=self._attn_res_enabled_for("core"),
             )
             for i in range(self.n_layers_in_recurrent_block)
@@ -3944,9 +3883,6 @@ class GPT(nn.Module):
                 record_residual=h.residual_mode == "parallel" and h.parallel_residual_scope == "all",
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block,
-                laurel_rank=self._laurel_rank_for("coda"),
-                laurel_scale_init=h.laurel_scale_init,
-                laurel_norm=h.laurel_norm,
                 attn_res_enabled=self._attn_res_enabled_for("coda"),
             )
             for i in range(self.n_layers_in_coda)
@@ -4034,9 +3970,6 @@ class GPT(nn.Module):
 
     def _attn_res_enabled_for(self, scope: str) -> bool:
         return self.attn_res_mode != "none" and self.attn_res_scope in {scope, "all"}
-
-    def _laurel_rank_for(self, scope: str) -> int:
-        return self.laurel_rank if self.laurel_scope in {scope, "all"} else 0
 
     def _init_weights(self) -> None:
         base_std = math.sqrt(2.0 / (5.0 * self.outer_dim))
@@ -4695,8 +4628,6 @@ def main() -> None:
             raise ValueError("ATTN_RES_MODE requires ATTN_RES_SCOPE to be prelude, core, coda, or all")
         if args.residual_mode != "sequential":
             raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
-        if args.laurel_scope != "none":
-            raise ValueError("Attention Residuals are mutually exclusive with LAUREL_SCOPE")
         if args.gradient_checkpointing:
             raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
     if not (0 < args.eval_stride <= args.train_seq_len):
@@ -5014,16 +4945,6 @@ def main() -> None:
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
     log0(f"rmsnorm:triton_enabled:{args.triton_rmsnorm} triton_available:{triton is not None}")
     log0(f"liger_ce:enabled:{args.liger_ce} triton_available:{triton is not None}")
-    laurel_params = sum(
-        p.numel()
-        for module in base_model.modules()
-        if isinstance(module, LaurelLowRank)
-        for p in module.parameters()
-    )
-    log0(
-        f"laurel:scope:{args.laurel_scope} rank:{args.laurel_rank} "
-        f"scale_init:{args.laurel_scale_init:g} norm:{args.laurel_norm} params:{laurel_params}"
-    )
     attn_res_params = sum(
         p.numel()
         for module in base_model.modules()
