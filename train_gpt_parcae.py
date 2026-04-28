@@ -36,6 +36,11 @@ except Exception:
     triton = None
     tl = None
 
+try:
+    from liger_kernel.ops import LigerGELUMulFunction
+except Exception:
+    LigerGELUMulFunction = None
+
 USE_TRITON_RMSNORM = False
 
 if triton is not None:
@@ -3275,6 +3280,36 @@ class GatedMLP(nn.Module):
         return self.proj(self.nonlin(gate) * value)
 
 
+def _gelu_mul(gate: Tensor, value: Tensor) -> Tensor:
+    if LigerGELUMulFunction is not None and gate.is_cuda:
+        return LigerGELUMulFunction.apply(gate, value)
+    return F.gelu(gate) * value
+
+
+class LigerStyleGatedMLP(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate_proj = CastedLinear(dim, hidden_dim, bias=False)
+        self.up_proj = CastedLinear(dim, hidden_dim, bias=False)
+        self.down_proj = CastedLinear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down_proj(_gelu_mul(self.gate_proj(x), self.up_proj(x)))
+
+
+def get_mlp_class(mlp_class_name: str) -> type[nn.Module]:
+    if mlp_class_name == "BaseMLP":
+        return BaseMLP
+    if mlp_class_name == "GatedMLP":
+        return GatedMLP
+    if mlp_class_name in {"LigerStyleGatedMLP", "LigerGEGLUMLP"}:
+        return LigerStyleGatedMLP
+    raise ValueError(
+        "MLP class must be BaseMLP, GatedMLP, LigerStyleGatedMLP, "
+        f"or LigerGEGLUMLP; got {mlp_class_name!r}"
+    )
+
+
 class TopKMoE(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, num_experts: int, top_k: int):
         super().__init__()
@@ -3369,7 +3404,7 @@ class DeepSeekMoE(nn.Module):
         self.balance_alpha = balance_alpha
         self.norm_topk_prob = norm_topk_prob
         expert_hidden_dim = hidden_dim // expert_segments
-        mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
+        mlp_cls = get_mlp_class(mlp_class_name)
         self.router = CastedLinear(dim, self.routed_experts_count, bias=False)
         self.routed_experts = nn.ModuleList(
             mlp_cls(dim, expert_hidden_dim) for _ in range(self.routed_experts_count)
@@ -3549,7 +3584,7 @@ class TransformerPreNormBlock(nn.Module):
             rope_dims=rope_dims,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
-        mlp_cls = GatedMLP if mlp_class_name == 'GatedMLP' else BaseMLP
+        mlp_cls = get_mlp_class(mlp_class_name)
         self.mlp = mlp_cls(dim, hidden_dim)
         self.attn_res_attn = AttentionResidualMixer(dim) if attn_res_enabled else None
         self.attn_res_mlp = AttentionResidualMixer(dim) if attn_res_enabled else None
@@ -3996,14 +4031,18 @@ class GPT(nn.Module):
                 if name == 'project_out':
                     continue
                 is_moe_proj = (
-                    '.routed_experts.' in name and name.endswith('.proj')
-                ) or name.endswith('shared_experts.proj')
+                    '.routed_experts.' in name and name.endswith(('.proj', '.down_proj'))
+                ) or name.endswith(('shared_experts.proj', 'shared_experts.down_proj'))
                 is_moe_fc = (
-                    '.routed_experts.' in name and name.endswith('.fc')
-                ) or name.endswith('shared_experts.fc')
-                if name.endswith(('attn.c_proj', 'mlp.proj')) or is_moe_proj:
+                    '.routed_experts.' in name and name.endswith(('.fc', '.gate_proj', '.up_proj'))
+                ) or name.endswith(('shared_experts.fc', 'shared_experts.gate_proj', 'shared_experts.up_proj'))
+                if name.endswith(('attn.c_proj', 'mlp.proj', 'mlp.down_proj')) or is_moe_proj:
                     std = (recurrent_std if name.startswith('core_block.') else base_std) / out_proj_divisor
-                elif name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'mlp.fc', 'lm_head')) or is_moe_fc or name.endswith('mlp.router'):
+                elif (
+                    name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'mlp.fc', 'mlp.gate_proj', 'mlp.up_proj', 'lm_head'))
+                    or is_moe_fc
+                    or name.endswith('mlp.router')
+                ):
                     std = recurrent_std if name.startswith('core_block.') else base_std
                 else:
                     continue
@@ -4927,6 +4966,10 @@ def main() -> None:
     log0(f"attention_backend:flash_attn4_wrapper has_flash_attn:{HAS_FLASH_ATTN}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
+        f"liger_geglu_available:{LigerGELUMulFunction is not None}"
+    )
     log0(
         f"bigram_hash:buckets:{args.bigram_hash_buckets} dim:{args.bigram_hash_dim} "
         f"heads:{args.bigram_hash_heads} gate:{args.bigram_hash_gate} "

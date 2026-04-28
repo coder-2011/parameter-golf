@@ -114,6 +114,56 @@ def test_smear_gate_is_wired_into_gpt_backward():
     assert torch.isfinite(model.smear.gate.grad).all()
 
 
+def test_liger_style_gated_mlp_matches_packed_gated_mlp_with_split_weights():
+    torch.manual_seed(123)
+    packed = pg.GatedMLP(dim=5, hidden_dim=7)
+    split = pg.LigerStyleGatedMLP(dim=5, hidden_dim=7)
+    with torch.no_grad():
+        split.gate_proj.weight.copy_(packed.fc.weight[:7])
+        split.up_proj.weight.copy_(packed.fc.weight[7:])
+        split.down_proj.weight.copy_(packed.proj.weight)
+    x = torch.randn(3, 4, 5)
+
+    actual = split(x)
+    expected = packed(x)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_liger_style_gated_mlp_is_wired_into_gpt():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.mlp_class_name = "LigerStyleGatedMLP"
+    h.recurrent_mlp_class_name = "LigerGEGLUMLP"
+    model = pg.GPT(h)
+
+    assert isinstance(model.prelude[0].mlp, pg.LigerStyleGatedMLP)
+    assert all(isinstance(block.mlp, pg.LigerStyleGatedMLP) for block in model.core_block)
+    assert isinstance(model.coda[0].mlp, pg.LigerStyleGatedMLP)
+    qat_names = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, pg.CastedLinear) and module in model.qat_linears
+    }
+    assert "core_block.0.mlp.gate_proj" in qat_names
+    assert "core_block.0.mlp.up_proj" in qat_names
+    assert "core_block.0.mlp.down_proj" in qat_names
+
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.core_block[0].mlp.gate_proj.weight.grad is not None
+    assert torch.isfinite(model.core_block[0].mlp.gate_proj.weight.grad).all()
+
+
 def test_xsa_efficient_matches_explicit_gqa_projection():
     attn = pg.ParcaeCausalSelfAttention(
         dim=16,
