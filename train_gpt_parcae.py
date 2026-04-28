@@ -29,6 +29,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.flash_attention import HAS_FLASH_ATTN, flash_attn
 
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
+
+USE_TRITON_RMSNORM = bool(int(os.environ.get("TRITON_RMSNORM", "0")))
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -190,6 +199,7 @@ class Hyperparameters:
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
+    triton_rmsnorm = bool(int(os.environ.get("TRITON_RMSNORM", "0")))
     gradient_checkpointing = bool(int(os.environ.get("GRADIENT_CHECKPOINTING", "0")))
     activation_checkpoint_impl = os.environ.get("ACTIVATION_CHECKPOINT_IMPL", "none")
     lockstep_n = bool(int(os.environ.get("LOCKSTEP_N", "0")))
@@ -2773,6 +2783,16 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
 class BigramHashEmbedding(nn.Module):
     HASH_CUR_MULTS = (36313, 17491, 52973, 29837, 44497, 62137, 24071, 57223)
     HASH_PREV_MULTS = (27191, 43889, 19937, 60271, 34583, 49331, 15461, 41077)
@@ -2884,24 +2904,37 @@ class LinearCrossEntropyLoss(nn.Module):
         return loss
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, condense_ratio: int = 1) -> Tensor:
+def precompute_freqs_cos_sin(dim: int, end: int, theta: float = 10000.0, condense_ratio: int = 1) -> tuple[Tensor, Tensor]:
     with torch.autocast(device_type='cuda', enabled=False):
         inv_freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         t = torch.arange(end, dtype=torch.float32, device=inv_freqs.device) / condense_ratio
         freqs = torch.outer(t, inv_freqs).float()
-        return torch.stack([torch.cos(freqs)[None, :, None, :], torch.sin(freqs)[None, :, None, :]], dim=4)
+        return torch.cos(freqs)[None, :, None, :], torch.sin(freqs)[None, :, None, :]
 
 
-def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cis: Tensor, rope_dims: int) -> tuple[Tensor, Tensor]:
+def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, rope_dims: int) -> tuple[Tensor, Tensor]:
     with torch.autocast(device_type='cuda', enabled=False):
-        freqs_cis = freqs_cis[..., : rope_dims // 2, :]
+        if freqs_cos.shape[-1] != rope_dims // 2:
+            freqs_cos = freqs_cos[..., : rope_dims // 2]
+            freqs_sin = freqs_sin[..., : rope_dims // 2]
+        if rope_dims == q.shape[-1]:
+            qk_r2 = torch.cat([q, k], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()
+            rotated_qk_r2 = torch.stack(
+                [
+                    qk_r2[..., 0] * freqs_cos - qk_r2[..., 1] * freqs_sin,
+                    qk_r2[..., 1] * freqs_cos + qk_r2[..., 0] * freqs_sin,
+                ],
+                dim=-1,
+            ).flatten(3)
+            return torch.split(rotated_qk_r2.type_as(q), q.shape[2], dim=2)
+
         q_rope, q_pass = q[..., :rope_dims], q[..., rope_dims:]
         k_rope, k_pass = k[..., :rope_dims], k[..., rope_dims:]
         qk_r2 = torch.cat([q_rope, k_rope], dim=2).unflatten(dim=-1, sizes=(-1, 2)).float()
         rotated_qk_r2 = torch.stack(
             [
-                qk_r2[..., 0] * freqs_cis[..., 0] - qk_r2[..., 1] * freqs_cis[..., 1],
-                qk_r2[..., 1] * freqs_cis[..., 0] + qk_r2[..., 0] * freqs_cis[..., 1],
+                qk_r2[..., 0] * freqs_cos - qk_r2[..., 1] * freqs_sin,
+                qk_r2[..., 1] * freqs_cos + qk_r2[..., 0] * freqs_sin,
             ],
             dim=-1,
         ).flatten(3)
@@ -2913,6 +2946,171 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
+if triton is not None and tl is not None:
+    @triton.jit
+    def _triton_rms_norm_fwd(
+        x_ptr,
+        y_ptr,
+        weight_ptr,
+        rstd_ptr,
+        row_stride,
+        feature_dim,
+        eps,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        x_ptr += row_idx * row_stride
+        y_ptr += row_idx * row_stride
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < feature_dim
+        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        variance = tl.sum(x * x, axis=0) / feature_dim
+        rstd = 1.0 / tl.sqrt(variance + eps)
+        tl.store(rstd_ptr + row_idx, rstd)
+        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        tl.store(y_ptr + cols, x * rstd * weight, mask=mask)
+
+
+    @triton.jit
+    def _triton_rms_norm_bwd_dx_dw_partial(
+        dx_ptr,
+        dy_ptr,
+        dw_partial_ptr,
+        x_ptr,
+        weight_ptr,
+        rstd_ptr,
+        lock_ptr,
+        row_stride,
+        feature_dim,
+        GROUP_SIZE_M: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < feature_dim
+        x_ptr += row_idx * row_stride
+        dy_ptr += row_idx * row_stride
+        dx_ptr += row_idx * row_stride
+
+        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        dy = tl.load(dy_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        rstd = tl.load(rstd_ptr + row_idx)
+
+        weight_dy = weight * dy
+        dot = tl.sum(tl.where(mask, weight_dy * x, 0.0), axis=0)
+        correction = dot * rstd / feature_dim
+        dx = (weight_dy - x * rstd * correction) * rstd
+        tl.store(dx_ptr + cols, dx, mask=mask)
+
+        partial_dw = tl.where(mask, dy * x * rstd, 0.0)
+        lock_id = row_idx % GROUP_SIZE_M
+        lock = lock_ptr + lock_id
+        count = lock + GROUP_SIZE_M
+        dw_partial_ptr += lock_id * feature_dim + cols
+        while tl.atomic_cas(lock, 0, 1) == 1:
+            pass
+        if tl.load(count) == 0:
+            tl.atomic_xchg(count, 1)
+        else:
+            partial_dw += tl.load(dw_partial_ptr, mask=mask, other=0.0)
+        tl.store(dw_partial_ptr, partial_dw, mask=mask)
+        tl.debug_barrier()
+        tl.atomic_xchg(lock, 0)
+
+
+    @triton.jit
+    def _triton_rms_norm_bwd_dw(
+        dw_partial_ptr,
+        dw_final_ptr,
+        num_groups,
+        feature_dim,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for row_start in range(0, num_groups, BLOCK_SIZE_M):
+            rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+            mask = (rows[:, None] < num_groups) & (cols[None, :] < feature_dim)
+            offsets = rows[:, None] * feature_dim + cols[None, :]
+            acc += tl.load(dw_partial_ptr + offsets, mask=mask, other=0.0)
+        tl.store(dw_final_ptr + cols, tl.sum(acc, axis=0), mask=cols < feature_dim)
+
+
+class _TritonRMSNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, weight: Tensor, eps: float) -> Tensor:
+        if triton is None:
+            raise RuntimeError("TRITON_RMSNORM=1 requires triton to be importable")
+        y = torch.empty_like(x)
+        x_2d = x.reshape(-1, x.shape[-1])
+        y_2d = y.reshape(-1, y.shape[-1])
+        rows, feature_dim = x_2d.shape
+        block_size = triton.next_power_of_2(feature_dim)
+        max_block_size = 65536 // x.element_size()
+        if block_size > max_block_size:
+            raise RuntimeError(f"Triton RMSNorm feature_dim={feature_dim} exceeds max block size {max_block_size}")
+        rstd = torch.empty((rows,), dtype=torch.float32, device=x.device)
+        _triton_rms_norm_fwd[(rows,)](
+            x_2d,
+            y_2d,
+            weight,
+            rstd,
+            x_2d.stride(0),
+            feature_dim,
+            eps,
+            BLOCK_SIZE=block_size,
+        )
+        ctx.save_for_backward(x, weight, rstd)
+        ctx.block_size = block_size
+        return y
+
+    @staticmethod
+    def backward(ctx, dy: Tensor) -> tuple[Tensor, Tensor, None]:
+        x, weight, rstd = ctx.saved_tensors
+        x_2d = x.reshape(-1, x.shape[-1])
+        dy_2d = dy.reshape(-1, dy.shape[-1])
+        dx = torch.empty_like(dy)
+        dx_2d = dx.reshape(-1, dx.shape[-1])
+        rows, feature_dim = x_2d.shape
+        if feature_dim <= 1024:
+            group_size = 256
+        elif feature_dim <= 4096:
+            group_size = 128
+        elif feature_dim <= 8192:
+            group_size = 96
+        else:
+            group_size = 64
+        locks = torch.zeros(2 * group_size, dtype=torch.int32, device=x.device)
+        dw_partial = torch.zeros((group_size, feature_dim), dtype=torch.float32, device=x.device)
+        dw = torch.empty((feature_dim,), dtype=weight.dtype, device=weight.device)
+        _triton_rms_norm_bwd_dx_dw_partial[(rows,)](
+            dx_2d,
+            dy_2d,
+            dw_partial,
+            x_2d,
+            weight,
+            rstd,
+            locks,
+            x_2d.stride(0),
+            feature_dim,
+            GROUP_SIZE_M=group_size,
+            BLOCK_SIZE=ctx.block_size,
+        )
+        grid = lambda meta: (triton.cdiv(feature_dim, meta["BLOCK_SIZE_N"]),)
+        _triton_rms_norm_bwd_dw[grid](
+            dw_partial,
+            dw,
+            min(group_size, rows),
+            feature_dim,
+            BLOCK_SIZE_M=32,
+            BLOCK_SIZE_N=128,
+        )
+        return dx, dw, None
+
+
 class ParcaeRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -2920,6 +3118,8 @@ class ParcaeRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
+        if USE_TRITON_RMSNORM and x.is_cuda:
+            return _TritonRMSNorm.apply(x, self.weight, self.eps)
         with torch.autocast(enabled=False, device_type=x.device.type):
             y = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
         return y.type_as(x) * self.weight.to(dtype=x.dtype)
@@ -3225,7 +3425,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         proj = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
         return (y_grouped - proj).reshape(bsz, seqlen, num_heads, head_dim)
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).view(bsz, seqlen, self.n_head, self.head_dim)
         k = self.c_k(x).view(bsz, seqlen, self.n_kv_head, self.head_dim)
@@ -3246,7 +3446,7 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = (q + self.q_bias).to(q.dtype)
             k = (k + self.k_bias).to(k.dtype)
 
-        q, k = apply_rotary_emb_complex_like(q, k, freqs_cis, self.rope_dims)
+        q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
         if self.qk_norm:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
@@ -3335,13 +3535,21 @@ class TransformerPreNormBlock(nn.Module):
     def _add_laurel(self, x_out: Tensor, x_in: Tensor) -> Tensor:
         return x_out + self.laurel(x_in) if self.laurel is not None else x_out
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor | None = None, x0: Tensor | None = None, **kwargs) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None = None,
+        x0: Tensor | None = None,
+        **kwargs,
+    ) -> Tensor:
         if self.record_residual:
             if x0 is None:
                 x0 = x
             mix = self.resid_mix.to(dtype=x.dtype)
             x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-            attn_out = self.attn(self.norm_1(x_in) * self.ln_scale_factor, freqs_cis, mask, **kwargs)
+            attn_out = self.attn(self.norm_1(x_in) * self.ln_scale_factor, freqs_cos, freqs_sin, mask, **kwargs)
             attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
             mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
             if self.parallel_residual:
@@ -3353,17 +3561,18 @@ class TransformerPreNormBlock(nn.Module):
             return self._add_laurel(x_out, x_in)
         if self.parallel_residual:
             x0 = x
-            x_out = x0 + self.attn(self.norm_1(x0), freqs_cis, mask, **kwargs) + self.mlp(self.norm_2(x0))
+            x_out = x0 + self.attn(self.norm_1(x0), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
             return self._add_laurel(x_out, x0)
         x_in = x
-        x = self.attn(self.norm_1(x), freqs_cis, mask, **kwargs) + x
+        x = self.attn(self.norm_1(x), freqs_cos, freqs_sin, mask, **kwargs) + x
         x = self.mlp(self.norm_2(x)) + x
         return self._add_laurel(x, x_in)
 
     def forward_attn_res(
         self,
         state: AttentionResidualState,
-        freqs_cis: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
         mask: Tensor | None = None,
         **kwargs,
     ) -> Tensor:
@@ -3372,7 +3581,7 @@ class TransformerPreNormBlock(nn.Module):
         if self.record_residual or self.parallel_residual or self.laurel is not None:
             raise RuntimeError("Attention Residuals are mutually exclusive with parallel residuals and LAuReL")
         attn_input = state.mix(self.attn_res_attn)
-        attn_out = self.attn(self.norm_1(attn_input), freqs_cis, mask, **kwargs)
+        attn_out = self.attn(self.norm_1(attn_input), freqs_cos, freqs_sin, mask, **kwargs)
         state.add(attn_out)
         mlp_input = state.mix(self.attn_res_mlp)
         state.add(self.mlp(self.norm_2(mlp_input)))
@@ -3584,6 +3793,7 @@ class GPT(nn.Module):
             if h.bigram_hash_buckets > 0
             else None
         )
+        self.smear = SmearGate(self.outer_dim)
         self.prelude = nn.ModuleList(
             TransformerPreNormBlock(
                 dim=self.outer_dim,
@@ -3741,16 +3951,12 @@ class GPT(nn.Module):
                 if h.use_value_embeddings and has_ve(i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block, self.total_effective_layers)
             }
         )
-        self.register_buffer(
-            'outer_freqs_cis',
-            precompute_freqs_cis(self.outer_rope_dims, self.block_size, h.rope_base),
-            persistent=False,
-        )
-        self.register_buffer(
-            'recurrent_freqs_cis',
-            precompute_freqs_cis(max(self.recurrent_layer_rope_dims), self.block_size, h.rope_base),
-            persistent=False,
-        )
+        outer_freqs_cos, outer_freqs_sin = precompute_freqs_cos_sin(self.outer_rope_dims, self.block_size, h.rope_base)
+        recurrent_freqs_cos, recurrent_freqs_sin = precompute_freqs_cos_sin(max(self.recurrent_layer_rope_dims), self.block_size, h.rope_base)
+        self.register_buffer('outer_freqs_cos', outer_freqs_cos, persistent=False)
+        self.register_buffer('outer_freqs_sin', outer_freqs_sin, persistent=False)
+        self.register_buffer('recurrent_freqs_cos', recurrent_freqs_cos, persistent=False)
+        self.register_buffer('recurrent_freqs_sin', recurrent_freqs_sin, persistent=False)
         self._init_weights()
         self.qat_linears = [module for module in self.modules() if isinstance(module, CastedLinear)]
         for module in self.qat_linears:
@@ -3827,7 +4033,8 @@ class GPT(nn.Module):
         self,
         blocks: nn.ModuleList,
         x: Tensor,
-        freqs_cis: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
         mask: Tensor | None,
         value_embeds: nn.ModuleDict,
         input_ids: Tensor,
@@ -3838,7 +4045,7 @@ class GPT(nn.Module):
         for i, block in enumerate(blocks):
             ve = self._embedding(value_embeds[str(i)], input_ids) if str(i) in value_embeds else None
             use_xsa = self._use_xsa_for_effective_layer(base_layer_id + i, total_depth)
-            x = block.forward_attn_res(state, freqs_cis, mask, ve=ve, use_xsa=use_xsa)
+            x = block.forward_attn_res(state, freqs_cos, freqs_sin, mask, ve=ve, use_xsa=use_xsa)
         return x
 
     def _use_xsa_for_effective_layer(self, layer_id: int, total_depth: int | None = None) -> bool:
@@ -3883,13 +4090,16 @@ class GPT(nn.Module):
     ) -> dict[str, Tensor | None]:
         qat_enabled = self._qat_active()
         seq_len = input_ids.shape[1]
-        outer_freqs_cis = self.outer_freqs_cis[:, :seq_len]
-        recurrent_freqs_cis = self.recurrent_freqs_cis[:, :seq_len]
+        outer_freqs_cos = self.outer_freqs_cos[:, :seq_len]
+        outer_freqs_sin = self.outer_freqs_sin[:, :seq_len]
+        recurrent_freqs_cos = self.recurrent_freqs_cos[:, :seq_len]
+        recurrent_freqs_sin = self.recurrent_freqs_sin[:, :seq_len]
 
         input_embeds = self._embedding(self.tok_emb, input_ids)
         if self.bigram_hash is not None:
             hash_qat_bits = self.qat_bits if self.training and qat_enabled else 0
             input_embeds = input_embeds + self.bigram_hash(input_ids, input_embeds, qat_bits=hash_qat_bits)
+        input_embeds = self.smear(input_embeds)
         if self.emb_scale != 1.0:
             input_embeds = input_embeds * self.emb_scale
         self._current_input_ids = input_ids
@@ -3899,7 +4109,8 @@ class GPT(nn.Module):
             x = self._forward_attn_res_stack(
                 self.prelude,
                 x,
-                outer_freqs_cis,
+                outer_freqs_cos,
+                outer_freqs_sin,
                 None,
                 self.prelude_value_embeds,
                 input_ids,
@@ -3908,12 +4119,18 @@ class GPT(nn.Module):
             for i, block in enumerate(self.prelude):
                 ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
                 use_xsa = self._use_xsa_for_effective_layer(i)
-                x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                x = block(x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
 
         if self.prelude_norm_layer is not None:
             x = self.prelude_norm_layer(x)
 
-        x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(x, recurrent_freqs_cis, None, num_steps_pair)
+        x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
+            x,
+            recurrent_freqs_cos,
+            recurrent_freqs_sin,
+            None,
+            num_steps_pair,
+        )
         x_rec_output = x
         x = self.project_out(x)
         x_rec_projected = x
@@ -3923,7 +4140,8 @@ class GPT(nn.Module):
             x = self._forward_attn_res_stack(
                 self.coda,
                 x,
-                outer_freqs_cis,
+                outer_freqs_cos,
+                outer_freqs_sin,
                 None,
                 self.coda_value_embeds,
                 input_ids,
@@ -3935,9 +4153,9 @@ class GPT(nn.Module):
                 ve = self._embedding(self.coda_value_embeds[str(i)], input_ids) if str(i) in self.coda_value_embeds else None
                 use_xsa = self._use_xsa_for_effective_layer(coda_layer_offset + i, total_depth_int)
                 if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(block, x, outer_freqs_cis, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                    x = self._checkpoint(block, x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
                 else:
-                    x = block(x, outer_freqs_cis, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                    x = block(x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
         if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
             x = self._checkpoint(self.final_norm, x)
         else:
@@ -3981,11 +4199,28 @@ class GPT(nn.Module):
             raise RuntimeError('forward expected a loss tensor')
         return loss
 
-    def update_recurrent_state(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor, x0: Tensor) -> Tensor:
-        return self.core_block_forward(x, input_embeds, freqs_cis, mask, step, total_steps, x0)
+    def update_recurrent_state(
+        self,
+        x: Tensor,
+        input_embeds: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None,
+        step: Tensor,
+        total_steps: Tensor,
+        x0: Tensor,
+    ) -> Tensor:
+        return self.core_block_forward(x, input_embeds, freqs_cos, freqs_sin, mask, step, total_steps, x0)
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
-    def iterate_forward(self, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, num_steps_pair: Tensor | None = None):
+    def iterate_forward(
+        self,
+        input_embeds: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None,
+        num_steps_pair: Tensor | None = None,
+    ):
         x = self.initialize_state(input_embeds)
         x0 = x
         xk = x
@@ -4028,21 +4263,21 @@ class GPT(nn.Module):
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
             for step in range(num_steps_with_grad_int):
                 xk = x
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
                 else:
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
         else:
             with torch.no_grad():
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     active_mask = step < n_per_sample
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
                     mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                     x = torch.where(mask_expanded, x_new, x)
             for step in range(num_steps_with_grad_int):
@@ -4050,16 +4285,27 @@ class GPT(nn.Module):
                 active_mask = step < k_per_sample
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
                 else:
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cis, mask, step_t, total_steps, x0)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
                 mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                 x = torch.where(mask_expanded, x_new, x)
 
         self._last_total_steps_int = total_steps_int
         return x, num_steps_no_grad, num_steps_with_grad, xk.detach()
 
-    def core_block_forward(self, x: Tensor, input_embeds: Tensor, freqs_cis: Tensor, mask: Tensor | None, step: Tensor, total_steps: Tensor, x0: Tensor, **kwargs) -> Tensor:
+    def core_block_forward(
+        self,
+        x: Tensor,
+        input_embeds: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        mask: Tensor | None,
+        step: Tensor,
+        total_steps: Tensor,
+        x0: Tensor,
+        **kwargs,
+    ) -> Tensor:
         x = self.adapter(x, input_embeds)
         input_ids = self._current_input_ids
         if input_ids is None:
@@ -4068,9 +4314,9 @@ class GPT(nn.Module):
             for layer_idx, block in enumerate(self.core_block):
                 ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
                 if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=False)
+                    x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
                 else:
-                    x = block(x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=False)
+                    x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
             return x
         step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
         total_steps_int = int(total_steps.item()) if isinstance(total_steps, torch.Tensor) else int(total_steps)
@@ -4080,7 +4326,8 @@ class GPT(nn.Module):
             return self._forward_attn_res_stack(
                 self.core_block,
                 x,
-                freqs_cis,
+                freqs_cos,
+                freqs_sin,
                 mask,
                 self.core_value_embeds,
                 input_ids,
@@ -4091,9 +4338,9 @@ class GPT(nn.Module):
             ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
             use_xsa = self._use_xsa_for_effective_layer(base_layer_id + layer_idx, total_depth_int)
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=use_xsa)
+                x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=use_xsa)
             else:
-                x = block(x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=use_xsa)
+                x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=use_xsa)
         return x
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
@@ -4703,6 +4950,7 @@ def main() -> None:
         f"attn_res_block_size:{args.attn_res_block_size}"
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
+    log0(f"rmsnorm:triton_enabled:{args.triton_rmsnorm} triton_available:{triton is not None}")
     laurel_params = sum(
         p.numel()
         for module in base_model.modules()

@@ -82,8 +82,38 @@ def _block(*, parallel_residual: bool, record_residual: bool) -> pg.TransformerP
     )
 
 
-def _freqs() -> torch.Tensor:
-    return pg.precompute_freqs_cis(8, 5, 10000.0)
+def _freqs() -> tuple[torch.Tensor, torch.Tensor]:
+    return pg.precompute_freqs_cos_sin(8, 5, 10000.0)
+
+
+def test_smear_gate_matches_shifted_blend():
+    smear = pg.SmearGate(3)
+    with torch.no_grad():
+        smear.gate.copy_(torch.tensor([-2.0, 0.0, 2.0]))
+    x = torch.randn(2, 4, 3)
+
+    actual = smear(x)
+
+    g = torch.sigmoid(smear.gate.to(dtype=x.dtype))[None, None, :]
+    x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+    expected = (1 - g) * x + g * x_prev
+    assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_smear_gate_is_wired_into_gpt_backward():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    model = pg.GPT(h)
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+
+    loss = model.forward_model(input_ids, labels=target_ids, num_steps_pair=torch.tensor([0, 1]))["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.smear.gate.grad is not None
+    assert torch.isfinite(model.smear.gate.grad).all()
 
 
 def test_xsa_efficient_matches_explicit_gqa_projection():
@@ -172,9 +202,10 @@ def test_xsa_does_not_change_state_dict_contract_or_iterate_return_shape():
     assert sum(p.numel() for p in baseline.parameters()) == sum(p.numel() for p in xsa_model.parameters())
 
     input_embeds = torch.randn(2, h_xsa.train_seq_len, h_xsa.model_dim)
-    freqs = xsa_model.recurrent_freqs_cis[:, : h_xsa.train_seq_len]
+    freqs_cos = xsa_model.recurrent_freqs_cos[:, : h_xsa.train_seq_len]
+    freqs_sin = xsa_model.recurrent_freqs_sin[:, : h_xsa.train_seq_len]
     xsa_model._current_input_ids = torch.randint(0, h_xsa.vocab_size, (2, h_xsa.train_seq_len))
-    out = xsa_model.iterate_forward(input_embeds, freqs, None, torch.tensor([0, 1]))
+    out = xsa_model.iterate_forward(input_embeds, freqs_cos, freqs_sin, None, torch.tensor([0, 1]))
 
     assert len(out) == 4
     assert xsa_model._last_total_steps_int == 1
@@ -208,11 +239,12 @@ def test_record_parallel_block_matches_reference_formula():
     x = torch.randn(2, 5, 16)
     x0 = torch.randn(2, 5, 16)
 
-    actual = block(x, _freqs(), x0=x0)
+    freqs_cos, freqs_sin = _freqs()
+    actual = block(x, freqs_cos, freqs_sin, x0=x0)
 
     mix = block.resid_mix.to(dtype=x.dtype)
     x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-    attn_out = block.attn(block.norm_1(x_in) * block.ln_scale_factor, _freqs())
+    attn_out = block.attn(block.norm_1(x_in) * block.ln_scale_factor, freqs_cos, freqs_sin)
     mlp_out = block.mlp(block.norm_2(x_in) * block.ln_scale_factor)
     expected = (
         x_in
@@ -228,11 +260,12 @@ def test_record_sequential_block_matches_reference_formula():
     x = torch.randn(2, 5, 16)
     x0 = torch.randn(2, 5, 16)
 
-    actual = block(x, _freqs(), x0=x0)
+    freqs_cos, freqs_sin = _freqs()
+    actual = block(x, freqs_cos, freqs_sin, x0=x0)
 
     mix = block.resid_mix.to(dtype=x.dtype)
     x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-    attn_out = block.attn(block.norm_1(x_in) * block.ln_scale_factor, _freqs())
+    attn_out = block.attn(block.norm_1(x_in) * block.ln_scale_factor, freqs_cos, freqs_sin)
     x_after_attn = x_in + block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
     expected = x_after_attn + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * block.mlp(
         block.norm_2(x_after_attn) * block.ln_scale_factor
