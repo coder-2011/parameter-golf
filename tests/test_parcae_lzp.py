@@ -404,6 +404,85 @@ def test_eval_val_sliding_lzp_integration_collects_prefix_once_and_logs_metrics(
     assert any("context_mix_time:" in line and "subset_tokens:24" in line for line in logs)
 
 
+def test_eval_val_sliding_allows_sparse_stride_larger_than_window():
+    class UniformModel:
+        def __init__(self, vocab_size: int):
+            self.vocab_size = vocab_size
+            self.training = True
+
+        def eval(self):
+            self.training = False
+
+        def train(self):
+            self.training = True
+
+        def forward_logits(self, input_ids):
+            shape = (*input_ids.shape, self.vocab_size)
+            return torch.zeros(shape, dtype=torch.float32, device=input_ids.device)
+
+    args = SimpleNamespace(
+        train_seq_len=8,
+        eval_stride=16,
+        sliding_compile_logits=False,
+        ppm_enabled=False,
+        ppm_subset_tokens=0,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=False,
+        lzp_subset_tokens=0,
+        lzp_orders_str="3",
+        lzp_table_bits=8,
+        lzp_alpha_min=0.0,
+        lzp_alpha_max=0.0,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+        ngram_eval_order=0,
+        val_byte_count_override=0,
+    )
+    val_tokens = torch.arange(40, dtype=torch.int64) % 16
+    base_bytes_lut = torch.ones(256, dtype=torch.int16)
+    has_space_lut = torch.zeros(256, dtype=torch.bool)
+    boundary_lut = torch.zeros(256, dtype=torch.bool)
+    token_bytes = [bytes([i]) for i in range(256)]
+
+    context_size, chunk_windows = pg._ttt_chunk_windows(
+        total_tokens=val_tokens.numel() - 1,
+        seq_len=args.train_seq_len,
+        stride=args.eval_stride,
+        chunk_tokens=val_tokens.numel(),
+    )
+
+    assert context_size == 0
+    assert chunk_windows == [[0, 16, 32]]
+
+    loss, bpb, context_result, ngram_result = pg.eval_val_sliding(
+        args,
+        UniformModel(256),
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_space_lut,
+        is_boundary_token_lut=boundary_lut,
+        token_bytes_lut=token_bytes,
+        batch_seqs=2,
+    )
+
+    assert math.isclose(loss, math.log(256.0), rel_tol=1e-6)
+    assert math.isclose(bpb, 8.0, rel_tol=1e-6)
+    assert context_result is None
+    assert ngram_result is None
+
+
 if __name__ == "__main__":
     for test_name, test_fn in list(globals().items()):
         if test_name.startswith("test_"):

@@ -634,7 +634,7 @@ def _token_byte_sum(
 
 
 def _ttt_chunk_windows(total_tokens: int, seq_len: int, stride: int, chunk_tokens: int) -> tuple[int, list[list[int]]]:
-    context_size = seq_len - stride
+    context_size = max(seq_len - stride, 0)
     chunk_windows = [[] for _ in range((total_tokens + chunk_tokens - 1) // chunk_tokens)]
     for ws in range(0, total_tokens, stride):
         if ws + context_size < total_tokens:
@@ -4633,8 +4633,8 @@ def main() -> None:
             raise ValueError("Attention Residuals require RESIDUAL_MODE=sequential")
         if args.gradient_checkpointing:
             raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
-    if not (0 < args.eval_stride <= args.train_seq_len):
-        raise ValueError(f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got {args.eval_stride}")
+    if args.eval_stride <= 0:
+        raise ValueError(f"EVAL_STRIDE must be positive, got {args.eval_stride}")
     if args.ppm_enabled and not args.sliding_window_enabled:
         raise ValueError("PPM_ENABLED=1 requires SLIDING_WINDOW_ENABLED=1")
     if args.ppm_order < 0 or args.ppm_token_order < 0:
