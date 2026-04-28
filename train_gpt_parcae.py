@@ -697,6 +697,15 @@ def _rolling_context_hash(prefix: np.ndarray, powers: np.ndarray, end: int, orde
     return np.uint64((int(prefix[end]) - ((int(prefix[end - order]) * int(powers[order])) & mask64)) & mask64)
 
 
+def _lzp_context_matches(byte_stream: list[int], pred_pos: int, cur_pos: int, order: int) -> bool:
+    if pred_pos < order or pred_pos >= cur_pos:
+        return False
+    for i in range(order):
+        if byte_stream[pred_pos - order + i] != byte_stream[cur_pos - order + i]:
+            return False
+    return True
+
+
 def _ppm_mixture_bpb(
     target_ids: np.ndarray,
     prev_ids: np.ndarray,
@@ -1014,17 +1023,12 @@ def _context_mixture_bpb(
         order: np.full(lzp_table_size, -1, dtype=np.int32)
         for order in lzp_order_list
     }
-    lzp_confirm_tables = {
-        order: np.zeros(lzp_table_size, dtype=np.uint64)
-        for order in lzp_order_list
-    }
     lzp_streaks = {order: 0 for order in lzp_order_list}
     if lzp_order_list:
         max_lzp_order = max(lzp_order_list)
         lzp_prefix1, lzp_pow1 = _rolling_hash_prefix(byte_stream, 257, max_lzp_order)
-        lzp_prefix2, lzp_pow2 = _rolling_hash_prefix(byte_stream, 65537, max_lzp_order)
     else:
-        lzp_prefix1 = lzp_pow1 = lzp_prefix2 = lzp_pow2 = None
+        lzp_prefix1 = lzp_pow1 = None
 
     ppm_counts: dict[bytes, dict[int, int]] = {}
     ppm_window = bytearray()
@@ -1081,10 +1085,9 @@ def _context_mixture_bpb(
                 pred = None
                 if t >= order:
                     h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
-                    h2 = _rolling_context_hash(lzp_prefix2, lzp_pow2, t, order)
                     slot = int(h1) & lzp_table_mask
                     pred_pos = int(lzp_pos_tables[order][slot])
-                    if pred_pos >= 0 and lzp_confirm_tables[order][slot] == h2 and pred_pos < total_bytes:
+                    if _lzp_context_matches(byte_stream, pred_pos, t, order):
                         pred = byte_stream[pred_pos]
                         votes, streak, best_order = pred_stats.get(pred, (0, 0, 0))
                         pred_stats[pred] = (
@@ -1165,10 +1168,8 @@ def _context_mixture_bpb(
                 lzp_streaks[order] = 0
             if t >= order:
                 h1 = _rolling_context_hash(lzp_prefix1, lzp_pow1, t, order)
-                h2 = _rolling_context_hash(lzp_prefix2, lzp_pow2, t, order)
                 slot = int(h1) & lzp_table_mask
                 lzp_pos_tables[order][slot] = t
-                lzp_confirm_tables[order][slot] = h2
 
     result = {
         "bytes": float(total_bytes),
