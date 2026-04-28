@@ -30,7 +30,6 @@ def _tiny_h() -> pg.Hyperparameters:
     h.sampling_scheme = "fixed"
     h.curriculum_target = "forward"
     h.injection_type = "diagonal"
-    h.injection_swiglu_scale = 0.0
     h.residual_mode = "sequential"
     h.parallel_residual_scope = "none"
     h.parallel_residual_start = -1
