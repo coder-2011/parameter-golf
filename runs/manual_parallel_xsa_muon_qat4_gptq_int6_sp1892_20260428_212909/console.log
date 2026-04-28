@@ -1,0 +1,136 @@
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.9.1+cu130).
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] Graph break from `Tensor.item()`, consider setting:
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] or:
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] to include these operations in the captured graph.
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] 
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] Graph break: from user code at:
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4262, in update_recurrent_state
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]     return self.core_block_forward(x, input_embeds, freqs_cos, freqs_sin, mask, step, total_steps, x0)
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4381, in core_block_forward
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0]     step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] 
+W0428 21:30:26.506000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1048] [3/0] 
+W0428 21:32:18.919000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1358] [16/8] torch._dynamo hit config.recompile_limit (8)
+W0428 21:32:18.919000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1358] [16/8]    function: 'torch_dynamo_resume_in_forward_at_110' (/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torchao/quantization/qat/linear.py:110)
+W0428 21:32:18.919000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1358] [16/8]    last reason: 16/7: tensor '___stack0' dtype mismatch. expected BFloat16, actual Float
+W0428 21:32:18.919000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1358] [16/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0428 21:32:18.919000 437161 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1358] [16/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+logs/manual_parallel_xsa_muon_qat4_gptq_int6_sp1892_20260428_212909.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0
+train_loader:dataset:fineweb10B_sp1892 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_*.bin tokens:53271040
+model_params:6535617
+world_size:1 grad_accum_steps:8
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:4 num_kv_heads:2 qkv_projection:packed
+mlp:outer:BaseMLP recurrent:BaseMLP liger_geglu_available:False
+bigram_hash:buckets:8192 dim:128 heads:2 gate:True scale_init:0.05
+parcae:prelude:1 core:2 coda:1 recurrent_dim:256 recurrence:2/1 iteration:per-batch sampling:fixed injection:diagonal residual_mode:parallel parallel_residual_scope:core parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:delayed parallel_residual_record_controls:False parallel_residual_tied_norm:True parallel_residual_in_fp32:True attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_4 active_effective_layers:[2, 3, 4, 5]
+liger_ce:enabled:False real_liger_available:False
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 poe_experts:3 poe_extra_heads:2 poe_head_lr:0.002 matrix_lr:0.04 scalar_lr:0.04 muon_steps:5 muon_wd:0.095 muon_row_normalize:True
+qat:bits:4 start_step:500 backend:torchao group_size:32 activation_bits:8 linear:True tied_output:True export_bits:6
+gptq:enabled:True calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:16384 train_seq_len:512 iterations:1000000 warmup_steps:500 max_wallclock_seconds:300.000
+weight_average:ema_enabled:True ema_decay:0.997 ema_update_every:4 swa_enabled:False swa_start_frac:0.2 swa_every:50 priority:ema
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+gptq:reserved_wallclock:12.000s train_cap:288000ms
+warmup_step:10/501 train_step:9
+warmup_step:20/501 train_step:19
+warmup_step:30/501 train_step:29
+warmup_step:40/501 train_step:39
+warmup_step:50/501 train_step:49
+warmup_step:60/501 train_step:59
+warmup_step:70/501 train_step:69
+warmup_step:80/501 train_step:79
+warmup_step:90/501 train_step:89
+warmup_step:100/501 train_step:99
+warmup_step:110/501 train_step:109
+warmup_step:120/501 train_step:119
+warmup_step:130/501 train_step:129
+warmup_step:140/501 train_step:139
+warmup_step:150/501 train_step:149
+warmup_step:160/501 train_step:159
+warmup_step:170/501 train_step:169
+warmup_step:180/501 train_step:179
+warmup_step:190/501 train_step:189
+warmup_step:200/501 train_step:199
+warmup_step:210/501 train_step:209
+warmup_step:220/501 train_step:219
+warmup_step:230/501 train_step:229
+warmup_step:240/501 train_step:239
+warmup_step:250/501 train_step:249
+warmup_step:260/501 train_step:259
+warmup_step:270/501 train_step:269
+warmup_step:280/501 train_step:279
+warmup_step:290/501 train_step:289
+warmup_step:300/501 train_step:299
+warmup_step:310/501 train_step:309
+warmup_step:320/501 train_step:319
+warmup_step:330/501 train_step:329
+warmup_step:340/501 train_step:339
+warmup_step:350/501 train_step:349
+warmup_step:360/501 train_step:359
+warmup_step:370/501 train_step:369
+warmup_step:380/501 train_step:379
+warmup_step:390/501 train_step:389
+warmup_step:400/501 train_step:399
+warmup_step:410/501 train_step:409
+warmup_step:420/501 train_step:419
+warmup_step:430/501 train_step:429
+warmup_step:440/501 train_step:439
+warmup_step:450/501 train_step:449
+warmup_step:460/501 train_step:459
+warmup_step:470/501 train_step:469
+warmup_step:480/501 train_step:479
+warmup_step:490/501 train_step:489
+warmup_step:500/501 train_step:499
+Traceback (most recent call last):
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5486, in <module>
+    main()
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5106, in main
+    warmup_loss = model(x, y)
+                  ^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 414, in __call__
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 845, in compile_wrapper
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/compile_fx.py", line 990, in _compile_fx_inner
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/compile_fx.py", line 974, in _compile_fx_inner
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/compile_fx.py", line 1695, in fx_codegen_and_compile
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/compile_fx.py", line 1505, in codegen_and_compile
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/graph.py", line 2319, in compile_to_module
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/graph.py", line 2329, in _compile_to_module
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/graph.py", line 2397, in _compile_to_module_lines
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/codecache.py", line 3548, in load_by_key_path
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/compile_tasks.py", line 33, in _reload_python_module
+  File "/tmp/torchinductor_root/vh/cvhhbnng55fpqwb7yu7rdghaltttx6ly4ygslsrpmbwwjwicgirl.py", line 119, in <module>
+    async_compile.wait(globals())
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/async_compile.py", line 631, in wait
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/async_compile.py", line 651, in _wait_futures
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/codecache.py", line 4289, in result
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/async_compile.py", line 461, in get_result
+torch._inductor.exc.InductorError: SubprocException: An exception occurred in a subprocess:
+
+Name=triton_poi_fused__to_copy_add_clamp_ge_le_logical_and_mul_reciprocal_round_sub_view_0
+Traceback (most recent call last):
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/compile_worker/subproc_pool.py", line 397, in do_job
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/compile_tasks.py", line 66, in _worker_compile_triton
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 439, in precompile
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 470, in _precompile_worker
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 778, in _precompile_config
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/compiler.py", line 320, in compile
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/backends/nvidia/compiler.py", line 518, in <lambda>
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/backends/nvidia/compiler.py", line 393, in make_llir
+ValueError: Failed to parse library at /workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/backends/nvidia/lib/libdevice.10.bc
+
+
+Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS="+dynamo"
+
