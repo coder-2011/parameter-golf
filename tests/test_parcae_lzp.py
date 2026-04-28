@@ -29,6 +29,49 @@ def test_parse_lzp_orders_deduplicates_and_prefers_longer_first():
     assert pg._parse_lzp_orders("4,8,4,6") == [8, 6, 4]
 
 
+def test_lzp_context_match_uses_prediction_position_as_context_end():
+    byte_stream = list(b"abcXabcY")
+
+    assert pg._lzp_context_matches(byte_stream, pred_pos=3, cur_pos=7, order=3)
+    assert not pg._lzp_context_matches(byte_stream, pred_pos=4, cur_pos=7, order=3)
+    assert not pg._lzp_context_matches(byte_stream, pred_pos=7, cur_pos=7, order=3)
+
+
+def test_lzp_rejects_hash_slot_collision_when_context_bytes_differ():
+    token_bytes, has_space, is_boundary = _byte_token_luts()
+    target, prev, nll = _ids_from_bytes(bytes([0, 0, 1, 2, 2, 7]))
+
+    result = pg._context_mixture_bpb(
+        target,
+        prev,
+        nll,
+        token_bytes,
+        has_space,
+        is_boundary,
+        ppm_enabled=False,
+        ppm_order=0,
+        ppm_lambda_hi=1.0,
+        ppm_lambda_lo=1.0,
+        ppm_conf_threshold=1.0,
+        ppm_token_order=0,
+        ppm_use_meta_mix=False,
+        ppm_meta_alpha=0.995,
+        ppm_meta_eta=2.0,
+        ppm_meta_warmup_bytes=0,
+        lzp_enabled=True,
+        lzp_orders="2",
+        lzp_table_bits=1,
+        lzp_alpha_min=1.0,
+        lzp_alpha_max=1.0,
+        lzp_min_streak=0,
+        lzp_max_streak=0,
+        lzp_hit_prob=0.99,
+    )
+
+    assert result["lzp_coverage"] == 0.0
+    assert math.isclose(result["lzp_only_bpb"], 8.0)
+
+
 def test_lzp_improves_repeated_byte_stream_against_uniform_neural_baseline():
     token_bytes, has_space, is_boundary = _byte_token_luts()
     target, prev, nll = _ids_from_bytes((b"abcXYZ" * 12) + (b"tail" * 4))
