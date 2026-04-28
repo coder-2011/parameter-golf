@@ -9,12 +9,44 @@ from __future__ import annotations
 
 import dropout_layer_norm
 import torch
+import torch.nn.functional as F
 from torch.nn import init
+
+
+_SUPPORTED_RMS_TYPES = (torch.float16, torch.bfloat16, torch.float32)
+_UNSUPPORTED_TYPES = ("char", "float8", "fp8", "int8", "uint8")
 
 
 def maybe_align(x: torch.Tensor, alignment_in_bytes: int = 16) -> torch.Tensor:
     """Assume that x already has last dim divisible by alignment_in_bytes."""
     return x if x.data_ptr() % alignment_in_bytes == 0 else x.clone()
+
+
+def _supports_dropout_layer_norm_dtype(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return x.is_cuda and x.dtype in _SUPPORTED_RMS_TYPES and weight.dtype in _SUPPORTED_RMS_TYPES
+
+
+def supports_dropout_add_layer_norm_dtype(x_dtype: torch.dtype, weight_dtype: torch.dtype) -> bool:
+    """Return True when the fused extension path can be used."""
+    return x_dtype in _SUPPORTED_RMS_TYPES and weight_dtype in _SUPPORTED_RMS_TYPES
+
+
+def is_supported_dtype_name(x_dtype: str) -> bool:
+    dt = x_dtype.lower().replace("torch.", "")
+    return dt in {"float16", "bfloat16", "float32", "f16", "bf16", "f32"}
+
+
+def supported_dropout_layer_norm_dtypes() -> dict[str, bool]:
+    """Report commonly used candidate dtypes for fused RMS/LayerNorm."""
+    return {
+        "float16": supports_dropout_add_layer_norm_dtype(torch.float16, torch.float16),
+        "bfloat16": supports_dropout_add_layer_norm_dtype(torch.bfloat16, torch.bfloat16),
+        "float32": supports_dropout_add_layer_norm_dtype(torch.float32, torch.float32),
+        "float8_e4m3fn": False,
+        "float8_e5m2": False,
+        "int8": False,
+        "int6": False,
+    }
 
 
 def _dropout_add_layer_norm_forward(
@@ -575,10 +607,17 @@ class DropoutAddLayerNormParallelResidualFn(torch.autograd.Function):
 
 
 def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, epsilon: float) -> torch.Tensor:
+    if not _supports_dropout_layer_norm_dtype(x, weight) or (bias is not None and bias.dtype not in _SUPPORTED_RMS_TYPES):
+        x_fp = x.to(dtype=weight.dtype)
+        bias_arg = None if bias is None else bias.to(dtype=weight.dtype)
+        return F.layer_norm(x_fp, x_fp.shape[-1:], weight=weight.to(dtype=weight.dtype), bias=bias_arg, eps=epsilon)
     return DropoutAddLayerNormFn.apply(x, None, weight, bias, None, None, 0.0, epsilon, False)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+    if not _supports_dropout_layer_norm_dtype(x, weight):
+        x_fp = x.to(dtype=weight.dtype)
+        return F.rms_norm(x_fp, x_fp.shape[-1:], weight=weight.to(dtype=weight.dtype), eps=epsilon)
     return DropoutAddLayerNormFn.apply(x, None, weight, None, None, None, 0.0, epsilon, False, False, True)
 
 
@@ -595,6 +634,8 @@ def dropout_add_layer_norm(
     residual_in_fp32: bool = False,
     return_dropout_mask: bool = False,
 ):
+    if not _supports_dropout_layer_norm_dtype(x0, weight):
+        raise TypeError(f"dropout_add_layer_norm does not support dtype={x0.dtype}; use layer_norm fallback path")
     return DropoutAddLayerNormFn.apply(
         x0,
         residual,
@@ -624,6 +665,8 @@ def dropout_add_rms_norm(
     residual_in_fp32: bool = False,
     return_dropout_mask: bool = False,
 ):
+    if not _supports_dropout_layer_norm_dtype(x0, weight):
+        raise TypeError(f"dropout_add_rms_norm does not support dtype={x0.dtype}; use rms_norm fallback path")
     return DropoutAddLayerNormFn.apply(
         x0,
         residual,
