@@ -4064,6 +4064,14 @@ class GPT(nn.Module):
         input_ids = self._current_input_ids
         if input_ids is None:
             raise RuntimeError('current input ids are not set')
+        if self.attn_res_mode == "none" and self.xsa_last_n <= 0:
+            for layer_idx, block in enumerate(self.core_block):
+                ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
+                if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
+                    x = self._checkpoint(block, x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=False)
+                else:
+                    x = block(x, freqs_cis, mask, x0=x0, ve=ve, use_xsa=False)
+            return x
         step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
         total_steps_int = int(total_steps.item()) if isinstance(total_steps, torch.Tensor) else int(total_steps)
         total_depth_int, _ = self._depth_and_coda_offset(total_steps_int)
