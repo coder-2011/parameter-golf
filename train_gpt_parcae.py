@@ -36,7 +36,95 @@ except Exception:
     triton = None
     tl = None
 
-USE_TRITON_RMSNORM = bool(int(os.environ.get("TRITON_RMSNORM", "0")))
+USE_TRITON_RMSNORM = False
+
+if triton is not None:
+    @triton.jit
+    def _liger_ce_forward_kernel(
+        logits_ptr,
+        target_ptr,
+        loss_ptr,
+        grad_ptr,
+        inv_n,
+        n_cols: tl.constexpr,
+        ignore_index: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        y = tl.load(target_ptr + row)
+        row_start = row * n_cols
+        x = tl.load(logits_ptr + row_start + offsets, mask=mask, other=-float("inf")).to(tl.float32)
+
+        if y == ignore_index:
+            tl.store(loss_ptr + row, 0.0)
+            tl.store(grad_ptr + row_start + offsets, 0.0, mask=mask)
+            return
+
+        row_max = tl.max(x, axis=0)
+        exp_x = tl.exp(x - row_max)
+        denom = tl.sum(exp_x, axis=0)
+        y_logit = tl.load(logits_ptr + row_start + y).to(tl.float32)
+        loss = (row_max + tl.log(denom) - y_logit) * inv_n
+        grad = (exp_x / denom - tl.where(offsets == y, 1.0, 0.0)) * inv_n
+
+        tl.store(loss_ptr + row, loss)
+        tl.store(grad_ptr + row_start + offsets, grad, mask=mask)
+else:
+    _liger_ce_forward_kernel = None
+
+
+class LigerCrossEntropyFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits: Tensor, target: Tensor, ignore_index: int, n_non_ignore: int) -> Tensor:
+        flat_logits = logits.reshape(-1, logits.size(-1)).contiguous()
+        flat_target = target.reshape(-1).contiguous()
+
+        n_rows, n_cols = flat_logits.shape
+        block_size = triton.next_power_of_2(n_cols)
+        loss_buf = torch.empty(n_rows, device=flat_logits.device, dtype=torch.float32)
+        grad = torch.empty_like(flat_logits)
+        _liger_ce_forward_kernel[(n_rows,)](
+            flat_logits,
+            flat_target,
+            loss_buf,
+            grad,
+            inv_n=1.0 / n_non_ignore,
+            n_cols=n_cols,
+            ignore_index=ignore_index,
+            BLOCK_SIZE=block_size,
+            num_warps=8,
+        )
+        ctx.save_for_backward(grad)
+        ctx.logits_shape = logits.shape
+        return loss_buf.sum()
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, None, None, None]:
+        (grad,) = ctx.saved_tensors
+        return (grad * grad_output).reshape(ctx.logits_shape), None, None, None
+
+
+def liger_cross_entropy(
+    logits: Tensor,
+    target: Tensor,
+    ignore_index: int = -100,
+    assume_no_ignore: bool = False,
+) -> Tensor:
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_target = target.reshape(-1)
+    if (
+        _liger_ce_forward_kernel is None
+        or flat_logits.device.type != "cuda"
+        or not torch.is_floating_point(flat_logits)
+        or triton.next_power_of_2(flat_logits.size(-1)) > 65536
+    ):
+        return F.cross_entropy(flat_logits.float(), flat_target, ignore_index=ignore_index)
+    n_non_ignore = flat_target.numel() if assume_no_ignore else int((flat_target != ignore_index).sum().item())
+    if n_non_ignore == 0:
+        return F.cross_entropy(flat_logits.float(), flat_target, ignore_index=ignore_index)
+    return LigerCrossEntropyFunction.apply(logits, target, ignore_index, n_non_ignore)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -110,7 +198,7 @@ class Hyperparameters:
     ngram_cubric_cadence = int(os.environ.get("NGRAM_CUBRIC_CADENCE", os.environ.get("CUBRIC_CADENCE", 0)))
     ngram_chunk_tokens = int(os.environ.get("NGRAM_CHUNK_TOKENS", 1_048_576))
     ngram_batch_seqs = int(os.environ.get("NGRAM_BATCH_SEQS", 128))
-    ngram_mix_mode = os.environ.get("NGRAM_MIX_MODE", "linear").strip().lower()
+    ngram_mix_mode = os.environ.get("NGRAM_MIX_MODE", "expert").strip().lower()
     ngram_expert_topk = int(os.environ.get("NGRAM_EXPERT_TOPK", 8))
     ngram_expert_boost_scale = float(os.environ.get("NGRAM_EXPERT_BOOST_SCALE", 0.25))
     ngram_expert_max_boost = float(os.environ.get("NGRAM_EXPERT_MAX_BOOST", 12.0))
@@ -199,7 +287,7 @@ class Hyperparameters:
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
-    triton_rmsnorm = bool(int(os.environ.get("TRITON_RMSNORM", "0")))
+    triton_rmsnorm = USE_TRITON_RMSNORM
     gradient_checkpointing = bool(int(os.environ.get("GRADIENT_CHECKPOINTING", "0")))
     activation_checkpoint_impl = os.environ.get("ACTIVATION_CHECKPOINT_IMPL", "none")
     lockstep_n = bool(int(os.environ.get("LOCKSTEP_N", "0")))
@@ -207,6 +295,7 @@ class Hyperparameters:
     monitoring = bool(int(os.environ.get("MONITORING", "0")))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "0")))
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
+    liger_ce = bool(int(os.environ.get("LIGER_CE", "0")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
     coda_moe_num_experts = int(os.environ.get("CODA_MOE_NUM_EXPERTS", 0))
@@ -1265,16 +1354,15 @@ def _ngram_bulk_update(
     start: int,
     end: int,
     ctx_tables: dict[int, np.ndarray],
-    full_tables: dict[int, np.ndarray],
     min_order: int,
     max_order: int,
     primes: np.ndarray,
     mask: np.uint64,
-    candidate_ids: dict[int, np.ndarray] | None = None,
-    candidate_counts: dict[int, np.ndarray] | None = None,
-    vocab_size: int | None = None,
+    candidate_ids: dict[int, np.ndarray],
+    candidate_counts: dict[int, np.ndarray],
+    vocab_size: int,
 ) -> None:
-    """Update hashed n-gram count tables from a contiguous token range."""
+    """Update hashed context counts and sparse top-k token candidates."""
     t = token_ids[start:end].astype(np.uint64, copy=False)
     n = len(t)
     for order in range(min_order, max_order + 1):
@@ -1287,17 +1375,14 @@ def _ngram_bulk_update(
             ctx_hash ^= t[k:ngram_count + k] * primes[k % len(primes)]
         ctx_key = (ctx_hash & mask).astype(np.int64)
         tgt = t[ctx_width:]
-        full_key = ((ctx_hash ^ (tgt * primes[ctx_width % len(primes)])) & mask).astype(np.int64)
         ctx_tables[order] += np.bincount(ctx_key, minlength=len(ctx_tables[order])).astype(np.uint32)
-        full_tables[order] += np.bincount(full_key, minlength=len(full_tables[order])).astype(np.uint32)
-        if candidate_ids is not None and candidate_counts is not None and vocab_size is not None:
-            _ngram_candidate_bulk_update(
-                ctx_key,
-                tgt.astype(np.int64),
-                candidate_ids[order],
-                candidate_counts[order],
-                vocab_size,
-            )
+        _ngram_candidate_bulk_update(
+            ctx_key,
+            tgt.astype(np.int64),
+            candidate_ids[order],
+            candidate_counts[order],
+            vocab_size,
+        )
 
 
 def _ngram_candidate_bulk_update(
@@ -1398,6 +1483,9 @@ def eval_val_sliding_hashed_ngram(
     log_fn=None,
 ) -> tuple[float, float, float]:
     """Sliding validation mixed with a causal chunked hashed n-gram predictor."""
+    mix_mode = args.ngram_mix_mode
+    if mix_mode != "expert":
+        raise ValueError(f"NGRAM_MIX_MODE only supports expert, got {mix_mode!r}")
     seq_len = args.train_seq_len
     stride = args.eval_stride
     total_tokens = val_tokens.numel() - 1
@@ -1409,8 +1497,6 @@ def eval_val_sliding_hashed_ngram(
     ent_center = args.ngram_eval_entropy_center
     ent_scale = args.ngram_eval_entropy_scale
     chunk_tokens = int(args.ngram_chunk_tokens)
-    mix_mode = args.ngram_mix_mode
-    use_sparse_expert = mix_mode == "expert"
 
     context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, stride, chunk_tokens)
     all_window_starts = [ws for windows in chunk_windows for ws in windows]
@@ -1433,18 +1519,14 @@ def eval_val_sliding_hashed_ngram(
     buckets = int(args.ngram_eval_buckets)
     candidate_vocab_size = int(getattr(args, "vocab_size", int(val_np.max()) + 1 if val_np.size else 1))
     ctx_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
-    full_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
-    candidate_ids = None
-    candidate_counts = None
-    if use_sparse_expert:
-        candidate_ids = {
-            n: np.full((buckets, args.ngram_expert_topk), -1, dtype=np.int32)
-            for n in range(min_order, max_order + 1)
-        }
-        candidate_counts = {
-            n: np.zeros((buckets, args.ngram_expert_topk), dtype=np.uint32)
-            for n in range(min_order, max_order + 1)
-        }
+    candidate_ids = {
+        n: np.full((buckets, args.ngram_expert_topk), -1, dtype=np.int32)
+        for n in range(min_order, max_order + 1)
+    }
+    candidate_counts = {
+        n: np.zeros((buckets, args.ngram_expert_topk), dtype=np.uint32)
+        for n in range(min_order, max_order + 1)
+    }
     mask = np.uint64(buckets - 1)
     primes = np.array(
         [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
@@ -1452,20 +1534,7 @@ def eval_val_sliding_hashed_ngram(
         dtype=np.uint64,
     )
 
-    num_ent_bins = 3
-    num_cnt_bins = 3
     ent_edges = np.array([ent_center - 1.0, ent_center + 1.0], dtype=np.float64)
-    cnt_edges = np.array([5.0, 50.0], dtype=np.float64)
-    total_cells = num_ent_bins * num_cnt_bins
-    cubric_enabled = args.ngram_cubric_cadence > 0 and fixed_order_mults is None
-    cubric_steps = 0
-    if cubric_enabled:
-        warm = {2: 0.45, 3: 0.30, 4: 0.45, 5: 1.88, 6: 2.00, 7: 2.00, 8: 2.00, 9: 2.00}
-        cubric_alpha_mult = {
-            n: [warm.get(n, 1.0)] * total_cells for n in range(min_order, max_order + 1)
-        }
-        cubric_hits = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
-        cubric_beats = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
 
     logits_fn = (
         torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
@@ -1521,9 +1590,9 @@ def eval_val_sliding_hashed_ngram(
                     seg_nll = nll[i, s:wlen].to(torch.float64).cpu().numpy()
                     seg_model_p = np.exp(-seg_nll)
                     log_probs_np = None
-                    if adaptive or use_sparse_expert:
+                    if adaptive or mix_mode == "expert":
                         log_probs = F.log_softmax(logits_f[i, s:wlen], dim=-1)
-                        if use_sparse_expert:
+                        if mix_mode == "expert":
                             log_probs_np = log_probs.cpu().numpy()
                         if adaptive:
                             probs = log_probs.exp()
@@ -1541,12 +1610,10 @@ def eval_val_sliding_hashed_ngram(
                         ent_bins = np.ones(seg_len, dtype=np.int32)
 
                     global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
-                    p_ng = np.zeros(seg_len, dtype=np.float64)
                     ng_matched = np.zeros(seg_len, dtype=np.bool_)
                     ng_order = np.zeros(seg_len, dtype=np.int32)
                     ng_ctx_key = np.zeros(seg_len, dtype=np.int64)
                     ng_ctx_count = np.zeros(seg_len, dtype=np.float64)
-                    tgt_np = val_np[global_j].astype(np.uint64)
 
                     for n in range(max_order, min_order - 1, -1):
                         ctx_width = n - 1
@@ -1560,14 +1627,10 @@ def eval_val_sliding_hashed_ngram(
                             tok = val_np[jv - (ctx_width - k)].astype(np.uint64)
                             ctx_hash ^= tok * primes[k % len(primes)]
                         ctx_key = (ctx_hash & mask).astype(np.int64)
-                        full_key = ((ctx_hash ^ (tgt_np[valid_idx] * primes[ctx_width % len(primes)])) & mask).astype(np.int64)
                         ctx_counts = ctx_tables[n][ctx_key].astype(np.float64)
-                        full_counts = full_tables[n][full_key].astype(np.float64)
                         has_data = ctx_counts >= float(args.ngram_eval_min_count)
                         if has_data.any():
                             hit_idx = valid_idx[has_data]
-                            p = np.minimum(full_counts, ctx_counts) / np.maximum(ctx_counts, 1.0)
-                            p_ng[hit_idx] = np.clip(p[has_data], 0.0, 1.0)
                             ng_matched[hit_idx] = True
                             ng_order[hit_idx] = n
                             ng_ctx_key[hit_idx] = ctx_key[has_data]
@@ -1586,46 +1649,25 @@ def eval_val_sliding_hashed_ngram(
                             mult_idx = np.clip(ng_order[matched_idx] - min_order, 0, len(fixed_order_mults) - 1)
                             a *= fixed_order_mults[mult_idx]
                             np.clip(a, 0.0, 0.95, out=a)
-                        elif cubric_enabled:
-                            a = per_token_alpha[matched_idx].copy()
-                            matched_ent_bins = ent_bins[matched_idx]
-                            matched_cnt_bins = np.digitize(ng_ctx_count[matched_idx], cnt_edges).astype(np.int32)
-                            for n in range(min_order, max_order + 1):
-                                order_mask = ng_order[matched_idx] == n
-                                if not order_mask.any():
-                                    continue
-                                for eb in range(num_ent_bins):
-                                    for cb in range(num_cnt_bins):
-                                        cell = eb * num_cnt_bins + cb
-                                        cell_mask = order_mask & (matched_ent_bins == eb) & (matched_cnt_bins == cb)
-                                        if cell_mask.any():
-                                            idx = matched_idx[cell_mask]
-                                            cubric_hits[n][cell] += int(cell_mask.sum())
-                                            cubric_beats[n][cell] += int((p_ng[idx] > seg_model_p[idx]).sum())
-                                            a[cell_mask] *= cubric_alpha_mult[n][cell]
-                            np.clip(a, 0.0, 0.95, out=a)
                         else:
                             a = per_token_alpha[matched_idx]
-                        if use_sparse_expert:
-                            contexts_used, target_hits = _ngram_apply_sparse_expert(
-                                seg_model_p=seg_model_p,
-                                log_probs_np=log_probs_np,
-                                target_ids=y[i, s:wlen].detach().cpu().numpy().astype(np.int64),
-                                matched_idx=matched_idx,
-                                alpha=a,
-                                ng_order=ng_order,
-                                ng_ctx_key=ng_ctx_key,
-                                ng_ctx_count=ng_ctx_count,
-                                candidate_ids=candidate_ids,
-                                candidate_counts=candidate_counts,
-                                vocab_size=vocab_size,
-                                boost_scale=args.ngram_expert_boost_scale,
-                                max_boost=args.ngram_expert_max_boost,
-                            )
-                            expert_contexts_used += contexts_used
-                            expert_target_hits += target_hits
-                        else:
-                            seg_model_p[matched_idx] = (1.0 - a) * seg_model_p[matched_idx] + a * p_ng[matched_idx]
+                        contexts_used, target_hits = _ngram_apply_sparse_expert(
+                            seg_model_p=seg_model_p,
+                            log_probs_np=log_probs_np,
+                            target_ids=y[i, s:wlen].detach().cpu().numpy().astype(np.int64),
+                            matched_idx=matched_idx,
+                            alpha=a,
+                            ng_order=ng_order,
+                            ng_ctx_key=ng_ctx_key,
+                            ng_ctx_count=ng_ctx_count,
+                            candidate_ids=candidate_ids,
+                            candidate_counts=candidate_counts,
+                            vocab_size=vocab_size,
+                            boost_scale=args.ngram_expert_boost_scale,
+                            max_boost=args.ngram_expert_max_boost,
+                        )
+                        expert_contexts_used += contexts_used
+                        expert_target_hits += target_hits
 
                     seg_nll = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
                     loss_sum += float(seg_nll.sum())
@@ -1647,41 +1689,14 @@ def eval_val_sliding_hashed_ngram(
                 chunk_start,
                 chunk_end + 1,
                 ctx_tables,
-                full_tables,
                 min_order,
                 max_order,
                 primes,
                 mask,
                 candidate_ids=candidate_ids,
                 candidate_counts=candidate_counts,
-                vocab_size=candidate_vocab_size if use_sparse_expert else None,
+                vocab_size=candidate_vocab_size,
             )
-
-            if cubric_enabled:
-                rates = []
-                for n in range(min_order, max_order + 1):
-                    for cell in range(total_cells):
-                        if cubric_hits[n][cell] >= 8:
-                            rates.append(cubric_beats[n][cell] / cubric_hits[n][cell])
-                if len(rates) >= 4:
-                    avg_rate = sum(rates) / len(rates)
-                    for n in range(min_order, max_order + 1):
-                        for cell in range(total_cells):
-                            if cubric_hits[n][cell] >= 8:
-                                rate = cubric_beats[n][cell] / cubric_hits[n][cell]
-                                if rate > avg_rate + 0.05:
-                                    cubric_alpha_mult[n][cell] = min(cubric_alpha_mult[n][cell] * 1.03, 2.0)
-                                elif rate < avg_rate - 0.05:
-                                    cubric_alpha_mult[n][cell] = max(cubric_alpha_mult[n][cell] * 0.97, 0.3)
-                cubric_steps += 1
-                cubric_hits = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
-                cubric_beats = {n: [0] * total_cells for n in range(min_order, max_order + 1)}
-                if rank == 0 and log_fn is not None and cubric_steps % max(args.ngram_cubric_cadence, 1) == 0:
-                    parts = []
-                    for n in range(min_order, max_order + 1):
-                        avg_mult = sum(cubric_alpha_mult[n]) / len(cubric_alpha_mult[n])
-                        parts.append(f"o{n}:avg={avg_mult:.2f}")
-                    log_fn(f"ngram_cubric:step:{cubric_steps} {' '.join(parts)}")
 
             if rank == 0 and log_fn is not None and (chunk_idx < 3 or chunk_idx % 10 == 0 or chunk_idx == len(chunk_windows) - 1):
                 elapsed = time.perf_counter() - t0
@@ -1717,21 +1732,12 @@ def eval_val_sliding_hashed_ngram(
                 f"ngram_eval:cutoff max_seconds:{args.ngram_eval_max_seconds:.1f} "
                 f"coverage:{coverage * 100.0:.2f}% elapsed:{time.perf_counter() - t0:.0f}s"
             )
-        if use_sparse_expert:
-            hit_rate = expert_target_hits_t.item() / max(expert_contexts_t.item(), 1.0)
-            log_fn(
-                f"ngram_expert:contexts:{expert_contexts_t.item():.0f} "
-                f"target_hits:{expert_target_hits_t.item():.0f} hit_rate:{hit_rate:.4f} "
-                f"topk:{args.ngram_expert_topk} boost_scale:{args.ngram_expert_boost_scale:g}"
-            )
-        if cubric_enabled:
-            log_fn(
-                f"ngram_cubric:final steps:{cubric_steps} "
-                f"cells:{total_cells}x{max_order - min_order + 1}"
-            )
-            for n in range(min_order, max_order + 1):
-                row = " ".join(f"{m:.2f}" for m in cubric_alpha_mult[n])
-                log_fn(f"ngram_cubric:o{n} [{row}]")
+        hit_rate = expert_target_hits_t.item() / max(expert_contexts_t.item(), 1.0)
+        log_fn(
+            f"ngram_expert:contexts:{expert_contexts_t.item():.0f} "
+            f"target_hits:{expert_target_hits_t.item():.0f} hit_rate:{hit_rate:.4f} "
+            f"topk:{args.ngram_expert_topk} boost_scale:{args.ngram_expert_boost_scale:g}"
+        )
 
     model.train()
     return float(val_loss), float(val_bpb), float(coverage)
@@ -1814,13 +1820,15 @@ def eval_val_sliding(
     token_bytes_lut: list[bytes] | None,
     log_fn=None,
     batch_seqs: int = 32,
-) -> tuple[float, float, dict[str, float] | None]:
+) -> tuple[float, float, dict[str, float] | None, dict[str, float] | None]:
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
-    context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, args.eval_stride, total_tokens)
-    window_starts = chunk_windows[0] if chunk_windows else []
-    my_start, my_end = _rank_bounds(len(window_starts), rank, world_size)
-    my_windows = window_starts[my_start:my_end]
+    ngram_enabled = args.ngram_eval_order >= 2
+    chunk_tokens = int(args.ngram_chunk_tokens) if ngram_enabled else total_tokens
+    context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, args.eval_stride, chunk_tokens)
+    all_window_starts = [ws for windows in chunk_windows for ws in windows]
+    if ngram_enabled:
+        batch_seqs = args.ngram_batch_seqs
     logits_fn = (
         torch.compile(model.forward_logits, dynamic=False, fullgraph=True)
         if getattr(args, "sliding_compile_logits", False)
@@ -1843,37 +1851,222 @@ def eval_val_sliding(
         pos_prev = torch.zeros((context_limit,), dtype=torch.int64, device=device)
         pos_written = torch.zeros((context_limit,), dtype=torch.int32, device=device)
 
+    ngram_result = None
+    if ngram_enabled:
+        if args.ngram_mix_mode != "expert":
+            raise ValueError(f"NGRAM_MIX_MODE only supports expert, got {args.ngram_mix_mode!r}")
+        min_order = max(args.ngram_eval_min_order, 2)
+        max_order = max(args.ngram_eval_order, min_order)
+        adaptive = args.ngram_eval_adaptive
+        alpha_min = args.ngram_eval_alpha_min
+        alpha_max = args.ngram_eval_alpha_max
+        ent_center = args.ngram_eval_entropy_center
+        ent_scale = args.ngram_eval_entropy_scale
+        fixed_order_mults = None
+        if args.ngram_order_mults_str:
+            fixed_order_mults = np.array(
+                [float(x) for x in args.ngram_order_mults_str.split(",") if x.strip()],
+                dtype=np.float64,
+            )
+            if fixed_order_mults.size == 0:
+                fixed_order_mults = None
+        val_np = val_tokens.detach().cpu().numpy()
+        buckets = int(args.ngram_eval_buckets)
+        candidate_vocab_size = int(getattr(args, "vocab_size", int(val_np.max()) + 1 if val_np.size else 1))
+        ctx_tables = {n: np.zeros((buckets,), dtype=np.uint32) for n in range(min_order, max_order + 1)}
+        candidate_ids = {
+            n: np.full((buckets, args.ngram_expert_topk), -1, dtype=np.int32)
+            for n in range(min_order, max_order + 1)
+        }
+        candidate_counts = {
+            n: np.zeros((buckets, args.ngram_expert_topk), dtype=np.uint32)
+            for n in range(min_order, max_order + 1)
+        }
+        mask = np.uint64(buckets - 1)
+        primes = np.array(
+            [np.uint64(36313), np.uint64(27191), np.uint64(51647), np.uint64(81929),
+             np.uint64(131071), np.uint64(174763), np.uint64(233017)],
+            dtype=np.uint64,
+        )
+        ng_loss_sum = 0.0
+        ng_token_count = 0.0
+        ng_byte_count = 0.0
+        expert_contexts_used = 0.0
+        expert_target_hits = 0.0
+        total_ngram_scored_tokens = 0.0
+        for ws in all_window_starts:
+            wlen = min(ws + seq_len, total_tokens) - ws
+            s = 0 if ws == 0 else context_size
+            total_ngram_scored_tokens += float(max(wlen - s, 0))
+        ngram_start_time = time.perf_counter()
+        ngram_deadline = (
+            ngram_start_time + args.ngram_eval_max_seconds
+            if args.ngram_eval_max_seconds > 0.0
+            else None
+        )
+        ngram_cutoff_hit = False
+        if rank == 0 and log_fn is not None:
+            log_fn(
+                f"ngram_eval:fused chunks:{len(chunk_windows)} chunk_tokens:{chunk_tokens} "
+                f"windows:{len(all_window_starts)} shared_tables:1 mode:{args.ngram_mix_mode}"
+            )
+
     model.eval()
     with torch.inference_mode():
-        for batch_start in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[batch_start:batch_start + batch_seqs]
-            x, y, wlens = _window_batch(val_tokens, batch_ws, seq_len, total_tokens, device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits = logits_fn(x)
-            nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
-            for i, ws in enumerate(batch_ws):
-                s = 0 if ws == 0 else context_size
-                wlen = wlens[i]
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
-                byte_count += _token_byte_sum(
-                    x[i, s:wlen],
-                    y[i, s:wlen],
-                    base_bytes_lut,
-                    has_leading_space_lut,
-                    is_boundary_token_lut,
+        for chunk_idx, windows in enumerate(chunk_windows):
+            if not windows:
+                continue
+            if ngram_enabled and ngram_deadline is not None and time.perf_counter() >= ngram_deadline:
+                ngram_cutoff_hit = True
+
+            my_start, my_end = _rank_bounds(len(windows), rank, world_size)
+            my_windows = windows[my_start:my_end]
+            for batch_start in range(0, len(my_windows), batch_seqs):
+                if ngram_enabled and ngram_deadline is not None and time.perf_counter() >= ngram_deadline:
+                    ngram_cutoff_hit = True
+                batch_ws = my_windows[batch_start:batch_start + batch_seqs]
+                x, y, wlens = _window_batch(val_tokens, batch_ws, seq_len, total_tokens, device)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    logits = logits_fn(x)
+                logits_f = logits.float()
+                nll = F.cross_entropy(
+                    logits_f.reshape(-1, logits_f.size(-1)),
+                    y.reshape(-1),
+                    reduction="none",
+                ).reshape_as(y)
+                vocab_size = logits_f.size(-1)
+                for i, ws in enumerate(batch_ws):
+                    s = 0 if ws == 0 else context_size
+                    wlen = wlens[i]
+                    seg_len = wlen - s
+                    if seg_len <= 0:
+                        continue
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(seg_len)
+                    seg_byte_count = _token_byte_sum(
+                        x[i, s:wlen],
+                        y[i, s:wlen],
+                        base_bytes_lut,
+                        has_leading_space_lut,
+                        is_boundary_token_lut,
+                    )
+                    byte_count += seg_byte_count
+                    if collect_context_mix:
+                        start_pos = ws + s
+                        end_pos = ws + wlen
+                        if start_pos < context_limit:
+                            write_end = min(end_pos, context_limit)
+                            n_write = write_end - start_pos
+                            pos_nll[start_pos:write_end] = scored_nll[:n_write]
+                            pos_tgt[start_pos:write_end] = y[i, s:s + n_write]
+                            pos_prev[start_pos:write_end] = x[i, s:s + n_write]
+                            pos_written[start_pos:write_end] += 1
+
+                    if ngram_enabled and not ngram_cutoff_hit:
+                        seg_nll_np = scored_nll.cpu().numpy()
+                        seg_model_p = np.exp(-seg_nll_np)
+                        log_probs = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                        log_probs_np = log_probs.cpu().numpy()
+                        if adaptive:
+                            probs = log_probs.exp()
+                            entropy = -(probs * log_probs).sum(dim=-1).cpu().numpy()
+                            sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropy - ent_center)))
+                            per_token_alpha = alpha_min + (alpha_max - alpha_min) * sig
+                        else:
+                            entropy = np.zeros(seg_len, dtype=np.float64)
+                            per_token_alpha = np.full(seg_len, args.ngram_eval_alpha, dtype=np.float64)
+
+                        global_j = np.arange(ws + s + 1, ws + wlen + 1, dtype=np.int64)
+                        ng_matched = np.zeros(seg_len, dtype=np.bool_)
+                        ng_order = np.zeros(seg_len, dtype=np.int32)
+                        ng_ctx_key = np.zeros(seg_len, dtype=np.int64)
+                        ng_ctx_count = np.zeros(seg_len, dtype=np.float64)
+
+                        for n in range(max_order, min_order - 1, -1):
+                            ctx_width = n - 1
+                            valid = (global_j >= ctx_width) & (~ng_matched)
+                            if not valid.any():
+                                continue
+                            valid_idx = np.nonzero(valid)[0]
+                            jv = global_j[valid_idx]
+                            ctx_hash = np.zeros(len(jv), dtype=np.uint64)
+                            for k in range(ctx_width):
+                                tok = val_np[jv - (ctx_width - k)].astype(np.uint64)
+                                ctx_hash ^= tok * primes[k % len(primes)]
+                            ctx_key = (ctx_hash & mask).astype(np.int64)
+                            ctx_counts = ctx_tables[n][ctx_key].astype(np.float64)
+                            has_data = ctx_counts >= float(args.ngram_eval_min_count)
+                            if has_data.any():
+                                hit_idx = valid_idx[has_data]
+                                ng_matched[hit_idx] = True
+                                ng_order[hit_idx] = n
+                                ng_ctx_key[hit_idx] = ctx_key[has_data]
+                                ng_ctx_count[hit_idx] = ctx_counts[has_data]
+
+                        if ng_matched.any():
+                            matched_idx = np.nonzero(ng_matched)[0]
+                            if adaptive and args.ngram_entropy_shift:
+                                matched_orders = ng_order[matched_idx].astype(np.float64)
+                                shifted_centers = ent_center - 0.25 * (matched_orders - float(min_order))
+                                shifted_sig = 1.0 / (1.0 + np.exp(-ent_scale * (entropy[matched_idx] - shifted_centers)))
+                                per_token_alpha[matched_idx] = alpha_min + (alpha_max - alpha_min) * shifted_sig
+
+                            if fixed_order_mults is not None:
+                                a = per_token_alpha[matched_idx].copy()
+                                mult_idx = np.clip(ng_order[matched_idx] - min_order, 0, len(fixed_order_mults) - 1)
+                                a *= fixed_order_mults[mult_idx]
+                                np.clip(a, 0.0, 0.95, out=a)
+                            else:
+                                a = per_token_alpha[matched_idx]
+                            contexts_used, target_hits = _ngram_apply_sparse_expert(
+                                seg_model_p=seg_model_p,
+                                log_probs_np=log_probs_np,
+                                target_ids=y[i, s:wlen].detach().cpu().numpy().astype(np.int64),
+                                matched_idx=matched_idx,
+                                alpha=a,
+                                ng_order=ng_order,
+                                ng_ctx_key=ng_ctx_key,
+                                ng_ctx_count=ng_ctx_count,
+                                candidate_ids=candidate_ids,
+                                candidate_counts=candidate_counts,
+                                vocab_size=vocab_size,
+                                boost_scale=args.ngram_expert_boost_scale,
+                                max_boost=args.ngram_expert_max_boost,
+                            )
+                            expert_contexts_used += contexts_used
+                            expert_target_hits += target_hits
+
+                        ng_seg_nll = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
+                        ng_loss_sum += float(ng_seg_nll.sum())
+                        ng_token_count += float(seg_len)
+                        ng_byte_count += float(seg_byte_count.item())
+
+            if ngram_enabled and not ngram_cutoff_hit:
+                chunk_start = chunk_idx * chunk_tokens
+                chunk_end = min((chunk_idx + 1) * chunk_tokens, total_tokens)
+                _ngram_bulk_update(
+                    val_np,
+                    chunk_start,
+                    chunk_end + 1,
+                    ctx_tables,
+                    min_order,
+                    max_order,
+                    primes,
+                    mask,
+                    candidate_ids=candidate_ids,
+                    candidate_counts=candidate_counts,
+                    vocab_size=candidate_vocab_size,
                 )
-                if collect_context_mix:
-                    start_pos = ws + s
-                    end_pos = ws + wlen
-                    if start_pos < context_limit:
-                        write_end = min(end_pos, context_limit)
-                        n_write = write_end - start_pos
-                        pos_nll[start_pos:write_end] = scored_nll[:n_write]
-                        pos_tgt[start_pos:write_end] = y[i, s:s + n_write]
-                        pos_prev[start_pos:write_end] = x[i, s:s + n_write]
-                        pos_written[start_pos:write_end] += 1
+
+                if rank == 0 and log_fn is not None and (
+                    chunk_idx < 3 or chunk_idx % 10 == 0 or chunk_idx == len(chunk_windows) - 1
+                ):
+                    elapsed = time.perf_counter() - ngram_start_time
+                    cur_bpb = (ng_loss_sum / max(ng_token_count, 1.0)) / math.log(2.0) * (
+                        ng_token_count / max(ng_byte_count, 1.0)
+                    )
+                    log_fn(f"ngram_eval:fused_chunk:{chunk_idx + 1}/{len(chunk_windows)} bpb:{cur_bpb:.6f} t:{elapsed:.0f}s")
 
     context_result = None
     if dist.is_available() and dist.is_initialized() and collect_context_mix:
@@ -1931,8 +2124,51 @@ def eval_val_sliding(
         if log_fn is not None:
             log_fn(f"context_mix_time:{time.perf_counter() - t0:.1f}s subset_tokens:{usable}")
 
+    if ngram_enabled:
+        ng_loss_t = torch.tensor(ng_loss_sum, device=device, dtype=torch.float64)
+        ng_token_t = torch.tensor(ng_token_count, device=device, dtype=torch.float64)
+        ng_byte_t = torch.tensor(ng_byte_count, device=device, dtype=torch.float64)
+        expert_contexts_t = torch.tensor(expert_contexts_used, device=device, dtype=torch.float64)
+        expert_target_hits_t = torch.tensor(expert_target_hits, device=device, dtype=torch.float64)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(ng_loss_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ng_token_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ng_byte_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(expert_contexts_t, op=dist.ReduceOp.SUM)
+            dist.all_reduce(expert_target_hits_t, op=dist.ReduceOp.SUM)
+        ng_loss_sum = float(ng_loss_t.item())
+        ng_token_count = float(ng_token_t.item())
+        ng_byte_count = float(ng_byte_t.item())
+        ng_coverage = ng_token_count / max(total_ngram_scored_tokens, 1.0)
+        if args.val_byte_count_override > 0 and ng_coverage >= 0.999999:
+            ng_byte_count = float(args.val_byte_count_override)
+        ng_val_loss = ng_loss_sum / max(ng_token_count, 1.0)
+        ng_val_bpb = ng_val_loss / math.log(2.0) * (ng_token_count / max(ng_byte_count, 1.0))
+        hit_rate = expert_target_hits_t.item() / max(expert_contexts_t.item(), 1.0)
+        ngram_result = {
+            "val_loss": float(ng_val_loss),
+            "val_bpb": float(ng_val_bpb),
+            "coverage": float(ng_coverage),
+            "contexts": float(expert_contexts_t.item()),
+            "target_hits": float(expert_target_hits_t.item()),
+            "hit_rate": float(hit_rate),
+            "cutoff": float(ngram_cutoff_hit),
+            "elapsed": float(time.perf_counter() - ngram_start_time),
+        }
+        if rank == 0 and log_fn is not None:
+            if ngram_cutoff_hit:
+                log_fn(
+                    f"ngram_eval:fused_cutoff max_seconds:{args.ngram_eval_max_seconds:.1f} "
+                    f"coverage:{ng_coverage * 100.0:.2f}% elapsed:{ngram_result['elapsed']:.0f}s"
+                )
+            log_fn(
+                f"ngram_expert:fused contexts:{expert_contexts_t.item():.0f} "
+                f"target_hits:{expert_target_hits_t.item():.0f} hit_rate:{hit_rate:.4f} "
+                f"topk:{args.ngram_expert_topk} boost_scale:{args.ngram_expert_boost_scale:g}"
+            )
+
     model.train()
-    return sliding_loss, sliding_bpb, context_result
+    return sliding_loss, sliding_bpb, context_result, ngram_result
 
 
 def eval_val_ttt(
@@ -2614,15 +2850,6 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
-class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -2946,171 +3173,6 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
-if triton is not None and tl is not None:
-    @triton.jit
-    def _triton_rms_norm_fwd(
-        x_ptr,
-        y_ptr,
-        weight_ptr,
-        rstd_ptr,
-        row_stride,
-        feature_dim,
-        eps,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        row_idx = tl.program_id(0)
-        x_ptr += row_idx * row_stride
-        y_ptr += row_idx * row_stride
-        cols = tl.arange(0, BLOCK_SIZE)
-        mask = cols < feature_dim
-        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        variance = tl.sum(x * x, axis=0) / feature_dim
-        rstd = 1.0 / tl.sqrt(variance + eps)
-        tl.store(rstd_ptr + row_idx, rstd)
-        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        tl.store(y_ptr + cols, x * rstd * weight, mask=mask)
-
-
-    @triton.jit
-    def _triton_rms_norm_bwd_dx_dw_partial(
-        dx_ptr,
-        dy_ptr,
-        dw_partial_ptr,
-        x_ptr,
-        weight_ptr,
-        rstd_ptr,
-        lock_ptr,
-        row_stride,
-        feature_dim,
-        GROUP_SIZE_M: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        row_idx = tl.program_id(0)
-        cols = tl.arange(0, BLOCK_SIZE)
-        mask = cols < feature_dim
-        x_ptr += row_idx * row_stride
-        dy_ptr += row_idx * row_stride
-        dx_ptr += row_idx * row_stride
-
-        x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        dy = tl.load(dy_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        rstd = tl.load(rstd_ptr + row_idx)
-
-        weight_dy = weight * dy
-        dot = tl.sum(tl.where(mask, weight_dy * x, 0.0), axis=0)
-        correction = dot * rstd / feature_dim
-        dx = (weight_dy - x * rstd * correction) * rstd
-        tl.store(dx_ptr + cols, dx, mask=mask)
-
-        partial_dw = tl.where(mask, dy * x * rstd, 0.0)
-        lock_id = row_idx % GROUP_SIZE_M
-        lock = lock_ptr + lock_id
-        count = lock + GROUP_SIZE_M
-        dw_partial_ptr += lock_id * feature_dim + cols
-        while tl.atomic_cas(lock, 0, 1) == 1:
-            pass
-        if tl.load(count) == 0:
-            tl.atomic_xchg(count, 1)
-        else:
-            partial_dw += tl.load(dw_partial_ptr, mask=mask, other=0.0)
-        tl.store(dw_partial_ptr, partial_dw, mask=mask)
-        tl.debug_barrier()
-        tl.atomic_xchg(lock, 0)
-
-
-    @triton.jit
-    def _triton_rms_norm_bwd_dw(
-        dw_partial_ptr,
-        dw_final_ptr,
-        num_groups,
-        feature_dim,
-        BLOCK_SIZE_M: tl.constexpr,
-        BLOCK_SIZE_N: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for row_start in range(0, num_groups, BLOCK_SIZE_M):
-            rows = row_start + tl.arange(0, BLOCK_SIZE_M)
-            mask = (rows[:, None] < num_groups) & (cols[None, :] < feature_dim)
-            offsets = rows[:, None] * feature_dim + cols[None, :]
-            acc += tl.load(dw_partial_ptr + offsets, mask=mask, other=0.0)
-        tl.store(dw_final_ptr + cols, tl.sum(acc, axis=0), mask=cols < feature_dim)
-
-
-class _TritonRMSNorm(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, eps: float) -> Tensor:
-        if triton is None:
-            raise RuntimeError("TRITON_RMSNORM=1 requires triton to be importable")
-        y = torch.empty_like(x)
-        x_2d = x.reshape(-1, x.shape[-1])
-        y_2d = y.reshape(-1, y.shape[-1])
-        rows, feature_dim = x_2d.shape
-        block_size = triton.next_power_of_2(feature_dim)
-        max_block_size = 65536 // x.element_size()
-        if block_size > max_block_size:
-            raise RuntimeError(f"Triton RMSNorm feature_dim={feature_dim} exceeds max block size {max_block_size}")
-        rstd = torch.empty((rows,), dtype=torch.float32, device=x.device)
-        _triton_rms_norm_fwd[(rows,)](
-            x_2d,
-            y_2d,
-            weight,
-            rstd,
-            x_2d.stride(0),
-            feature_dim,
-            eps,
-            BLOCK_SIZE=block_size,
-        )
-        ctx.save_for_backward(x, weight, rstd)
-        ctx.block_size = block_size
-        return y
-
-    @staticmethod
-    def backward(ctx, dy: Tensor) -> tuple[Tensor, Tensor, None]:
-        x, weight, rstd = ctx.saved_tensors
-        x_2d = x.reshape(-1, x.shape[-1])
-        dy_2d = dy.reshape(-1, dy.shape[-1])
-        dx = torch.empty_like(dy)
-        dx_2d = dx.reshape(-1, dx.shape[-1])
-        rows, feature_dim = x_2d.shape
-        if feature_dim <= 1024:
-            group_size = 256
-        elif feature_dim <= 4096:
-            group_size = 128
-        elif feature_dim <= 8192:
-            group_size = 96
-        else:
-            group_size = 64
-        locks = torch.zeros(2 * group_size, dtype=torch.int32, device=x.device)
-        dw_partial = torch.zeros((group_size, feature_dim), dtype=torch.float32, device=x.device)
-        dw = torch.empty((feature_dim,), dtype=weight.dtype, device=weight.device)
-        _triton_rms_norm_bwd_dx_dw_partial[(rows,)](
-            dx_2d,
-            dy_2d,
-            dw_partial,
-            x_2d,
-            weight,
-            rstd,
-            locks,
-            x_2d.stride(0),
-            feature_dim,
-            GROUP_SIZE_M=group_size,
-            BLOCK_SIZE=ctx.block_size,
-        )
-        grid = lambda meta: (triton.cdiv(feature_dim, meta["BLOCK_SIZE_N"]),)
-        _triton_rms_norm_bwd_dw[grid](
-            dw_partial,
-            dw,
-            min(group_size, rows),
-            feature_dim,
-            BLOCK_SIZE_M=32,
-            BLOCK_SIZE_N=128,
-        )
-        return dx, dw, None
-
-
 class ParcaeRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -3118,11 +3180,7 @@ class ParcaeRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        if USE_TRITON_RMSNORM and x.is_cuda:
-            return _TritonRMSNorm.apply(x, self.weight, self.eps)
-        with torch.autocast(enabled=False, device_type=x.device.type):
-            y = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return y.type_as(x) * self.weight.to(dtype=x.dtype)
+        return F.rms_norm(x, (x.size(-1),), self.weight.to(dtype=x.dtype), self.eps)
 
 
 class LaurelLowRank(nn.Module):
@@ -3713,6 +3771,7 @@ class GPT(nn.Module):
         self._current_input_ids: Tensor | None = None
         self.emb_scale = h.emb_scale
         self.logit_scale = h.logit_scale
+        self.liger_ce = h.liger_ce
         self.coda_moe_num_experts = h.coda_moe_num_experts
         self.coda_moe_top_k = h.coda_moe_top_k
         self.deepseek_moe_num_base_experts = h.deepseek_moe_num_base_experts
@@ -4179,7 +4238,10 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
         if labels is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1), reduction='mean')
+            if self.liger_ce:
+                loss = liger_cross_entropy(logits, labels, assume_no_ignore=True)
+            else:
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), labels.reshape(-1), reduction='mean')
         else:
             loss = torch.zeros((), device=input_ids.device)
 
@@ -4687,10 +4749,10 @@ def main() -> None:
         raise ValueError("NGRAM_EVAL_MAX_SECONDS must be non-negative")
     if args.ngram_chunk_tokens <= 0 or args.ngram_batch_seqs <= 0:
         raise ValueError("NGRAM_CHUNK_TOKENS and NGRAM_BATCH_SEQS must be positive")
-    if args.ngram_cubric_cadence < 0:
-        raise ValueError("NGRAM_CUBRIC_CADENCE must be non-negative")
-    if args.ngram_mix_mode not in {"linear", "expert"}:
-        raise ValueError(f"NGRAM_MIX_MODE must be linear or expert, got {args.ngram_mix_mode!r}")
+    if args.ngram_cubric_cadence != 0:
+        raise ValueError("NGRAM_CUBRIC_CADENCE is no longer supported; expert n-gram mixing must use 0")
+    if args.ngram_mix_mode != "expert":
+        raise ValueError(f"NGRAM_MIX_MODE only supports expert, got {args.ngram_mix_mode!r}")
     if args.ngram_expert_topk <= 0:
         raise ValueError("NGRAM_EXPERT_TOPK must be positive")
     if args.ngram_expert_boost_scale < 0.0 or args.ngram_expert_max_boost <= 0.0:
@@ -4951,6 +5013,7 @@ def main() -> None:
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
     log0(f"rmsnorm:triton_enabled:{args.triton_rmsnorm} triton_available:{triton is not None}")
+    log0(f"liger_ce:enabled:{args.liger_ce} triton_available:{triton is not None}")
     laurel_params = sum(
         p.numel()
         for module in base_model.modules()
@@ -5308,7 +5371,7 @@ def main() -> None:
     if args.sliding_window_enabled:
         torch.cuda.synchronize()
         t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb, context_result = eval_val_sliding(
+        sw_val_loss, sw_val_bpb, context_result, fused_ngram_result = eval_val_sliding(
             args,
             base_model,
             rank,
@@ -5350,8 +5413,35 @@ def main() -> None:
                 f"avg_alpha:{context_result['lzp_avg_alpha']:.8f} "
                 f"subset_tokens:{min(args.lzp_subset_tokens, val_tokens.numel() - 1)}"
             )
+        if fused_ngram_result is not None:
+            if fused_ngram_result["coverage"] >= 0.999999:
+                log0(
+                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order} "
+                    f"val_loss:{fused_ngram_result['val_loss']:.4f} "
+                    f"val_bpb:{fused_ngram_result['val_bpb']:.4f} stride:{args.eval_stride} "
+                    f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms fused:1"
+                )
+                log0(
+                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
+                    f"val_loss:{fused_ngram_result['val_loss']:.8f} "
+                    f"val_bpb:{fused_ngram_result['val_bpb']:.8f}"
+                )
+            else:
+                log0(
+                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
+                    f"val_loss:{fused_ngram_result['val_loss']:.4f} "
+                    f"val_bpb:{fused_ngram_result['val_bpb']:.4f} "
+                    f"coverage:{fused_ngram_result['coverage']:.4f} stride:{args.eval_stride} "
+                    f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms fused:1"
+                )
+                log0(
+                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
+                    f"val_loss:{fused_ngram_result['val_loss']:.8f} "
+                    f"val_bpb:{fused_ngram_result['val_bpb']:.8f} "
+                    f"coverage:{fused_ngram_result['coverage']:.8f}"
+                )
 
-    if args.ngram_eval_order >= 2:
+    if args.ngram_eval_order >= 2 and not args.sliding_window_enabled:
         if distributed:
             dist.barrier()
         torch.cuda.synchronize()
