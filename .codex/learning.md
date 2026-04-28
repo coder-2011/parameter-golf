@@ -125,11 +125,9 @@ Implementation scope:
 | default derived active count | if `DEEPSEEK_MOE_ACTIVE_EXPERTS=0`, active count is `shared + max(1, segments - shared)` |
 | disabled behavior | `DEEPSEEK_MOE_NUM_BASE_EXPERTS=0` preserves dense coda unless legacy `CODA_MOE_NUM_EXPERTS>0` is set |
 
-## 2026-04-26 LAuReL-LR implementation
+## 2026-04-26 LAuReL-LR removal
 
-`train_gpt_parcae.py` now has default-off LAuReL low-rank residual augmentation. Use `LAUREL_SCOPE=prelude|core|coda|all`, `LAUREL_RANK>0`, `LAUREL_SCALE_INIT`, and `LAUREL_NORM=0|1`. Each selected `TransformerPreNormBlock` adds `scale * RMSNorm(right(left(block_input)))` to the block output, using the record-style mixed residual input when parallel residual mode is active. Disabled default creates zero LAuReL modules.
-
-Focused checks passed: py_compile under system Python and `.venv`, enabled CUDA forward/backward smoke, default-off module count, strict state-dict reload, and int8 quant/dequant strict reload.
+`train_gpt_parcae.py` no longer carries the default-off LAuReL low-rank residual path. The env knobs, module class, block injections, attention-residual mutual-exclusion checks, and logging were removed after local tests showed the feature was not promising and added code surface.
 
 ## 2026-04-26 PLE diagnostics and stabilization
 
@@ -230,3 +228,5 @@ Follow-up: SP1892 local data was installed under `data_sp1892/` using `data/down
 - 2026-04-28: `train_gpt_parcae.py` now wires record-style SmearGate into the embedding path. The exact supplied gate blends each position with the previous position via a learned per-channel sigmoid gate, after token embedding plus optional BigramHash and before embedding scale/prelude/core/coda. Focused checks passed: `.venv/bin/python -m py_compile train_gpt_parcae.py`, `python -m pytest tests/test_parcae_parallel_residual.py -q`.
 
 - 2026-04-28: The experimental custom Triton RMSNorm path in `train_gpt_parcae.py` was removed. `ParcaeRMSNorm` now uses plain PyTorch `F.rms_norm`, and `TRITON_RMSNORM` is effectively disabled. Focused checks passed: `.venv/bin/python -m py_compile train_gpt_parcae.py`, `python -m pytest tests/test_parcae_parallel_residual.py -q`.
+
+- 2026-04-28: Parcae sliding eval now fuses LZP/context mix and expert n-gram scoring into the same sliding neural forward pass when `SLIDING_WINDOW_ENABLED=1`. The old standalone n-gram evaluator remains for non-sliding use, but final eval skips it when sliding already produced fused n-gram metrics. Synthetic checks verified fused n-gram equals the old standalone n-gram exactly, LZP/context metrics are unchanged by n-gram chunking, and `NGRAM_EVAL_MAX_SECONDS` cuts off only n-gram work while preserving sliding/LZP coverage.
