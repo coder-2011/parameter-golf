@@ -168,6 +168,8 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     qat_bits = int(os.environ.get("QAT_BITS", 0))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 500))
+    qat_group_size = int(os.environ.get("QAT_GROUP_SIZE", 32))
+    qat_activation_bits = int(os.environ.get("QAT_ACTIVATION_BITS", 8))
     qat_linear = bool(int(os.environ.get("QAT_LINEAR", "1")))
     qat_tied_output = bool(int(os.environ.get("QAT_TIED_OUTPUT", "1")))
     quant_bits = int(os.environ.get("QUANT_BITS", qat_bits if qat_bits > 0 else 8))
@@ -2312,16 +2314,77 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def fake_quant_weight_ste(weight: Tensor, bits: int) -> Tensor:
-    qmax = signed_quant_max(bits)
-    w32 = weight.float()
-    if w32.ndim == 2:
-        scale = w32.detach().abs().amax(dim=1, keepdim=True).div(qmax).clamp_min(QUANT_SCALE_EPS)
-    else:
-        scale = w32.detach().abs().amax().div(qmax).clamp_min(QUANT_SCALE_EPS)
-    q = torch.clamp(torch.round(w32 / scale), -qmax, qmax)
-    wq = (q * scale).to(dtype=weight.dtype)
-    return weight + (wq - weight).detach()
+def _set_fake_quantizer_enabled(module: nn.Module, enabled: bool) -> None:
+    for attr in ("activation_fake_quantizer", "weight_fake_quantizer"):
+        fake_quantizer = getattr(module, attr, None)
+        if fake_quantizer is not None and hasattr(fake_quantizer, "enabled"):
+            fake_quantizer.enabled = enabled
+
+def _torchao_int_dtype(bits: int):
+    if bits == 8:
+        return torch.int8
+    if bits == 4 and hasattr(torch, "int4"):
+        return torch.int4
+    if bits == 4:
+        from torchao.quantization.quant_primitives import TorchAODType
+
+        return TorchAODType.INT4
+    raise ValueError(f"TorchAO QAT supports QAT_BITS=4 or 8, got {bits}")
+
+def prepare_torchao_qat(model: nn.Module, args: "Hyperparameters") -> None:
+    if args.qat_bits <= 0 or not args.qat_linear:
+        return
+    if args.qat_activation_bits not in (0, 8):
+        raise ValueError(f"TorchAO QAT supports QAT_ACTIVATION_BITS=0 or 8, got {args.qat_activation_bits}")
+    if args.qat_group_size <= 0:
+        raise ValueError(f"QAT_GROUP_SIZE must be positive, got {args.qat_group_size}")
+    try:
+        from torchao.quantization import quantize_
+        from torchao.quantization.qat import IntxFakeQuantizeConfig, QATConfig
+    except ImportError as exc:
+        raise RuntimeError("TorchAO QAT requires torchao; run uv sync --no-install-project first") from exc
+
+    weight_config = IntxFakeQuantizeConfig(
+        dtype=_torchao_int_dtype(args.qat_bits),
+        group_size=args.qat_group_size,
+        is_symmetric=True,
+    )
+    activation_config = (
+        IntxFakeQuantizeConfig(
+            dtype=torch.int8,
+            granularity="per_token",
+            is_symmetric=False,
+        )
+        if args.qat_activation_bits == 8
+        else None
+    )
+    quantize_(
+        model,
+        QATConfig(activation_config=activation_config, weight_config=weight_config, step="prepare"),
+        filter_fn=lambda module, _: isinstance(module, CastedLinear),
+    )
+    quantize_(
+        model,
+        QATConfig(weight_config=weight_config, step="prepare"),
+        filter_fn=lambda module, _: isinstance(module, nn.Embedding),
+    )
+    if isinstance(model, GPT):
+        model.refresh_qat_modules()
+
+def convert_torchao_qat(model: nn.Module, args: "Hyperparameters") -> None:
+    if args.qat_bits <= 0:
+        return
+    from torchao.quantization import quantize_
+    from torchao.quantization.qat import QATConfig
+
+    quantize_(
+        model,
+        QATConfig(step="convert"),
+        filter_fn=lambda module, _: hasattr(module, "activation_fake_quantizer")
+        or hasattr(module, "weight_fake_quantizer"),
+    )
+    if isinstance(model, GPT):
+        model.refresh_qat_modules()
 
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     qmax = signed_quant_max(bits)
@@ -2518,7 +2581,7 @@ def collect_gptq_hessians(
         return hook_fn
 
     for module_name, module in model.named_modules():
-        if not isinstance(module, CastedLinear):
+        if not isinstance(module, nn.Linear):
             continue
         state_name = f"{module_name}.weight"
         if (
@@ -2846,11 +2909,7 @@ class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        weight = self.weight
-        qat_bits = getattr(self, "qat_bits", 0)
-        if self.training and qat_bits > 0 and getattr(self, "qat_enabled", False):
-            weight = fake_quant_weight_ste(weight, qat_bits)
-        return F.linear(x, weight.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -3077,11 +3136,8 @@ class BigramHashEmbedding(nn.Module):
         offsets = torch.arange(self.num_heads, device=token_ids.device, dtype=tokens.dtype) * self.num_buckets
         return hashes + offsets
 
-    def forward(self, token_ids: Tensor, input_embeds: Tensor, qat_bits: int = 0) -> Tensor:
-        weight = self.embed.weight
-        if self.training and qat_bits > 0:
-            weight = fake_quant_weight_ste(weight, qat_bits)
-        h = F.embedding(self._hash(token_ids), weight)
+    def forward(self, token_ids: Tensor, input_embeds: Tensor) -> Tensor:
+        h = self.embed(self._hash(token_ids))
         if self.num_heads > 1:
             h = h.sum(dim=-2) * (self.num_heads ** -0.5)
         if self.proj is not None:
@@ -3755,6 +3811,7 @@ class GPT(nn.Module):
         self.qat_start_step = h.qat_start_step
         self.qat_tied_output = h.qat_tied_output
         self._qat_enabled = False
+        self.qat_fake_quant_modules: list[nn.Module] = []
         self._current_input_ids: Tensor | None = None
         self.emb_scale = h.emb_scale
         self.logit_scale = h.logit_scale
@@ -3980,20 +4037,16 @@ class GPT(nn.Module):
         self.register_buffer('recurrent_freqs_cos', recurrent_freqs_cos, persistent=False)
         self.register_buffer('recurrent_freqs_sin', recurrent_freqs_sin, persistent=False)
         self._init_weights()
-        self.qat_linears = [module for module in self.modules() if isinstance(module, CastedLinear)]
-        for module in self.qat_linears:
-            module.qat_bits = self.qat_bits
-            module.qat_enabled = False
+        self.refresh_qat_modules()
 
     def set_training_step(self, step: int) -> None:
         self.step = step
         self._set_qat_enabled_for_step(step)
 
     def _embedding(self, emb: nn.Embedding, input_ids: Tensor) -> Tensor:
-        weight = emb.weight
-        if self.training and self._qat_enabled and self.qat_bits > 0:
-            weight = fake_quant_weight_ste(weight, self.qat_bits)
-        return F.embedding(input_ids, weight)
+        if hasattr(emb, "weight_fake_quantizer"):
+            return emb(input_ids)
+        return F.embedding(input_ids, emb.weight)
 
     def _attn_res_enabled_for(self, scope: str) -> bool:
         return self.attn_res_mode != "none" and self.attn_res_scope in {scope, "all"}
@@ -4096,13 +4149,22 @@ class GPT(nn.Module):
     def _set_qat_enabled_for_step(self, step: int) -> bool:
         enabled = self.qat_bits > 0 and step >= self.qat_start_step
         if enabled != self._qat_enabled:
-            for module in self.qat_linears:
-                module.qat_enabled = enabled
+            for module in self.qat_fake_quant_modules:
+                _set_fake_quantizer_enabled(module, enabled)
             self._qat_enabled = enabled
         return enabled
 
     def _qat_active(self) -> bool:
         return self._qat_enabled
+
+    def refresh_qat_modules(self) -> None:
+        self.qat_fake_quant_modules = [
+            module
+            for module in self.modules()
+            if hasattr(module, "activation_fake_quantizer") or hasattr(module, "weight_fake_quantizer")
+        ]
+        for module in self.qat_fake_quant_modules:
+            _set_fake_quantizer_enabled(module, self._qat_enabled)
 
     def forward_model(
         self,
@@ -4120,8 +4182,7 @@ class GPT(nn.Module):
 
         input_embeds = self._embedding(self.tok_emb, input_ids)
         if self.bigram_hash is not None:
-            hash_qat_bits = self.qat_bits if self.training and qat_enabled else 0
-            input_embeds = input_embeds + self.bigram_hash(input_ids, input_embeds, qat_bits=hash_qat_bits)
+            input_embeds = input_embeds + self.bigram_hash(input_ids, input_embeds)
         input_embeds = self.smear(input_embeds)
         if self.emb_scale != 1.0:
             input_embeds = input_embeds * self.emb_scale
@@ -4189,8 +4250,13 @@ class GPT(nn.Module):
 
         if self.tie_embeddings:
             output_weight = self.tok_emb.weight
-            if self.training and qat_enabled and self.qat_tied_output:
-                output_weight = fake_quant_weight_ste(output_weight, self.qat_bits)
+            if (
+                self.training
+                and qat_enabled
+                and self.qat_tied_output
+                and hasattr(self.tok_emb, "weight_fake_quantizer")
+            ):
+                output_weight = self.tok_emb.weight_fake_quantizer(output_weight)
             logits_proj = F.linear(x, output_weight)
         else:
             if self.lm_head is None:
@@ -4576,6 +4642,8 @@ def main() -> None:
     args = Hyperparameters()
     if args.qat_bits != 0:
         signed_quant_max(args.qat_bits)
+    if args.qat_bits not in {0, 4, 8}:
+        raise ValueError(f"TorchAO QAT supports QAT_BITS=4 or 8, got {args.qat_bits}")
     signed_quant_max(args.quant_bits)
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
@@ -4785,6 +4853,12 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    if args.qat_bits > 0:
+        try:
+            torch._inductor.config.force_fuse_int_mm_with_mul = True
+            torch._inductor.config.use_mixed_mm = True
+        except AttributeError:
+            pass
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
@@ -4871,6 +4945,7 @@ def main() -> None:
 
     base_model = GPT(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
+    prepare_torchao_qat(base_model, args)
     base_model.set_training_step(0)
     if args.compile_model:
         compiled_model = torch.compile(base_model, dynamic=False)
@@ -5017,7 +5092,9 @@ def main() -> None:
     )
     log0(
         f"qat:bits:{args.qat_bits} start_step:{args.qat_start_step} "
-        f"linear:{args.qat_linear} tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
+        f"backend:torchao group_size:{args.qat_group_size} "
+        f"activation_bits:{args.qat_activation_bits} linear:{args.qat_linear} "
+        f"tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
     )
     log0(
         f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
@@ -5256,6 +5333,10 @@ def main() -> None:
         del swa_state
     elif args.swa_enabled:
         log0(f"swa:skipped count:{swa_state.count if swa_state is not None else 0}")
+
+    if args.qat_bits > 0:
+        log0("qat:converting TorchAO fake-quant modules before artifact export")
+        convert_torchao_qat(base_model, args)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
