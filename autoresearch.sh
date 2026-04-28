@@ -6,19 +6,28 @@ cd "$(dirname "$0")"
 # Unique run ID per invocation
 RUN_ID="autoresearch_$(date +%Y%m%d_%H%M%S)_$$"
 LOGFILE="logs/${RUN_ID}.txt"
+PYTHON_BIN="${PYTHON:-/workspace/parameter-golf/.venv/bin/python}"
+mkdir -p logs
+unset NUM_LAYERS QK_GAIN_INIT CLIP_QKV
+unset RANK LOCAL_RANK WORLD_SIZE
+unset CONTROL_TENSOR_NAME_PATTERNS INT8_KEEP_FLOAT_FP32_NAME_PATTERNS
 
 echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 
 # Fast syntax check before GPU burn
-python -m py_compile train_gpt_parcae.py 2>&1 | tail -5
+"${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
 # Baseline config (SP1024, 300s wall-clock, 1x GPU)
 export RUN_ID
 export DATA_PATH="./data/datasets/fineweb10B_sp1024"
 export TOKENIZER_PATH="./data/tokenizers/fineweb_1024_bpe.model"
+export TOKENIZER_META_PATH=""
+export TOKENIZER_META_VALIDATE=0
+export VAL_BYTE_COUNT_OVERRIDE=0
 export VOCAB_SIZE=1024
 export MODEL_DIM=384
 export RECURRENT_DIM=384
+export RECURRENT_INTERMEDIATE_DIM=0
 export NUM_HEADS=4
 export NUM_KV_HEADS=2
 export RECURRENT_NUM_HEADS=4
@@ -29,31 +38,166 @@ export MLP_MULT=4
 export TRAIN_SEQ_LEN=1024
 export TRAIN_BATCH_TOKENS=131072
 export ITERATIONS=1000000
-export MAX_WALLCLOCK_SECONDS=600
+export MAX_WALLCLOCK_SECONDS=300
+export WARMDOWN_ITERS=1200
 export WARMUP_STEPS=500
+export VAL_BATCH_SIZE=524288
 export TRAIN_LOG_EVERY=100
 export VAL_LOSS_EVERY=0
 export MEAN_RECURRENCE=2
 export MEAN_BACKPROP_DEPTH=1
+export RECURRENT_ITERATION_METHOD=per-batch
+export SAMPLING_SCHEME=fixed
+export CURRICULUM_TARGET=forward
 export ROPE_DIMS=32
+export ROPE_BASE=10000.0
+export OUTER_ROPE_DIMS=0
+export RECURRENT_ROPE_DIMS=0
+export RECURRENT_LAYER_ROPE_DIMS=""
 export QK_NORM=1
+export QK_BIAS=0
 export USE_VALUE_EMBEDDINGS=0
+export PRELUDE_NORM=0
+export STATE_INIT=like-init
+export INJECTION_TYPE=diagonal
+export INJECTION_SWIGLU_SCALE=0.0
 export BIGRAM_HASH_BUCKETS=8192
 export BIGRAM_HASH_DIM=128
 export BIGRAM_HASH_HEADS=2
 export BIGRAM_HASH_GATE=1
+export BIGRAM_HASH_SCALE_INIT=0.05
+export BIGRAM_HASH_INIT_STD=0.02
 export COMPILE_MODEL=1
 export COMPILE_MUON_BACKEND=0
+export MONITORING=0
+export LOCKSTEP_N=0
+export LOCKSTEP_K=0
+export MLP_CLASS_NAME=BaseMLP
+export RECURRENT_MLP_CLASS_NAME=BaseMLP
+export TIE_EMBEDDINGS=1
+export EMB_SCALE=1.0
+export LOGIT_SCALE=1.0
+export LOGIT_SOFTCAP=30.0
 export POE_NUM_EXPERTS=1
+export POE_HEAD_LR=0.008
+export EMBED_LR=0.6
+export HEAD_LR=0.008
+export TIED_EMBED_LR=0.05
+export TIED_EMBED_INIT_STD=0.005
+export MATRIX_LR=0.04
+export SCALAR_LR=0.04
+export MUON_MOMENTUM=0.95
+export MUON_BACKEND_STEPS=5
+export MUON_MOMENTUM_WARMUP_START=0.85
+export MUON_MOMENTUM_WARMUP_STEPS=500
+export MUON_ROW_NORMALIZE=1
+export MUON_WD=0.095
+export BETA1=0.9
+export BETA2=0.95
+export ADAM_EPS=1e-8
 export GRAD_CLIP_NORM=0.3
 export EMA_ENABLED=0
-export SWA_ENABLED=1
+export EMA=0
+export EMA_DECAY=0.997
+export EMA_UPDATE_EVERY=1
+export SWA_ENABLED=0
 export SWA_START_FRAC=0.2
 export SWA_EVERY=50
+export QAT_BITS=0
+export QAT_START_STEP=500
+export QAT_LINEAR=1
+export QAT_TIED_OUTPUT=1
+export QUANT_BITS=8
+export GPTQ_ENABLED=0
+export GPTQ_CALIBRATION_BATCHES=32
+export GPTQ_RESERVE_SECONDS=12
+export GPTQ_BLOCKSIZE=128
+export GPTQ_DAMPENING=0.01
+export GPTQ_MIN_NUMEL=65536
+export GPTQ_ACT_ORDER=1
+export GPTQ_QUANTIZE_EMBEDDINGS=1
+export GPTQ_MATRIX_CLIP_SIGMAS=12.85
+export GPTQ_EMBED_CLIP_SIGMAS=20.0
+export SAVE_RAW_MODEL=0
+export XSA_LAST_N=0
+export ATTN_RES_MODE=none
+export ATTN_RES_SCOPE=all
+export ATTN_RES_BLOCK_SIZE=2
+export LAUREL_SCOPE=none
+export LAUREL_RANK=0
+export LAUREL_SCALE_INIT=0.01
+export LAUREL_NORM=1
+export RESIDUAL_MODE=sequential
+export PARALLEL_RESIDUAL_SCOPE=none
+export PARALLEL_RESIDUAL_START=-1
+export PARALLEL_RESIDUAL_LN_SCALE=1
+export CODA_MOE_NUM_EXPERTS=0
+export CODA_MOE_TOP_K=1
+export CODA_MOE_MLP_MULT=0
+export DEEPSEEK_MOE_NUM_BASE_EXPERTS=0
+export DEEPSEEK_MOE_EXPERT_SEGMENTS=4
+export DEEPSEEK_MOE_SHARED_EXPERTS=1
+export DEEPSEEK_MOE_ACTIVE_EXPERTS=0
+export DEEPSEEK_MOE_MLP_MULT=0
+export DEEPSEEK_MOE_BALANCE_ALPHA=0.0
+export DEEPSEEK_MOE_NORM_TOPK_PROB=1
+export GRADIENT_CHECKPOINTING=0
+export ACTIVATION_CHECKPOINT_IMPL=none
+export SLIDING_WINDOW_ENABLED=0
+export SLIDING_COMPILE_LOGITS=0
+export EVAL_STRIDE=64
+export PPM_ENABLED=0
+export PPM_ORDER=5
+export PPM_SUBSET_TOKENS=5000000
+export PPM_LAMBDA_HI=0.9
+export PPM_LAMBDA_LO=0.05
+export PPM_CONF_THRESHOLD=0.9
+export PPM_USE_META_MIX=0
+export PPM_TOKEN_ORDER=3
+export PPM_META_ALPHA=0.995
+export PPM_META_ETA=2.0
+export PPM_META_WARMUP_BYTES=4096
+export LZP_ENABLED=0
+export LZP_SUBSET_TOKENS=5000000
+export LZP_ORDERS=4,5,6,8
+export LZP_TABLE_BITS=20
+export LZP_ALPHA_MIN=0.0
+export LZP_ALPHA_MAX=0.20
+export LZP_MIN_STREAK=1
+export LZP_MAX_STREAK=8
+export LZP_HIT_PROB=0.98
+export NGRAM_EVAL_ORDER=0
+export NGRAM_EVAL_MIN_ORDER=2
+export NGRAM_EVAL_ALPHA=0.30
+export NGRAM_EVAL_ADAPTIVE=1
+export NGRAM_EVAL_ALPHA_MIN=0.05
+export NGRAM_EVAL_ALPHA_MAX=0.60
+export NGRAM_EVAL_ENTROPY_CENTER=4.0
+export NGRAM_EVAL_ENTROPY_SCALE=2.0
+export NGRAM_EVAL_MIN_COUNT=2
+export NGRAM_EVAL_BUCKETS=4194304
+export NGRAM_EVAL_MAX_SECONDS=0.0
+export NGRAM_ENTROPY_SHIFT=0
+export NGRAM_ORDER_MULTS=""
+export NGRAM_CUBRIC_CADENCE=0
+export CUBRIC_CADENCE=0
+export NGRAM_CHUNK_TOKENS=1048576
+export NGRAM_BATCH_SEQS=128
+export NGRAM_MIX_MODE=linear
+export NGRAM_EXPERT_TOPK=8
+export NGRAM_EXPERT_BOOST_SCALE=0.25
+export NGRAM_EXPERT_MAX_BOOST=12.0
+export TTT_ENABLED=0
+export TTT_LR=0.005
+export TTT_MOMENTUM=0.9
+export TTT_EPOCHS=3
+export TTT_CHUNK_TOKENS=32768
+export TTT_BATCH_SEQS=32
+export TTT_GRAD_CLIP=1.0
 export SEED=1337
 
 # Run training
-"${PYTHON:-/workspace/parameter-golf/.venv/bin/python}" train_gpt_parcae.py
+"${PYTHON_BIN}" train_gpt_parcae.py
 
 # Parse exact roundtrip BPB and other metrics from log
 if [[ ! -f "${LOGFILE}" ]]; then
@@ -61,14 +205,19 @@ if [[ ! -f "${LOGFILE}" ]]; then
     exit 1
 fi
 
-VAL_BPB=$(grep 'final_int8_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*val_bpb:([0-9.]+).*/\1/' || echo "")
-VAL_LOSS=$(grep 'final_int8_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*val_loss:([0-9.]+).*/\1/' || echo "")
-TRAIN_TIME=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 | sed -E 's/.*train_time:([0-9.]+)ms.*/\1/' || echo "")
-STEPS=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 | sed -E 's/.*step:([0-9]+)\/.*/\1/' || echo "")
-STEP_AVG=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 | sed -E 's/.*step_avg:([0-9.]+)ms.*/\1/' || echo "")
-SUBMISSION_BYTES=$(grep 'Total submission size int8+zlib:' "${LOGFILE}" | tail -n1 | sed -E 's/.*Total submission size int8\+zlib: ([0-9]+) bytes.*/\1/' || echo "")
+ROUNDTRIP_LINE=$(grep -E 'final_(gptq_)?int[0-9]+_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 || true)
+FINAL_STEP_LINE=$(grep -E 'step:[0-9]+/[0-9]+ val_loss:' "${LOGFILE}" | tail -n1 || true)
+STOP_LINE=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 || true)
+SUBMISSION_LINE=$(grep -E 'Total submission size (gptq_)?int[0-9]+\+zlib:' "${LOGFILE}" | tail -n1 || true)
+
+VAL_BPB=$(sed -E 's/.*val_bpb:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
+VAL_LOSS=$(sed -E 's/.*val_loss:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
+TRAIN_TIME=$(sed -E 's/.*train_time:([0-9.]+)ms.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
+STEPS=$(sed -E 's/.*step:([0-9]+)\/.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
+STEP_AVG=$(sed -E 's/.*step_avg:([0-9.]+)ms.*/\1/' <<<"${FINAL_STEP_LINE}")
+SUBMISSION_BYTES=$(sed -E 's/.*Total submission size (gptq_)?int[0-9]+\+zlib: ([0-9]+) bytes.*/\2/' <<<"${SUBMISSION_LINE}")
 PEAK_MEM=$(grep 'peak memory allocated:' "${LOGFILE}" | tail -n1 | sed -E 's/.*allocated: ([0-9]+) MiB.*/\1/' || echo "")
-TRAIN_LOSS=$(grep 'step:[0-9]*/1000000 train_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*train_loss:([0-9.]+).*/\1/' || echo "")
+TRAIN_LOSS=$(grep -E 'step:[0-9]+/[0-9]+ train_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*train_loss:([0-9.]+).*/\1/' || echo "")
 
 # Validate extraction
 if [[ -z "${VAL_BPB}" ]]; then
@@ -87,6 +236,6 @@ echo "METRIC train_time_ms=${TRAIN_TIME:-0}"
 
 # Also output raw key lines for human inspection
 echo "=== SUMMARY ==="
-grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 || true
-grep 'Total submission size int8+zlib:' "${LOGFILE}" | tail -n1 || true
-grep 'final_int8_zlib_roundtrip_exact' "${LOGFILE}" | tail -n1 || true
+[[ -n "${STOP_LINE}" ]] && echo "${STOP_LINE}"
+[[ -n "${SUBMISSION_LINE}" ]] && echo "${SUBMISSION_LINE}"
+[[ -n "${ROUNDTRIP_LINE}" ]] && echo "${ROUNDTRIP_LINE}"
