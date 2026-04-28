@@ -379,7 +379,7 @@ def test_eval_val_sliding_lzp_integration_collects_prefix_once_and_logs_metrics(
     token_bytes = [bytes([i]) for i in range(256)]
     logs: list[str] = []
 
-    loss, bpb, context_result = pg.eval_val_sliding(
+    loss, bpb, context_result, ngram_result = pg.eval_val_sliding(
         args,
         UniformModel(256),
         rank=0,
@@ -397,6 +397,7 @@ def test_eval_val_sliding_lzp_integration_collects_prefix_once_and_logs_metrics(
     assert math.isclose(loss, math.log(256.0), rel_tol=1e-6)
     assert math.isclose(bpb, 8.0, rel_tol=1e-6)
     assert context_result is not None
+    assert ngram_result is None
     assert context_result["bytes"] == args.lzp_subset_tokens
     assert context_result["lzp_coverage"] > 0.25
     assert any("context_mix bytes:24" in line and "lzp_only:" in line for line in logs)
