@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -140,14 +141,9 @@ def test_liger_style_gated_mlp_is_wired_into_gpt():
     assert isinstance(model.prelude[0].mlp, pg.LigerStyleGatedMLP)
     assert all(isinstance(block.mlp, pg.LigerStyleGatedMLP) for block in model.core_block)
     assert isinstance(model.coda[0].mlp, pg.LigerStyleGatedMLP)
-    qat_names = {
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, pg.CastedLinear) and module in model.qat_linears
-    }
-    assert "core_block.0.mlp.gate_proj" in qat_names
-    assert "core_block.0.mlp.up_proj" in qat_names
-    assert "core_block.0.mlp.down_proj" in qat_names
+    assert isinstance(model.core_block[0].mlp.gate_proj, pg.CastedLinear)
+    assert isinstance(model.core_block[0].mlp.up_proj, pg.CastedLinear)
+    assert isinstance(model.core_block[0].mlp.down_proj, pg.CastedLinear)
 
     input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
     target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
@@ -340,18 +336,39 @@ def test_parallel_residual_scope_and_start_use_physical_layer_indices():
 
 
 def test_qat_schedule_is_latched_outside_forward():
+    pytest.importorskip("torchao")
     h = _tiny_h()
-    h.qat_bits = 6
+    h.qat_bits = 4
+    h.qat_group_size = 8
+    h.qat_activation_bits = 8
     h.qat_start_step = 3
     model = pg.GPT(h)
+    pg.prepare_torchao_qat(model, h)
 
     model.set_training_step(2)
     assert not model._qat_enabled
-    assert all(not module.qat_enabled for module in model.qat_linears)
+    assert model.qat_fake_quant_modules
+    assert all(
+        not getattr(fake_quantizer, "enabled", False)
+        for module in model.qat_fake_quant_modules
+        for fake_quantizer in (
+            getattr(module, "activation_fake_quantizer", None),
+            getattr(module, "weight_fake_quantizer", None),
+        )
+        if fake_quantizer is not None
+    )
 
     model.set_training_step(3)
     assert model._qat_enabled
-    assert all(module.qat_enabled for module in model.qat_linears)
+    assert all(
+        getattr(fake_quantizer, "enabled", False)
+        for module in model.qat_fake_quant_modules
+        for fake_quantizer in (
+            getattr(module, "activation_fake_quantizer", None),
+            getattr(module, "weight_fake_quantizer", None),
+        )
+        if fake_quantizer is not None
+    )
 
     model.step = 0
     x = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
