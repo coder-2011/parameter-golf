@@ -25,7 +25,7 @@ Context: strict 300s wall-clock, SP1024, dim=384 batch=131k compile=1 SWA=1. Bes
 - `MUON_MOMENTUM=0.90` worth a quick test.
 
 ### F. NGRAM eval mixer
-- `NGRAM_EVAL_ORDER=5 NGRAM_MIX_MODE=linear` — eval-only, doesn't change trained model. Separate metric to watch: `final_..._ngram..._exact`.
+- `NGRAM_EVAL_ORDER=5 NGRAM_MIX_MODE=expert` — eval-only, doesn't change trained model. Separate metric to watch: `final_..._ngram..._exact`.
 
 ## Medium priority
 
