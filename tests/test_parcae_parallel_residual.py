@@ -55,6 +55,7 @@ def _tiny_h() -> pg.Hyperparameters:
     h.poe_num_experts = 1
     h.qat_bits = 0
     h.qat_linear = True
+    h.qat_embeddings = True
     h.qat_tied_output = True
     h.xsa_last_n = 0
     return h

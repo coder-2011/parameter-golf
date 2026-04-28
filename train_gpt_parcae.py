@@ -46,6 +46,11 @@ try:
 except Exception:
     LigerCrossEntropyLoss = None
 
+try:
+    from liger_kernel.ops.rope import LigerRopeFunction
+except Exception:
+    LigerRopeFunction = None
+
 def liger_cross_entropy(
     logits: Tensor,
     target: Tensor,
@@ -166,8 +171,9 @@ class Hyperparameters:
     qat_bits = int(os.environ.get("QAT_BITS", 0))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 500))
     qat_group_size = int(os.environ.get("QAT_GROUP_SIZE", 32))
-    qat_activation_bits = int(os.environ.get("QAT_ACTIVATION_BITS", 8))
+    qat_activation_bits = int(os.environ.get("QAT_ACTIVATION_BITS", 0))
     qat_linear = bool(int(os.environ.get("QAT_LINEAR", "1")))
+    qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "1")))
     qat_tied_output = bool(int(os.environ.get("QAT_TIED_OUTPUT", "1")))
     quant_bits = int(os.environ.get("QUANT_BITS", qat_bits if qat_bits > 0 else 8))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
@@ -180,6 +186,11 @@ class Hyperparameters:
     gptq_quantize_embeddings = bool(int(os.environ.get("GPTQ_QUANTIZE_EMBEDDINGS", "1")))
     gptq_matrix_clip_sigmas = float(os.environ.get("GPTQ_MATRIX_CLIP_SIGMAS", 12.85))
     gptq_embed_clip_sigmas = float(os.environ.get("GPTQ_EMBED_CLIP_SIGMAS", 20.0))
+    quant_keep_float_patterns = tuple(
+        pattern.strip()
+        for pattern in os.environ.get("QUANT_KEEP_FLOAT_PATTERNS", "").split(",")
+        if pattern.strip()
+    )
     save_raw_model = bool(int(os.environ.get("SAVE_RAW_MODEL", "0")))
 
     # Model shape.
@@ -241,6 +252,7 @@ class Hyperparameters:
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "0")))
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     liger_ce = bool(int(os.environ.get("LIGER_CE", "0")))
+    liger_rope = bool(int(os.environ.get("LIGER_ROPE", "0")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
     poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
@@ -2303,6 +2315,13 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+def should_keep_float_tensor(name: str, t: Tensor, keep_float_patterns: tuple[str, ...] = ()) -> bool:
+    return (
+        t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL
+        or _is_control_tensor_name(name)
+        or any(pattern in name for pattern in keep_float_patterns)
+    )
+
 def _set_fake_quantizer_enabled(module: nn.Module, enabled: bool) -> None:
     for attr in ("activation_fake_quantizer", "weight_fake_quantizer"):
         fake_quantizer = getattr(module, attr, None)
@@ -2312,13 +2331,14 @@ def _set_fake_quantizer_enabled(module: nn.Module, enabled: bool) -> None:
 def _torchao_int_dtype(bits: int):
     if bits == 8:
         return torch.int8
-    if bits == 4 and hasattr(torch, "int4"):
-        return torch.int4
-    if bits == 4:
+    if 1 <= bits <= 7:
+        dtype = getattr(torch, f"int{bits}", None)
+        if dtype is not None:
+            return dtype
         from torchao.quantization.quant_primitives import TorchAODType
 
-        return TorchAODType.INT4
-    raise ValueError(f"TorchAO QAT supports QAT_BITS=4 or 8, got {bits}")
+        return getattr(TorchAODType, f"INT{bits}")
+    raise ValueError(f"TorchAO QAT supports QAT_BITS in [1, 8], got {bits}")
 
 def prepare_torchao_qat(model: nn.Module, args: "Hyperparameters") -> None:
     if args.qat_bits <= 0 or not args.qat_linear:
@@ -2352,11 +2372,12 @@ def prepare_torchao_qat(model: nn.Module, args: "Hyperparameters") -> None:
         QATConfig(activation_config=activation_config, weight_config=weight_config, step="prepare"),
         filter_fn=lambda module, _: isinstance(module, CastedLinear),
     )
-    quantize_(
-        model,
-        QATConfig(weight_config=weight_config, step="prepare"),
-        filter_fn=lambda module, _: isinstance(module, nn.Embedding),
-    )
+    if args.qat_embeddings:
+        quantize_(
+            model,
+            QATConfig(weight_config=weight_config, step="prepare"),
+            filter_fn=lambda module, _: isinstance(module, nn.Embedding),
+        )
     if isinstance(model, GPT):
         model.refresh_qat_modules()
 
@@ -2462,7 +2483,7 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if should_keep_float_tensor(name, t):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["quant_payload_bytes"] += tensor_nbytes(kept)
@@ -2741,7 +2762,7 @@ def quantize_state_dict_gptq_int(
             methods[name] = "passthrough_nonfloat"
             continue
 
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or _is_control_tensor_name(name):
+        if should_keep_float_tensor(name, t, args.quant_keep_float_patterns):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["quant_payload_bytes"] += tensor_nbytes(kept)
@@ -3206,6 +3227,33 @@ def apply_rotary_emb_complex_like(q: Tensor, k: Tensor, freqs_cos: Tensor, freqs
         return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
+def apply_liger_rotary_emb(q: Tensor, k: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, rope_dims: int) -> tuple[Tensor, Tensor]:
+    if LigerRopeFunction is None:
+        raise RuntimeError("LIGER_ROPE=1 requires liger-kernel with liger_kernel.ops.rope.LigerRopeFunction")
+    if not (q.is_cuda and k.is_cuda):
+        return apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, rope_dims)
+
+    freqs_cos = freqs_cos[..., : rope_dims // 2]
+    freqs_sin = freqs_sin[..., : rope_dims // 2]
+    cos = freqs_cos.squeeze(2).contiguous() if freqs_cos.ndim == 4 else freqs_cos.contiguous()
+    sin = freqs_sin.squeeze(2).contiguous() if freqs_sin.ndim == 4 else freqs_sin.contiguous()
+
+    if rope_dims == q.shape[-1]:
+        q_out, k_out = LigerRopeFunction.apply(q.transpose(1, 2), k.transpose(1, 2), cos, sin)
+        return q_out.transpose(1, 2), k_out.transpose(1, 2)
+
+    q_rot, k_rot = LigerRopeFunction.apply(
+        q[..., :rope_dims].transpose(1, 2),
+        k[..., :rope_dims].transpose(1, 2),
+        cos,
+        sin,
+    )
+    return (
+        torch.cat((q_rot.transpose(1, 2), q[..., rope_dims:]), dim=-1),
+        torch.cat((k_rot.transpose(1, 2), k[..., rope_dims:]), dim=-1),
+    )
+
+
 def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
@@ -3360,6 +3408,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         qk_bias: bool,
         clip_qkv: float | None,
         rope_dims: int,
+        liger_rope: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -3377,6 +3426,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         if rope_dims <= 0 or rope_dims > self.head_dim or rope_dims % 2 != 0:
             raise ValueError(f"rope_dims must be a positive even value <= head_dim; got {rope_dims} for head_dim={self.head_dim}")
         self.rope_dims = rope_dims
+        self.liger_rope = liger_rope
         self.qk_norm = qk_norm
         self.clip_qkv = clip_qkv
         self.c_qkv = CastedLinear(dim, self.q_dim + 2 * self.kv_dim, bias=False)
@@ -3426,7 +3476,10 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = (q + self.q_bias).to(q.dtype)
             k = (k + self.k_bias).to(k.dtype)
 
-        q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
+        if self.liger_rope:
+            q, k = apply_liger_rotary_emb(q, k, freqs_cos, freqs_sin, self.rope_dims)
+        else:
+            q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
         if self.qk_norm:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
@@ -3476,6 +3529,7 @@ class TransformerPreNormBlock(nn.Module):
         ln_scale: bool,
         residual_layer_idx: int,
         attn_res_enabled: bool = False,
+        liger_rope: bool = False,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -3493,6 +3547,7 @@ class TransformerPreNormBlock(nn.Module):
             qk_bias=qk_bias,
             clip_qkv=clip_qkv,
             rope_dims=rope_dims,
+            liger_rope=liger_rope,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = get_mlp_class(mlp_class_name)
@@ -3808,6 +3863,7 @@ class GPT(nn.Module):
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i,
                 attn_res_enabled=self._attn_res_enabled_for("prelude"),
+                liger_rope=h.liger_rope,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -3843,6 +3899,7 @@ class GPT(nn.Module):
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude,
                 attn_res_enabled=self._attn_res_enabled_for("core"),
+                liger_rope=h.liger_rope,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -3878,6 +3935,7 @@ class GPT(nn.Module):
                 ln_scale=h.parallel_residual_ln_scale,
                 residual_layer_idx=i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block,
                 attn_res_enabled=self._attn_res_enabled_for("coda"),
+                liger_rope=h.liger_rope,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -4610,11 +4668,13 @@ def main() -> None:
     args = Hyperparameters()
     if args.qat_bits != 0:
         signed_quant_max(args.qat_bits)
-    if args.qat_bits not in {0, 4, 8}:
-        raise ValueError(f"TorchAO QAT supports QAT_BITS=4 or 8, got {args.qat_bits}")
+    if args.qat_bits != 0 and not (1 <= args.qat_bits <= 8):
+        raise ValueError(f"TorchAO QAT supports QAT_BITS in [1, 8], got {args.qat_bits}")
     signed_quant_max(args.quant_bits)
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
+    if args.liger_rope and LigerRopeFunction is None:
+        raise RuntimeError("LIGER_ROPE=1 requires installing liger-kernel")
     if "NUM_LAYERS" in os.environ:
         raise ValueError("NUM_LAYERS is ignored by train_gpt_parcae.py; use N_LAYERS_IN_PRELUDE, N_LAYERS_IN_RECURRENT_BLOCK, and N_LAYERS_IN_CODA")
     if "QK_GAIN_INIT" in os.environ:
@@ -4989,6 +5049,10 @@ def main() -> None:
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
     log0(f"liger_ce:enabled:{args.liger_ce} real_liger_available:{LigerCrossEntropyLoss is not None}")
+    log0(
+        f"liger_rope:enabled:{args.liger_rope} real_liger_available:{LigerRopeFunction is not None} "
+        "convention:llama_split_half"
+    )
     attn_res_params = sum(
         p.numel()
         for module in base_model.modules()
@@ -5012,7 +5076,7 @@ def main() -> None:
         f"qat:bits:{args.qat_bits} start_step:{args.qat_start_step} "
         f"backend:torchao group_size:{args.qat_group_size} "
         f"activation_bits:{args.qat_activation_bits} linear:{args.qat_linear} "
-        f"tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
+        f"embeddings:{args.qat_embeddings} tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
     )
     log0(
         f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
