@@ -1,0 +1,128 @@
+logs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_pwa_qk_dense_v_int6rans_20260429.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0
+train_loader:dataset:fineweb10B_sp1892 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_*.bin tokens:53271040
+model_params:19948289
+world_size:1 grad_accum_steps:1
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:8 num_kv_heads:4 qkv_projection:pwa_qk_dense_v rrhp_reduction_factor:4 pwa_num_bases:6 pwa_permute_size:4 pwa_init_scale:0.707107 pwa_lr:0.02 window:-1
+attn_preconv:kernel:0 scale_init:0.005 lr:0.001
+mlp:outer:BaseMLP recurrent:BaseMLP liger_geglu_available:True
+bigram_hash:buckets:4096 dim:128 heads:1 gate:False scale_init:0.05
+parcae:prelude:4 core:1 coda:4 recurrent_dim:512 recurrence:1/1 iteration:per-batch sampling:fixed injection:diagonal residual_mode:parallel parallel_residual_scope:all parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:delayed parallel_residual_record_controls:False parallel_residual_tied_norm:True parallel_residual_in_fp32:True attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_0 active_effective_layers:[]
+liger_ce:enabled:True real_liger_available:True
+liger_rope:enabled:False real_liger_available:True convention:llama_split_half
+tridao_packed_rope:enabled:True triton_available:True convention:adjacent_pair_interleaved layout:packed_qkv_inplace
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 poe_experts:1 poe_extra_heads:0 poe_head_lr:0.008 matrix_lr:0.02 scalar_lr:0.02 muon_steps:5 muon_wd:0.04 muon_row_normalize:True
+qat:bits:0 start_step:500 backend:torchao group_size:32 activation_bits:0 linear:True embeddings:True tied_output:True export_bits:6 rans_int6:True
+gptq:enabled:False calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:32768 train_seq_len:512 iterations:1000000 warmup_steps:200 max_wallclock_seconds:600.000
+weight_average:ema_enabled:False ema_decay:0.997 ema_update_every:1 swa_enabled:True swa_start_frac:0.5 swa_every:50 swa_dynamic:True swa_dynamic_min_every:10 swa_dynamic_power:1.5 swa_dynamic_weight_max:2 priority:swa
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+Traceback (most recent call last):
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 6231, in <module>
+    main()
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5833, in main
+    warmup_loss = model(x, y)
+                  ^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 472, in __call__
+    return super().__call__(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1024, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4890, in forward
+    out = self.forward_model(input_ids, labels=target_ids, return_logits=False)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4737, in forward_model
+    def forward_model(
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1263, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/aot_autograd.py", line 1200, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 566, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 105, in g
+    return f(*args)
+           ^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/autograd/function.py", line 596, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2503, in forward
+    fw_outs = call_func_at_runtime_with_args(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 783, in wrapper
+    return compiled_fn(runtime_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 1011, in inner_fn
+    outs = compiled_fn(args)
+           ^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/output_code.py", line 656, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/utils.py", line 3401, in run
+    out = model(new_inputs)
+          ^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_root/qa/cqabrpno64r7yiytis6lg65rs2pt5njvule3zb5go3g62oz5znet.py", line 1410, in call
+    triton_poi_fused_as_strided_clone_6.run(buf13, buf14, 33554176, stream=stream0)
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1448, in run
+    self.autotune_to_one_config(*args, **kwargs)
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1176, in autotune_to_one_config
+    timings = self.benchmark_all_configs(*args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1138, in benchmark_all_configs
+    timings = {
+              ^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1139, in <dictcomp>
+    launcher: self.bench(launcher, *args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 999, in bench
+    return benchmarker.benchmark(
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
+    return fn(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 206, in benchmark
+    return self.benchmark_gpu(_callable, warmup=warmup, rep=rep, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
+    return fn(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 380, in benchmark_gpu
+    torch.cuda.synchronize()
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py", line 1162, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
