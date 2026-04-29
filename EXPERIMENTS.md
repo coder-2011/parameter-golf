@@ -4,6 +4,73 @@
 
 This section consolidates the SP1892 work from the QID/QAT discussion through the record-copy comparisons and value-embedding check. The high-level outcome is that the best completed local run in this session is still the simple 9-effective-layer Parcae recipe at exact int6 BPB `1.47431031`; QAT/GPTQ/XSA-heavy paths were either slower, worse, or hit Blackwell/Triton compile issues.
 
+Update: the best completed local run in this family is now
+`runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_int6rans_20260429`.
+It uses SP1892, 9 effective 512d layers, `MLP_MULT=3`, BigramHash `4096x128`,
+full attention, `TRAIN_BATCH_TOKENS=32768`, dynamic SWA, and int6 RANS+zlib export.
+It reached step `6384` in the 600s train cap, pre-export `val_bpb:1.4059`, and exact
+roundtrip `val_bpb:1.41159149`. Total submission size was `16,822,763` bytes, so it
+improves quality substantially over the earlier `1.47431031` SP1892 baseline but is
+still slightly above a strict 16 MiB budget.
+
+Follow-up PWA QKV trial:
+
+- Run: `runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_pwa_int6rans_20260429`
+- Change from the current best: set `ATTN_QKV_MODE=pwa`; all other major settings kept
+  matched (`SP1892`, `TRAIN_BATCH_TOKENS=32768`, full attention, dynamic SWA, int6
+  RANS+zlib).
+- Header confirmed `qkv_projection:pwa`, `pwa_num_bases:6`, `pwa_permute_size:4`, and
+  params dropped from `23,590,657` to `18,616,833`.
+- Early result was clearly worse with no useful speed gain: at step `1600`, PWA train
+  loss was `3.5953` at `92.85ms/step`; the packed-QKV best run was `3.0635` at roughly
+  the same step and `93.17ms/step`.
+- Stopped early at step `1600`; not worth completing under this exact configuration.
+
+Fixed-PWA same-budget follow-up:
+
+- Code fix: `PWAQKVProjection` no longer wraps its basis rows in `RRHPWeight`. It now
+  stores full-width learned bases (`num_bases x dim`) and indexes those rows directly,
+  matching the SLlama PWA pseudocode structure more closely. This keeps PWA independent
+  from `ATTN_QKV_MODE=rrhp`.
+- Parameter smoke: at width `512`, packed QKV has `1024 x 512 = 524,288` parameters per
+  attention layer, while fixed PWA with `PWA_NUM_BASES=6` has `6 x 512 = 3,072`; PWA still
+  saves `521,216` QKV parameters per layer.
+- Run: `runs/sp1892_9l576_mlp3_bh4096_swa_dyn_fullattn_b32k_pwa8_fixed_int6rans_lr18_20260429`
+- Config changes from current best: fixed PWA, width scaled to `MODEL_DIM=RECURRENT_DIM=576`
+  to spend the saved QKV budget, `PWA_NUM_BASES=8`, `PWA_PERMUTE_SIZE=4`, and reduced
+  LR knobs (`MATRIX_LR=0.018`, `SCALAR_LR=0.018`, `TIED_EMBED_LR=0.028`).
+- Header confirmed near-matched size: `23,308,161` params versus packed best
+  `23,590,657` params.
+- Result: `4924` steps, `121.87ms/step`, pre-export `val_bpb:1.6477`, final exact
+  int6 RANS+zlib roundtrip `val_bpb:1.65480940`, total submission size `16,352,119`
+  bytes.
+- Interpretation: fixed PWA is now actually parameter-saving and can fit the artifact
+  budget after scaling, but quality is far worse than the packed-QKV current best
+  (`1.41159149`). The loss gap is too large to explain as a minor LR issue.
+
+### Quick tokenizer sweep: SP1024 vs SP1892 vs SP4096
+
+Goal: get a low-impact directional comparison of tokenizer choices without tying up the GPU. This is not an official challenge-quality comparison: each run used a tiny matched train/val slice rather than full validation, and the first `131072` validation tokens cover different byte spans for different tokenizers. The comparison is still useful as a quick same-code, same-shape signal.
+
+Shared config:
+
+- Model: Parcae `MODEL_DIM=96`, `RECURRENT_DIM=96`, 1 prelude / 1 core / 1 coda, `MEAN_RECURRENCE=1`, `MLP_MULT=2`, no BigramHash, no EMA/SWA, no QAT/GPTQ.
+- Training: `TRAIN_BATCH_TOKENS=1024`, `TRAIN_SEQ_LEN=128`, `MAX_WALLCLOCK_SECONDS=45`, `COMPILE_MODEL=0`, `LIGER_CE=1`, `VAL_BATCH_SIZE=4096`.
+- Data: local tiny sweep shards with `1,048,576` train tokens and `131,072` val target tokens per tokenizer.
+- GPU impact: peak allocated memory stayed below `215 MiB`; sampled SP1892/SP4096 process SM use was around `8-18%` after killing a stale unrelated `train_gpt.py` process.
+
+| Tokenizer | Run | Params | Steps | Step avg | Val loss | Exact BPB | Peak alloc | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| SP1024 | `logs/tokenizer_sweep_lowgpu_sp1024_20260429_022549.txt` | 314,368 | 2194 | 20.51ms | 4.0510 | 2.42985855 | 70 MiB | Smallest vocab, fastest steps, worst BPB in this slice |
+| SP1892 | `logs/tokenizer_sweep_lowgpu_sp1892_20260429_022549.txt` | 397,696 | 2083 | 21.61ms | 4.5631 | 2.35906366 | 112 MiB | Middle vocab, middle result |
+| SP4096 | `logs/tokenizer_sweep_lowgpu_sp4096_20260429_022549.txt` | 609,280 | 1843 | 24.42ms | 5.1549 | 2.24441973 | 215 MiB | Largest vocab, slowest and largest, best BPB in this slice |
+
+Interpretation:
+
+- In this low-budget controlled sweep, BPB improved monotonically with vocab size: SP4096 beat SP1892, which beat SP1024.
+- The cost also rose monotonically: parameters, memory, and step time all increased with vocab size because tied embeddings and output projection grow with vocab.
+- SP4096 looks worth testing in a real run, but full SP4096 validation needs care: default `VAL_BATCH_SIZE=524288` OOM'd on a tiny smoke because the current Liger CE wrapper applies softcap in fp32 before CE. Use a smaller validation batch or optimize eval softcap before serious SP4096 sweeps.
+
 ### Implementation and setup decisions
 
 - QAT was reworked toward the TorchAO-style path: `QAT_BITS>0` prepares `CastedLinear` modules as TorchAO fake-quantized linears and gates fake quant outside compiled forward via `GPT.set_training_step(step)`. The old custom STE fallback was removed earlier in this session series.
