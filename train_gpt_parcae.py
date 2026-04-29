@@ -277,6 +277,7 @@ class Hyperparameters:
     rrhp_reduction_factor = int(os.environ.get("RRHP_REDUCTION_FACTOR", "4"))
     pwa_num_bases = int(os.environ.get("PWA_NUM_BASES", "6"))
     pwa_permute_size = int(os.environ.get("PWA_PERMUTE_SIZE", "4"))
+    pwa_init_scale = float(os.environ.get("PWA_INIT_SCALE", str(1.0 / math.sqrt(2.0))))
     attn_preconv_kernel = int(os.environ.get("ATTN_PRECONV_KERNEL", "0"))
     attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.005"))
     attn_preconv_lr = float(os.environ.get("ATTN_PRECONV_LR", "0.001"))
@@ -306,6 +307,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    pwa_lr = float(os.environ.get("PWA_LR", matrix_lr))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -4311,6 +4313,7 @@ class GPT(nn.Module):
         self.poe_num_experts = h.poe_num_experts
         self.xsa_last_n = h.xsa_last_n
         self.attn_qkv_mode = h.attn_qkv_mode
+        self.pwa_init_scale = h.pwa_init_scale
         assert self.attn_qkv_mode in {"packed", "rrhp", "pwa", "pwa_qk_dense_v"}
         assert h.rrhp_reduction_factor > 0
         assert h.pwa_num_bases > 0
@@ -4606,7 +4609,7 @@ class GPT(nn.Module):
                 std = recurrent_std if name.startswith('core_block.') else base_std
                 nn.init.trunc_normal_(module.weight_reduced, mean=0.0, std=std, a=-3 * std, b=3 * std)
             if isinstance(module, PWAQKVProjection):
-                std = recurrent_std if name.startswith('core_block.') else base_std
+                std = (recurrent_std if name.startswith('core_block.') else base_std) * self.pwa_init_scale
                 nn.init.trunc_normal_(module.bases, mean=0.0, std=std, a=-3 * std, b=3 * std)
             if isinstance(module, CausalDepthwisePreAttentionConv):
                 std = recurrent_std if name.startswith('core_block.') else base_std
@@ -5567,6 +5570,9 @@ def main() -> None:
     def is_attn_preconv_param(name: str) -> bool:
         return '.attn_preconv.' in name
 
+    def is_pwa_base_param(name: str) -> bool:
+        return name.endswith('.qkv_proj.bases') or name.endswith('.qkv_proj.qk_proj.bases')
+
     matrix_params = []
     scalar_params = []
     for name, p in named_params:
@@ -5575,6 +5581,8 @@ def main() -> None:
         if is_token_embedding_param(name):
             continue
         if is_attn_preconv_param(name):
+            continue
+        if is_pwa_base_param(name):
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
@@ -5621,6 +5629,15 @@ def main() -> None:
             fused=True,
         )
         optimizers.append(optimizer_preconv)
+    pwa_params = [p for name, p in named_params if p.requires_grad and is_pwa_base_param(name)]
+    if pwa_params:
+        optimizer_pwa = torch.optim.Adam(
+            [{'params': pwa_params, 'lr': args.pwa_lr, 'base_lr': args.pwa_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_pwa)
     head_params = []
     if base_model.lm_head is not None:
         head_params.append(base_model.lm_head.weight)
@@ -5655,6 +5672,7 @@ def main() -> None:
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
         f"qkv_projection:{args.attn_qkv_mode} rrhp_reduction_factor:{args.rrhp_reduction_factor} "
         f"pwa_num_bases:{args.pwa_num_bases} pwa_permute_size:{args.pwa_permute_size} "
+        f"pwa_init_scale:{args.pwa_init_scale:g} pwa_lr:{args.pwa_lr:g} "
         f"window:{args.attention_window}"
     )
     log0(
