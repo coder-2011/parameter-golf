@@ -46,7 +46,12 @@ class HedgehogFeatureMap(nn.Module):
         if self.activation == "exp":
             return torch.cat((torch.exp(x), torch.exp(-x)), dim=-1)
         if self.activation == "softmax":
-            return torch.cat((F.softmax(x, dim=-1), F.softmax(-x, dim=-1)), dim=-1)
+            x32 = x.float()
+            pos = torch.exp(x32 - x32.amax(dim=-1, keepdim=True))
+            neg = torch.exp(-x32 - (-x32).amax(dim=-1, keepdim=True))
+            pos = pos / pos.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            neg = neg / neg.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            return torch.cat((pos, neg), dim=-1).to(dtype=x.dtype)
         raise ValueError(f"unsupported Hedgehog activation: {self.activation}")
 
 
@@ -76,12 +81,13 @@ class SoftmaxCausalAttention(nn.Module):
 
 
 class HedgehogCausalAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, feature_activation: str):
+    def __init__(self, dim: int, heads: int, feature_activation: str, chunk_size: int):
         super().__init__()
         if dim % heads != 0:
             raise ValueError(f"dim={dim} must be divisible by heads={heads}")
         self.heads = heads
         self.head_dim = dim // heads
+        self.chunk_size = chunk_size
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.q_map = HedgehogFeatureMap(self.head_dim, feature_activation)
         self.k_map = HedgehogFeatureMap(self.head_dim, feature_activation)
@@ -98,11 +104,26 @@ class HedgehogCausalAttention(nn.Module):
         q, k, v = self.qkv_heads(x)
         q = self.q_map(q)
         k = self.k_map(k)
-        k_prefix = k.cumsum(dim=2)
-        kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k, v).cumsum(dim=2)
-        numer = torch.einsum("bhtf,bhtfd->bhtd", q, kv_prefix)
-        denom = torch.einsum("bhtf,bhtf->bht", q, k_prefix).unsqueeze(-1).clamp_min(1e-6)
-        y = (numer / denom).transpose(1, 2).contiguous().view(batch, seq_len, dim)
+        chunk_size = min(self.chunk_size, seq_len)
+        feature_dim = q.size(-1)
+        value_dim = v.size(-1)
+        k_state = torch.zeros(batch, self.heads, feature_dim, device=x.device, dtype=x.dtype)
+        kv_state = torch.zeros(batch, self.heads, feature_dim, value_dim, device=x.device, dtype=x.dtype)
+        outputs = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
+            k_prefix = k_chunk.cumsum(dim=2) + k_state[:, :, None, :]
+            kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k_chunk, v_chunk).cumsum(dim=2)
+            kv_prefix = kv_prefix + kv_state[:, :, None, :, :]
+            numer = torch.einsum("bhtf,bhtfd->bhtd", q_chunk, kv_prefix)
+            denom = torch.einsum("bhtf,bhtf->bht", q_chunk, k_prefix).unsqueeze(-1).clamp_min(1e-6)
+            outputs.append(numer / denom)
+            k_state = k_prefix[:, :, -1, :]
+            kv_state = kv_prefix[:, :, -1, :, :]
+        y = torch.cat(outputs, dim=2).transpose(1, 2).contiguous().view(batch, seq_len, dim)
         return self.out(y)
 
     def attention_mimicry_loss(self, x: torch.Tensor) -> torch.Tensor:
@@ -131,13 +152,14 @@ class TinyHedgehogLM(nn.Module):
         mlp_mult: int,
         attention: str,
         feature_activation: str,
+        chunk_size: int,
     ):
         super().__init__()
         attn_cls = SoftmaxCausalAttention if attention == "softmax" else HedgehogCausalAttention
         self.emb = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList()
         for _ in range(depth):
-            attn = attn_cls(dim, heads) if attention == "softmax" else attn_cls(dim, heads, feature_activation)
+            attn = attn_cls(dim, heads) if attention == "softmax" else attn_cls(dim, heads, feature_activation, chunk_size)
             self.blocks.append(
                 nn.ModuleList(
                     [
@@ -212,12 +234,15 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--feature-activation", choices=("softmax", "exp"), default="softmax")
+    parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--mimicry-weight", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
     if args.steps < 1:
         raise ValueError(f"--steps must be >= 1, got {args.steps}")
+    if args.chunk_size < 1:
+        raise ValueError(f"--chunk-size must be >= 1, got {args.chunk_size}")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -236,6 +261,7 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         attention=args.attention,
         feature_activation=args.feature_activation,
+        chunk_size=args.chunk_size,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 

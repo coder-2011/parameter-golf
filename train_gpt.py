@@ -72,6 +72,8 @@ class Hyperparameters:
     attention_type = os.environ.get("ATTENTION_TYPE", "softmax")
     hedgehog_feature_activation = os.environ.get("HEDGEHOG_FEATURE_ACTIVATION", "softmax")
     hedgehog_mimicry_weight = float(os.environ.get("HEDGEHOG_MIMICRY_WEIGHT", 0.0))
+    hedgehog_chunk_size = int(os.environ.get("HEDGEHOG_CHUNK_SIZE", train_seq_len))
+    hedgehog_feature_dim = int(os.environ.get("HEDGEHOG_FEATURE_DIM", 4))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -556,18 +558,28 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class HedgehogFeatureMap(nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, activation: str):
+    def __init__(self, num_heads: int, head_dim: int, feature_dim: int, activation: str):
         super().__init__()
         if activation not in {"softmax", "exp"}:
             raise ValueError(f"HEDGEHOG_FEATURE_ACTIVATION must be softmax or exp, got {activation}")
+        if feature_dim <= 0:
+            raise ValueError(f"HEDGEHOG_FEATURE_DIM must be positive, got {feature_dim}")
         self.activation = activation
-        self.weight = nn.Parameter(torch.eye(head_dim).repeat(num_heads, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(num_heads, head_dim))
+        weight = torch.zeros(num_heads, head_dim, feature_dim)
+        diag = min(head_dim, feature_dim)
+        weight[:, torch.arange(diag), torch.arange(diag)] = 1.0
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(torch.zeros(num_heads, feature_dim))
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.einsum("bhtd,hdf->bhtf", x, self.weight.to(dtype=x.dtype)) + self.bias.to(dtype=x.dtype)[None, :, None, :]
         if self.activation == "softmax":
-            return torch.cat((F.softmax(x, dim=-1), F.softmax(-x, dim=-1)), dim=-1)
+            x32 = x.float()
+            pos = torch.exp(x32 - x32.amax(dim=-1, keepdim=True))
+            neg = torch.exp(-x32 - (-x32).amax(dim=-1, keepdim=True))
+            pos = pos / pos.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            neg = neg / neg.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            return torch.cat((pos, neg), dim=-1).to(dtype=x.dtype)
         return torch.cat((torch.exp(x), torch.exp(-x)), dim=-1)
 
 
@@ -582,6 +594,8 @@ class CausalSelfAttention(nn.Module):
         attention_type: str,
         hedgehog_feature_activation: str,
         hedgehog_mimicry_weight: float,
+        hedgehog_chunk_size: int,
+        hedgehog_feature_dim: int,
     ):
         super().__init__()
         if attention_type not in {"softmax", "hedgehog"}:
@@ -592,8 +606,13 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         if hedgehog_mimicry_weight < 0.0:
             raise ValueError(f"HEDGEHOG_MIMICRY_WEIGHT must be non-negative, got {hedgehog_mimicry_weight}")
+        if hedgehog_chunk_size <= 0:
+            raise ValueError(f"HEDGEHOG_CHUNK_SIZE must be positive, got {hedgehog_chunk_size}")
+        if hedgehog_feature_dim <= 0:
+            raise ValueError(f"HEDGEHOG_FEATURE_DIM must be positive, got {hedgehog_feature_dim}")
         self.attention_type = attention_type
         self.hedgehog_mimicry_weight = hedgehog_mimicry_weight
+        self.hedgehog_chunk_size = hedgehog_chunk_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
@@ -608,8 +627,8 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         if attention_type == "hedgehog":
-            self.q_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_activation)
-            self.k_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_activation)
+            self.q_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_dim, hedgehog_feature_activation)
+            self.k_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_dim, hedgehog_feature_activation)
 
     def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, _ = x.shape
@@ -634,11 +653,26 @@ class CausalSelfAttention(nn.Module):
         k, v = self._repeat_kv_for_gqa(k, v)
         q_features = self.q_map(q)
         k_features = self.k_map(k)
-        k_prefix = k_features.cumsum(dim=2)
-        kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k_features, v).cumsum(dim=2)
-        numer = torch.einsum("bhtf,bhtfd->bhtd", q_features, kv_prefix)
-        denom = torch.einsum("bhtf,bhtf->bht", q_features, k_prefix).unsqueeze(-1).clamp_min(1e-6)
-        return numer / denom
+        batch, heads, seq_len, feature_dim = q_features.shape
+        value_dim = v.size(-1)
+        chunk_size = min(self.hedgehog_chunk_size, seq_len)
+        k_state = torch.zeros(batch, heads, feature_dim, device=q.device, dtype=q.dtype)
+        kv_state = torch.zeros(batch, heads, feature_dim, value_dim, device=q.device, dtype=q.dtype)
+        outputs: list[Tensor] = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            q_chunk = q_features[:, :, start:end, :]
+            k_chunk = k_features[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
+            k_prefix = k_chunk.cumsum(dim=2) + k_state[:, :, None, :]
+            kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k_chunk, v_chunk).cumsum(dim=2)
+            kv_prefix = kv_prefix + kv_state[:, :, None, :, :]
+            numer = torch.einsum("bhtf,bhtfd->bhtd", q_chunk, kv_prefix)
+            denom = torch.einsum("bhtf,bhtf->bht", q_chunk, k_prefix).unsqueeze(-1).clamp_min(1e-6)
+            outputs.append(numer / denom)
+            k_state = k_prefix[:, :, -1, :]
+            kv_state = kv_prefix[:, :, -1, :, :]
+        return torch.cat(outputs, dim=2)
 
     def _hedgehog_mimicry_loss(self, q: Tensor, k: Tensor) -> Tensor:
         k, _ = self._repeat_kv_for_gqa(k, k)
@@ -702,6 +736,8 @@ class Block(nn.Module):
         attention_type: str,
         hedgehog_feature_activation: str,
         hedgehog_mimicry_weight: float,
+        hedgehog_chunk_size: int,
+        hedgehog_feature_dim: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -715,6 +751,8 @@ class Block(nn.Module):
             attention_type,
             hedgehog_feature_activation,
             hedgehog_mimicry_weight,
+            hedgehog_chunk_size,
+            hedgehog_feature_dim,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -754,6 +792,8 @@ class GPT(nn.Module):
         attention_type: str,
         hedgehog_feature_activation: str,
         hedgehog_mimicry_weight: float,
+        hedgehog_chunk_size: int,
+        hedgehog_feature_dim: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -780,6 +820,8 @@ class GPT(nn.Module):
                     attention_type,
                     hedgehog_feature_activation,
                     hedgehog_mimicry_weight,
+                    hedgehog_chunk_size,
+                    hedgehog_feature_dim,
                 )
                 for i in range(num_layers)
             ]
@@ -947,6 +989,8 @@ def main() -> None:
         attention_type=args.attention_type,
         hedgehog_feature_activation=args.hedgehog_feature_activation,
         hedgehog_mimicry_weight=args.hedgehog_mimicry_weight,
+        hedgehog_chunk_size=args.hedgehog_chunk_size,
+        hedgehog_feature_dim=args.hedgehog_feature_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1011,7 +1055,8 @@ def main() -> None:
     log0(
         f"attention_mode:{args.attention_type} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
         f"hedgehog_feature_activation:{args.hedgehog_feature_activation} "
-        f"hedgehog_mimicry_weight:{args.hedgehog_mimicry_weight:g}"
+        f"hedgehog_mimicry_weight:{args.hedgehog_mimicry_weight:g} "
+        f"hedgehog_chunk_size:{args.hedgehog_chunk_size} hedgehog_feature_dim:{args.hedgehog_feature_dim}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
