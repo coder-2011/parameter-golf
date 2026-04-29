@@ -1,5 +1,124 @@
 # Experiment Notes
 
+## 2026-04-28/29 SP1892 QAT, record-copy, and 9L Parcae session
+
+This section consolidates the SP1892 work from the QID/QAT discussion through the record-copy comparisons and value-embedding check. The high-level outcome is that the best completed local run in this session is still the simple 9-effective-layer Parcae recipe at exact int6 BPB `1.47431031`; QAT/GPTQ/XSA-heavy paths were either slower, worse, or hit Blackwell/Triton compile issues.
+
+### Implementation and setup decisions
+
+- QAT was reworked toward the TorchAO-style path: `QAT_BITS>0` prepares `CastedLinear` modules as TorchAO fake-quantized linears and gates fake quant outside compiled forward via `GPT.set_training_step(step)`. The old custom STE fallback was removed earlier in this session series.
+- The training script now honors `GRAD_ACCUM_STEPS` from the environment instead of always using `8 // world_size`. This mattered a lot on the single RTX PRO 4500 because record scripts assumed 8 GPUs and otherwise did eight local microsteps.
+- The active hardware target for these runs is one NVIDIA RTX PRO 4500 Blackwell, not the 8xH100 setup used by the leaderboard records.
+- User correction applied for the main branch of experiments: use SP1892, not Scylla; QAT/quant target should be int6 where used, not int4 or int8.
+- `COMPILE_MODEL=1` was kept for serious runs. Disabling compile is not considered an acceptable final workaround here.
+
+### Early QAT/XSA/GPTQ runs
+
+| Run | Main config | Result | Interpretation |
+| --- | --- | --- | --- |
+| `runs/manual_parallel_xsa_muon_qat4_gptq_int6_sp1892_20260428_212909` | 256d Parcae, XSA4, QAT4 activations, GPTQ int6, EMA, `grad_accum_steps=8` | Failed during compile after warmup: Triton `libdevice.10.bc` parse error | Environment/Inductor path failure before any useful score |
+| `runs/manual_parallel_xsa_muon_qat4_gptq_int6_sp1892_20260428_215045` | same family, compile got past warmup | `1092` steps, pre-roundtrip BPB `1.7386`, final GPTQ int6 BPB `1.84045398`, `~263.8ms/step` by end | Too slow and GPTQ roundtrip hurt badly |
+| `runs/fix_sp1892_parallel_xsa_muon_qat6_gptq6_keepfragile_20260428_223813` | 256d, XSA4, QAT6, GPTQ6, EMA, fragile tensors kept float | `2613` steps, pre-roundtrip BPB `1.6573`, final GPTQ int6 BPB `1.66229903`, `~110.2ms/step` | Better than QAT4 path but still far from the later no-QAT 512d baseline |
+| `runs/sp1892_no_xsa_512_rec3x3_qat6_gptq6_20260428_224917` | 512d, recurrence 3x with backprop 1, XSA off, QAT6/GPTQ6, EMA | `2363` steps, pre-roundtrip BPB `1.6115`, final GPTQ int6 BPB `1.62056918`, artifact over budget at `17,690,502` bytes | Turning off XSA and going 512d helped, but recurrence/QAT/GPTQ remained too slow and too large |
+
+Two follow-up run dirs were created while considering TTT/no-recurrence variants:
+
+- `runs/sp1892_no_xsa_512_rec3x3_qat6_gptq6_ttt_bh64_20260428_230628`
+- `runs/sp1892_no_xsa_512_core3_norecur_qat6_gptq6_ttt_bh64_20260428_230806`
+
+Those were abandoned in favor of simplifying the shape and copying the leaderboard feature set more selectively. The main lesson from this block was that QAT+GPTQ+XSA was not the immediate path to a good single-GPU score under the 300s local cap.
+
+### Leaderboard record comparison
+
+The relevant non-LZMA records inspected were:
+
+- `records/track_10min_16mb/2026-03-22_11L_EMA_GPTQ-lite_warmdown3500_QAT015_1.1233`
+- `records/track_10min_16mb/2026-03-21_11L_XSA4_EMA_PartialRoPE_LateQAT_1.1248`
+
+Their recipe is not just scale. It combines 8xH100 throughput with an 11-layer 512d U-Net-style transformer, GQA, 3x MLP, SmearGate, BigramHash, last-4-layer XSA, partial RoPE, LN scaling, shared value embeddings, EMA/SWA variants, Muon/AdamW split, GPTQ-lite/int6 export, zstd/zlib compression, and sliding-window evaluation. The 03-21 README also notes that its late-QAT path likely had no effect because `torch.compile` constant-folded the QAT flag.
+
+Scale is still a dominant difference: the record trained roughly `5.5B` tokens in 10 minutes on 8 H100s. The local 300s Parcae baseline below trained about `6079 * 16384 ~= 99.6M` tokens, around 55x fewer than the record run.
+
+### Record-code attempts on one GPU
+
+| Run | Change | Result | Interpretation |
+| --- | --- | --- | --- |
+| `runs/sp1892_9l_512_mlp3_smear_bh_swa_int6_zlib_20260428_232327` | Copied the 03-20 record script too literally: `TRAIN_BATCH_TOKENS=786432`, `TRAIN_SEQ_LEN=2048`, hardcoded `grad_accum_steps=8` on one GPU | `142` steps, pre-roundtrip BPB `2.9318`, about `2125ms/step`, int6 artifact `16,683,515` bytes and total `16,735,758` bytes | Not viable on one RTX PRO 4500; it was an 8xH100 recipe |
+| `runs/sp1892_single_gpu_9l512_mlp3_bh_swa_int6_196k_ga2_20260428_233527` | Run-local record copy with `TRAIN_BATCH_TOKENS=196608`, `GRAD_ACCUM_STEPS=2` | Still around `545ms/step`; stopped before full result | Better than the literal copy, but still far too slow for local iteration |
+
+This led to the decision to copy the feature set selectively rather than copying the record’s batch regime.
+
+### Main 9-effective-layer Parcae branch
+
+The stable local recipe moved to SP1892, `MODEL_DIM=512`, effective shape `4 prelude + 1 core + 4 coda`, no recurrence reuse (`MEAN_RECURRENCE=1`, `MEAN_BACKPROP_DEPTH=1`), `MLP_MULT=3`, delayed parallel residuals, partial RoPE 16, QK norm, SmearGate, BigramHash, int6 export, and no QAT/GPTQ.
+
+| Run | Change | Steps | Step avg | Pre-roundtrip BPB | Final int6 BPB | Size | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `runs/sp1892_parcae_9l512_mlp3_smear_bh4096_swa_int6_single_20260428_234444` | 9-effective-layer Parcae, BigramHash `4096x128`, one head, ungated, SWA, no EMA | 6079 | 49.36ms | 1.4698 | 1.47431031 | total `17,802,177` bytes | Best completed run in this session, but over 16MB budget |
+| `runs/sp1892_parcae_9l512_mlp3_bh4096h2gate_ema_int6_single_20260429_000536` | Same shape, BigramHash heads 2 + gate, EMA instead of SWA | stopped around step 5400 | about 50.6ms | no final | no final | n/a | Training looked only marginally different, so it was stopped |
+| `runs/sp1892_parcae_9l512_mlp3_smear_bh4096_swa_int6_ve_single_20260429_ve` | Same as best baseline plus `USE_VALUE_EMBEDDINGS=1`, kept `LIGER_CE=1` | failed before training | n/a | n/a | n/a | n/a | `torch.compile` failed inside the Liger cross-entropy Triton kernel on Blackwell with fp32/fp64 loop-carried type assertion |
+| `runs/sp1892_parcae_9l512_mlp3_smear_bh4096_swa_int6_ve_noliger_single_20260429` | Same VE test, `COMPILE_MODEL=1`, `LIGER_CE=0` | 5107 | 58.74ms | 1.4789 | 1.48408480 | total `19,900,288` bytes | VE added about 0.97M params, slowed training, and scored worse |
+
+Interpretation: for this 300s single-GPU regime, value embeddings are not worth it in the current wiring. The result is not perfectly controlled because `LIGER_CE` had to be disabled to avoid the Blackwell/Triton compile failure, but the VE run was slower, larger, and worse on validation.
+
+### SP1024 autoresearch replication and batch-size checks
+
+This block tried to reproduce `logs/autoresearch_20260428_033810_261426.txt`, because that run had a much better SP1024 result than the later SP1892 attempts.
+
+Original reference from `logs/autoresearch_20260428_033810_261426.txt`:
+
+- Shape: SP1024, `MODEL_DIM=384`, `RECURRENT_DIM=384`, 1 prelude / 3 recurrent core / 2 coda, `MEAN_RECURRENCE=2`, `MEAN_BACKPROP_DEPTH=1`, `MLP_MULT=4`, GQA `4q/2kv`, BigramHash `8192x128` heads 2 gated, PoE3, SWA, int8 export.
+- Batch/training: `TRAIN_BATCH_TOKENS=131072`, old implicit local `grad_accum_steps=8`, `MAX_WALLCLOCK_SECONDS=600`.
+- Result: `step:2853`, `step_avg:210.35ms`, `val_loss:2.3339`, `val_bpb:1.3823`; final int8 roundtrip exact `val_loss:2.33427464`, `val_bpb:1.38248893`.
+
+| Run | Change | Result | Interpretation |
+| --- | --- | --- | --- |
+| `runs/rep_autoresearch_20260428_033810_opt_20260429` | Copied the old shape but changed too much for speed: `TRAIN_BATCH_TOKENS=32768`, `GRAD_ACCUM_STEPS=1`, delayed parallel residuals, packed RoPE, compiled Muon, `LIGER_CE=0` | `10241` steps, `step_avg:58.59ms`, pre-roundtrip BPB `1.5066`, final int8 BPB `1.50863911` | Fast but not comparable; smaller effective batch and residual semantic changes likely broke the training recipe |
+| `runs/rep_autoresearch_20260428_033810_batch131k_ga2_20260429` | Restored original effective batch semantics more closely: `TRAIN_BATCH_TOKENS=131072`, `GRAD_ACCUM_STEPS=2`, sequential residuals, packed RoPE, compiled Muon, `LIGER_CE=0` | Reached `step:1000`, `step_avg:228.18ms`, train loss `2.6248`; no final eval in log | Loss lined up closely with the old reference through step 900; throughput was slightly slower than the old `210ms/step`, but close enough to show the code path was not fundamentally broken |
+| `runs/rep_autoresearch_20260428_033810_batch262k_ga2_ligerce_20260429` | Doubled effective batch to `TRAIN_BATCH_TOKENS=262144`, kept `GRAD_ACCUM_STEPS=2`, enabled `LIGER_CE=1`, otherwise preserved sequential residuals and old shape | Trained to `step:1200`, `step_avg:467.48ms`, train loss `2.4235`, then crashed entering validation | Bigger batch fit in memory (`~14.4GB`) and was stable at about `561k tokens/s`, but Liger CE with `torch.compile` is still not reliable; validation failed on a Dynamo guard mismatch involving `self.softcap` |
+
+Observed train-loss comparison for the 131k reproduction versus the old reference:
+
+| Step | Old reference train loss | 131k GA2 reproduction train loss |
+| ---: | ---: | ---: |
+| 100 | 3.7101 | 3.7209 |
+| 200 | 3.2151 | 2.9805 |
+| 300 | 2.9158 | 2.9032 |
+| 400 | 2.8715 | 2.8866 |
+| 500 | 2.7975 | 2.8048 |
+| 600 | 2.7601 | 2.7712 |
+| 700 | 2.5317 | 2.5511 |
+| 800 | 2.6270 | 2.6507 |
+| 900 | 2.6340 | 2.6502 |
+
+Token-matched read on the 262k Liger CE run was initially encouraging, but not score-valid:
+
+- At current step 1000, the 262k run had seen about as many tokens as the old 131k/reference step 2000.
+- Old reference step 2000 train loss: `2.5653`.
+- 262k Liger CE step 1000 train loss: `2.3923`.
+- 262k Liger CE step 1100 train loss: `2.3232`.
+- 262k Liger CE step 1200 train loss rose to `2.4235`, so the last train-loss point was worse than the previous one.
+
+Crash details for `LIGER_CE=1`:
+
+- During warmup/training it emitted Triton warnings from the Liger softcap path, including `invalid operands of type pointer<fp32> and triton.language.float32`.
+- The run continued through training, but final validation crashed inside compiled Liger CE with `AssertionError: Guard failed on the same frame it was created` and `tensor '___from_numpy(self.softcap)' dispatch key set mismatch`.
+- Fix applied after the crash: Parcae now applies logit softcap in PyTorch before calling Liger CE and always passes `softcap=None` into `LigerCrossEntropyLoss`. This avoids Liger's fused softcap Triton path while still using Liger for CE. Focused CUDA `torch.compile` smoke with softcap passed backward with finite gradients.
+
+Current interpretation of the SP1024 replication:
+
+- Restoring original batch semantics and sequential residuals fixed the worst regression from the fast 32k run.
+- Doubling effective batch to 262k may be promising, but the Liger CE crash invalidated the score and the last train-loss line ticked up.
+- Next clean test should rerun the 262k batch with the patched `LIGER_CE=1` path and verify that final validation/export completes.
+
+### Current beliefs after this session
+
+- The biggest remaining gap to the 1.12 leaderboard records is still token budget and architecture mismatch, not a single missing post-training quantization switch.
+- QAT/GPTQ should not be the default next experiment until the base recipe is much stronger and artifact size is under control.
+- XSA has repeatedly looked suspect locally; leave it off unless testing a narrow, controlled variant.
+- The most useful record features to keep copying are shape-level features that do not explode step time: 11-ish effective layers, 512d, 3x MLP, SmearGate, BigramHash, partial RoPE, LN/residual scaling, and careful EMA/SWA/export.
+- The current best local branch still needs artifact-size work: even the best no-VE int6 run is about `17.8MB` total, over the 16MB target.
+
 ## 2026-04-26 Parcae implementation log
 
 This section records code changes made around the current Parcae/Scylla training script. These are implementation notes, not proof of quality improvements unless a run result is listed separately.
