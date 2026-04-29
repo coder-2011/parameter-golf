@@ -1,0 +1,21 @@
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break from `Tensor.item()`, consider setting:
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] or:
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] to include these operations in the captured graph.
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break: from user code at:
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4715, in torch_dynamo_resume_in_forward_model_at_4638
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss = liger_cross_entropy(
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 101, in liger_cross_entropy
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=None)(ce_input, flat_target)
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/transformers/cross_entropy.py", line 41, in forward
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy = LigerCrossEntropyFunction.apply(
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/autograd_function.py", line 880, in inner
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     outs = orig_fwd(*args, **kwargs)
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 473, in forward
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy, _input = cross_entropy_forward(
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 334, in cross_entropy_forward
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     n_non_ignore = target_mask.sum().item()
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 03:11:44.655000 498286 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 

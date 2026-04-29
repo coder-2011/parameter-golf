@@ -1,0 +1,135 @@
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break from `Tensor.item()`, consider setting:
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] or:
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] to include these operations in the captured graph.
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break: from user code at:
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4806, in torch_dynamo_resume_in_forward_model_at_4729
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss = liger_cross_entropy(
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 102, in liger_cross_entropy
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=None)(ce_input, flat_target)
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/transformers/cross_entropy.py", line 41, in forward
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy = LigerCrossEntropyFunction.apply(
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/autograd_function.py", line 880, in inner
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     outs = orig_fwd(*args, **kwargs)
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 473, in forward
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy, _input = cross_entropy_forward(
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 334, in cross_entropy_forward
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     n_non_ignore = target_mask.sum().item()
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 04:23:46.002000 502697 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+logs/sp1892_9l576_mlp3_bh4096_swa_dyn_fullattn_b32k_pwa8_fixed_int6rans_lr18_20260429.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0
+train_loader:dataset:fineweb10B_sp1892 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_*.bin tokens:53271040
+model_params:23308161
+world_size:1 grad_accum_steps:1
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:8 num_kv_heads:4 qkv_projection:pwa rrhp_reduction_factor:4 pwa_num_bases:8 pwa_permute_size:4 window:-1
+mlp:outer:BaseMLP recurrent:BaseMLP liger_geglu_available:True
+bigram_hash:buckets:4096 dim:128 heads:1 gate:False scale_init:0.05
+parcae:prelude:4 core:1 coda:4 recurrent_dim:576 recurrence:1/1 iteration:per-batch sampling:fixed injection:diagonal residual_mode:parallel parallel_residual_scope:all parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:delayed parallel_residual_record_controls:False parallel_residual_tied_norm:True parallel_residual_in_fp32:True attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_0 active_effective_layers:[]
+liger_ce:enabled:True real_liger_available:True
+liger_rope:enabled:False real_liger_available:True convention:llama_split_half
+tridao_packed_rope:enabled:True triton_available:True convention:adjacent_pair_interleaved layout:packed_qkv_inplace
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.028 head_lr:0.0 poe_experts:1 poe_extra_heads:0 poe_head_lr:0.008 matrix_lr:0.018 scalar_lr:0.018 muon_steps:5 muon_wd:0.04 muon_row_normalize:True
+qat:bits:0 start_step:500 backend:torchao group_size:32 activation_bits:0 linear:True embeddings:True tied_output:True export_bits:6 rans_int6:True
+gptq:enabled:False calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:32768 train_seq_len:512 iterations:1000000 warmup_steps:200 max_wallclock_seconds:600.000
+weight_average:ema_enabled:False ema_decay:0.997 ema_update_every:1 swa_enabled:True swa_start_frac:0.5 swa_every:50 swa_dynamic:True swa_dynamic_min_every:10 swa_dynamic_power:1.5 swa_dynamic_weight_max:2 priority:swa
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+warmup_step:10/200 train_step:9
+warmup_step:20/200 train_step:19
+warmup_step:30/200 train_step:29
+warmup_step:40/200 train_step:39
+warmup_step:50/200 train_step:49
+warmup_step:60/200 train_step:59
+warmup_step:70/200 train_step:69
+warmup_step:80/200 train_step:79
+warmup_step:90/200 train_step:89
+warmup_step:100/200 train_step:99
+warmup_step:110/200 train_step:109
+warmup_step:120/200 train_step:119
+warmup_step:130/200 train_step:129
+warmup_step:140/200 train_step:139
+warmup_step:150/200 train_step:149
+warmup_step:160/200 train_step:159
+warmup_step:170/200 train_step:169
+warmup_step:180/200 train_step:179
+warmup_step:190/200 train_step:189
+warmup_step:200/200 train_step:199
+step:1/1000000 train_loss:7.5549 train_time:118ms step_avg:117.60ms
+step:2/1000000 train_loss:7.1404 train_time:259ms step_avg:129.31ms
+step:3/1000000 train_loss:14.3574 train_time:391ms step_avg:130.45ms
+step:4/1000000 train_loss:8.6974 train_time:519ms step_avg:129.71ms
+step:5/1000000 train_loss:15.8630 train_time:650ms step_avg:130.00ms
+step:6/1000000 train_loss:11.0880 train_time:778ms step_avg:129.72ms
+step:7/1000000 train_loss:12.6255 train_time:905ms step_avg:129.26ms
+step:8/1000000 train_loss:12.2608 train_time:1057ms step_avg:132.12ms
+step:9/1000000 train_loss:12.0544 train_time:1183ms step_avg:131.41ms
+step:10/1000000 train_loss:10.5925 train_time:1309ms step_avg:130.87ms
+step:100/1000000 train_loss:4.5986 train_time:12116ms step_avg:121.16ms
+step:200/1000000 train_loss:4.3400 train_time:24155ms step_avg:120.77ms
+step:300/1000000 train_loss:4.0931 train_time:36167ms step_avg:120.56ms
+step:400/1000000 train_loss:4.1264 train_time:48206ms step_avg:120.51ms
+step:500/1000000 train_loss:3.9225 train_time:60286ms step_avg:120.57ms
+step:600/1000000 train_loss:4.0003 train_time:72343ms step_avg:120.57ms
+step:700/1000000 train_loss:3.8727 train_time:84429ms step_avg:120.61ms
+step:800/1000000 train_loss:3.7179 train_time:96529ms step_avg:120.66ms
+step:900/1000000 train_loss:3.8570 train_time:108631ms step_avg:120.70ms
+step:1000/1000000 train_loss:3.7399 train_time:120749ms step_avg:120.75ms
+step:1100/1000000 train_loss:3.8104 train_time:132873ms step_avg:120.79ms
+step:1200/1000000 train_loss:3.6542 train_time:145002ms step_avg:120.84ms
+step:1300/1000000 train_loss:3.6534 train_time:157134ms step_avg:120.87ms
+step:1400/1000000 train_loss:3.7031 train_time:169281ms step_avg:120.91ms
+step:1500/1000000 train_loss:3.6753 train_time:181432ms step_avg:120.95ms
+step:1600/1000000 train_loss:3.5576 train_time:193597ms step_avg:121.00ms
+step:1700/1000000 train_loss:3.5627 train_time:205749ms step_avg:121.03ms
+step:1800/1000000 train_loss:3.5143 train_time:217893ms step_avg:121.05ms
+step:1900/1000000 train_loss:3.5523 train_time:230043ms step_avg:121.08ms
+step:2000/1000000 train_loss:3.6105 train_time:242218ms step_avg:121.11ms
+step:2100/1000000 train_loss:3.5310 train_time:254407ms step_avg:121.15ms
+step:2200/1000000 train_loss:3.5153 train_time:266596ms step_avg:121.18ms
+step:2300/1000000 train_loss:3.4929 train_time:278794ms step_avg:121.21ms
+step:2400/1000000 train_loss:3.5006 train_time:290988ms step_avg:121.24ms
+step:2500/1000000 train_loss:3.5728 train_time:303186ms step_avg:121.27ms
+step:2600/1000000 train_loss:3.5371 train_time:315395ms step_avg:121.31ms
+step:2700/1000000 train_loss:3.4456 train_time:327612ms step_avg:121.34ms
+step:2800/1000000 train_loss:3.4234 train_time:339807ms step_avg:121.36ms
+step:2900/1000000 train_loss:3.5001 train_time:352006ms step_avg:121.38ms
+step:3000/1000000 train_loss:3.4786 train_time:364204ms step_avg:121.40ms
+step:3100/1000000 train_loss:3.4190 train_time:376823ms step_avg:121.56ms
+step:3200/1000000 train_loss:3.4155 train_time:389011ms step_avg:121.57ms
+step:3300/1000000 train_loss:3.3428 train_time:401209ms step_avg:121.58ms
+step:3400/1000000 train_loss:3.5197 train_time:413420ms step_avg:121.59ms
+step:3500/1000000 train_loss:3.4147 train_time:425610ms step_avg:121.60ms
+step:3600/1000000 train_loss:3.3466 train_time:437801ms step_avg:121.61ms
+step:3700/1000000 train_loss:3.2110 train_time:449992ms step_avg:121.62ms
+step:3800/1000000 train_loss:3.4186 train_time:462182ms step_avg:121.63ms
+step:3900/1000000 train_loss:3.3778 train_time:474375ms step_avg:121.63ms
+step:4000/1000000 train_loss:3.6475 train_time:486568ms step_avg:121.64ms
+step:4100/1000000 train_loss:3.5928 train_time:498768ms step_avg:121.65ms
+step:4200/1000000 train_loss:3.3727 train_time:510967ms step_avg:121.66ms
+step:4300/1000000 train_loss:3.2252 train_time:523152ms step_avg:121.66ms
+swa:start step:4333 dynamic:True interval:50 weight:1.0000 progress:0.0008
+step:4400/1000000 train_loss:3.2865 train_time:535473ms step_avg:121.70ms
+step:4500/1000000 train_loss:3.2576 train_time:547777ms step_avg:121.73ms
+step:4600/1000000 train_loss:3.2611 train_time:560053ms step_avg:121.75ms
+step:4700/1000000 train_loss:3.3009 train_time:572349ms step_avg:121.78ms
+step:4800/1000000 train_loss:3.3737 train_time:584624ms step_avg:121.80ms
+step:4900/1000000 train_loss:3.2300 train_time:596917ms step_avg:121.82ms
+step:4924/1000000 val_loss:3.2391 val_bpb:1.6477 train_time:600070ms step_avg:121.87ms
+stopping_early: wallclock_cap train_time:600070ms step:4924/1000000
+peak memory allocated: 5455 MiB reserved: 7222 MiB
+swa:applying averaged 22 checkpoints weight_sum:33.6042
+Serialized model int6_rans+zlib: 16073584 bytes (payload:16117392 raw_torch:16148149 payload_ratio:2.89x)
+Total submission size int6_rans+zlib: 16352119 bytes
+final_int6_rans_zlib_roundtrip val_loss:3.2530 val_bpb:1.6548 eval_time:56641ms
+final_int6_rans_zlib_roundtrip_exact val_loss:3.25302847 val_bpb:1.65480940
