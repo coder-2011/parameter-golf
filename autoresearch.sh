@@ -36,6 +36,7 @@ export SWA_DYNAMIC=1
 export DATA_PATH="./data_sp1892/datasets/fineweb10B_sp1892"
 export TOKENIZER_PATH="./data_sp1892/tokenizers/fineweb_1892_bpe.model"
 export VOCAB_SIZE=1892
+export MLP_MULT=3
 # ======================================================
 
 # --- external variables with defaults ---
