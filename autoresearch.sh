@@ -1,11 +1,8 @@
 #!/bin/bash
 set -euo pipefail
-
 cd "$(dirname "$0")"
 
 TRAIN_PID=""
-
-# Kill only this script's training process tree on exit.
 cleanup() {
     if [[ -n "${TRAIN_PID}" ]]; then
         pkill -TERM -P "${TRAIN_PID}" 2>/dev/null || true
@@ -17,7 +14,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Unique run ID per invocation
 RUN_ID="autoresearch_$(date +%Y%m%d_%H%M%S)_$$"
 LOGFILE="logs/${RUN_ID}.txt"
 PYTHON_BIN="${PYTHON:-/workspace/parameter-golf/.venv/bin/python}"
@@ -27,12 +23,19 @@ unset RANK LOCAL_RANK WORLD_SIZE
 unset CONTROL_TENSOR_NAME_PATTERNS INT8_KEEP_FLOAT_FP32_NAME_PATTERNS
 
 echo "=== Autoresearch run: ${RUN_ID} ===" >&2
-
-# Fast syntax check before GPU burn
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
-# Baseline config (SP1024, 300s wall-clock, 1x GPU). Tokenizer/data fields are
-# overrideable so tokenizer ablations can reuse this exact harness.
+# ========= EXPERIMENT BLOCK (edit per run) =========
+export RESIDUAL_MODE=parallel
+export PARALLEL_RESIDUAL_SCOPE=core
+export MUON_MOMENTUM=0.85
+export GPTQ_ENABLED=0
+export QUANT_BITS=6
+export RANS_INT6=1
+export SWA_DYNAMIC=1
+# ======================================================
+
+# --- external variables with defaults ---
 export RUN_ID
 export DATA_PATH=${DATA_PATH:-"./data/datasets/fineweb10B_sp1024"}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-"./data/tokenizers/fineweb_1024_bpe.model"}
@@ -104,7 +107,6 @@ export TIED_EMBED_LR=0.05
 export TIED_EMBED_INIT_STD=0.005
 export MATRIX_LR=0.04
 export SCALAR_LR=0.04
-export MUON_MOMENTUM=${MUON_MOMENTUM:-0.95}
 export MUON_BACKEND_STEPS=5
 export MUON_MOMENTUM_WARMUP_START=0.85
 export MUON_MOMENTUM_WARMUP_STEPS=500
@@ -121,6 +123,10 @@ export EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
 export SWA_ENABLED=${SWA_ENABLED:-1}
 export SWA_START_FRAC=${SWA_START_FRAC:-0.2}
 export SWA_EVERY=${SWA_EVERY:-50}
+export SWA_DYNAMIC=${SWA_DYNAMIC:-0}
+export SWA_DYNAMIC_MIN_EVERY=${SWA_DYNAMIC_MIN_EVERY:-1}
+export SWA_DYNAMIC_POWER=${SWA_DYNAMIC_POWER:-1.0}
+export SWA_DYNAMIC_WEIGHT_MAX=${SWA_DYNAMIC_WEIGHT_MAX:-2.0}
 export QAT_BITS=${QAT_BITS:-0}
 export QAT_START_STEP=${QAT_START_STEP:-500}
 export QAT_LINEAR=${QAT_LINEAR:-1}
@@ -132,7 +138,6 @@ if [[ -z "${QUANT_BITS:-}" ]]; then
         export QUANT_BITS=8
     fi
 fi
-export GPTQ_ENABLED=${GPTQ_ENABLED:-0}
 export GPTQ_CALIBRATION_BATCHES=${GPTQ_CALIBRATION_BATCHES:-32}
 export GPTQ_RESERVE_SECONDS=${GPTQ_RESERVE_SECONDS:-12}
 export GPTQ_BLOCKSIZE=${GPTQ_BLOCKSIZE:-128}
@@ -148,12 +153,6 @@ export XSA_LAST_N=${XSA_LAST_N:-0}
 export ATTN_RES_MODE=${ATTN_RES_MODE:-none}
 export ATTN_RES_SCOPE=${ATTN_RES_SCOPE:-all}
 export ATTN_RES_BLOCK_SIZE=${ATTN_RES_BLOCK_SIZE:-2}
-export RESIDUAL_MODE=parallel
-export PARALLEL_RESIDUAL_SCOPE=core
-export MUON_MOMENTUM=0.85
-export GPTQ_ENABLED=0
-export QUANT_BITS=6
-export RANS_INT6=1
 export PARALLEL_RESIDUAL_START=${PARALLEL_RESIDUAL_START:--1}
 export PARALLEL_RESIDUAL_LN_SCALE=${PARALLEL_RESIDUAL_LN_SCALE:-1}
 export CODA_MOE_NUM_EXPERTS=${CODA_MOE_NUM_EXPERTS:-0}
@@ -223,7 +222,6 @@ export TTT_BATCH_SEQS=${TTT_BATCH_SEQS:-32}
 export TTT_GRAD_CLIP=${TTT_GRAD_CLIP:-1.0}
 export SEED=${SEED:-1337}
 
-# Run training
 "${PYTHON_BIN}" train_gpt_parcae.py &
 TRAIN_PID=$!
 set +e
@@ -235,7 +233,6 @@ if [[ "${TRAIN_STATUS}" -ne 0 ]]; then
     exit "${TRAIN_STATUS}"
 fi
 
-# Parse exact roundtrip BPB and other metrics from log
 if [[ ! -f "${LOGFILE}" ]]; then
     echo "ERROR: log file not found: ${LOGFILE}" >&2
     exit 1
@@ -251,17 +248,15 @@ VAL_LOSS=$(sed -E 's/.*val_loss:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
 TRAIN_TIME=$(sed -E 's/.*train_time:([0-9.]+)ms.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
 STEPS=$(sed -E 's/.*step:([0-9]+)\/.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
 STEP_AVG=$(sed -E 's/.*step_avg:([0-9.]+)ms.*/\1/' <<<"${FINAL_STEP_LINE}")
-SUBMISSION_BYTES=$(sed -E 's/.*Total submission size (gptq_)?int[0-9]+\+zlib: ([0-9]+) bytes.*/\2/' <<<"${SUBMISSION_LINE}")
+SUBMISSION_BYTES=$(sed -E 's/.*Total submission size (gptq_)?int[0-9]+(_rans)?\+zlib: ([0-9]+) bytes.*/\3/' <<<"${SUBMISSION_LINE}")
 PEAK_MEM=$(grep 'peak memory allocated:' "${LOGFILE}" | tail -n1 | sed -E 's/.*allocated: ([0-9]+) MiB.*/\1/' || echo "")
 TRAIN_LOSS=$(grep -E 'step:[0-9]+/[0-9]+ train_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*train_loss:([0-9.]+).*/\1/' || echo "")
 
-# Validate extraction
 if [[ -z "${VAL_BPB}" ]]; then
     echo "ERROR: could not extract val_bpb from ${LOGFILE}" >&2
     exit 1
 fi
 
-# Output structured metrics
 echo "METRIC val_bpb=${VAL_BPB}"
 echo "METRIC steps=${STEPS:-0}"
 echo "METRIC step_avg_ms=${STEP_AVG:-0}"
@@ -270,7 +265,6 @@ echo "METRIC train_loss=${TRAIN_LOSS:-0}"
 echo "METRIC peak_memory_mb=${PEAK_MEM:-0}"
 echo "METRIC train_time_ms=${TRAIN_TIME:-0}"
 
-# Also output raw key lines for human inspection
 echo "=== SUMMARY ==="
 [[ -n "${STOP_LINE}" ]] && echo "${STOP_LINE}"
 [[ -n "${SUBMISSION_LINE}" ]] && echo "${SUBMISSION_LINE}"
