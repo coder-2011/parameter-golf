@@ -1,0 +1,540 @@
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] Graph break from `Tensor.item()`, consider setting:
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] or:
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] to include these operations in the captured graph.
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] 
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] Graph break: from user code at:
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 104, in torch_dynamo_resume_in_liger_cross_entropy_at_104
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=liger_softcap)(ce_input, flat_target)
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/transformers/cross_entropy.py", line 41, in forward
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     loss, z_loss, token_accuracy = LigerCrossEntropyFunction.apply(
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/autograd_function.py", line 880, in inner
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     outs = orig_fwd(*args, **kwargs)
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 473, in forward
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     loss, z_loss, token_accuracy, _input = cross_entropy_forward(
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 334, in cross_entropy_forward
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0]     n_non_ignore = target_mask.sum().item()
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] 
+W0429 01:07:21.072000 477728 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [7/0] 
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Encountered an exception in identify_mutated_tensors, assuming every input is mutated
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Traceback (most recent call last):
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 994, in identify_mutated_tensors
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module, ordered_tensor_names = generate_ttir(
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                         ^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 517, in generate_ttir
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module = src.make_ir(target, options, codegen_fns, module_map, context)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1631, in ast_to_ttir
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     generator.visit(fn.parse())
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 521, in visit_Module
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ast.NodeVisitor.generic_visit(self, node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 426, in generic_visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(item)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 612, in visit_FunctionDef
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(node.body)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 927, in visit_If
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(active_block)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 695, in visit_Assign
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     values = _sanitize_value(self.visit(node.value))
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                              ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 745, in visit_BinOp
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     rhs = self.visit(node.right)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1410, in visit_Call
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     args.append(self.visit(arg))
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                 ^^^^^^^^^^^^^^^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1544, in visit
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] triton.compiler.errors.CompilationError: at 100:33:
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         weight_y = tl.load(weight_ptr + y).cast(tl.float32)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Online softmax: 2 loads + 1 store (compared with 3 loads + 1 store for the safe softmax)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Refer to Algorithm 3 in the paper: https://arxiv.org/pdf/1805.02867
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # 3. [Online softmax] first pass: find max + sum
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     m = float("-inf")  # m is the max value. use the notation from the paper
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     d = 0.0  # d is the sum. use the notation from the paper
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     argmax_idx = 0  # Track the index of the maximum value for token accuracy computation
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     if HAS_SOFTCAPPING:
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         ori_X_y = softcap * tanh(ori_X_y / softcap)
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                  ^
+W0429 01:07:27.663000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] IncompatibleTypeErrorImpl('invalid operands of type pointer<fp32> and triton.language.float32')
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Encountered an exception in identify_mutated_tensors, assuming every input is mutated
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Traceback (most recent call last):
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 994, in identify_mutated_tensors
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module, ordered_tensor_names = generate_ttir(
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                         ^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 517, in generate_ttir
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module = src.make_ir(target, options, codegen_fns, module_map, context)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1631, in ast_to_ttir
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     generator.visit(fn.parse())
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 521, in visit_Module
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ast.NodeVisitor.generic_visit(self, node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 426, in generic_visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(item)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 612, in visit_FunctionDef
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(node.body)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 927, in visit_If
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(active_block)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 695, in visit_Assign
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     values = _sanitize_value(self.visit(node.value))
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                              ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 745, in visit_BinOp
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     rhs = self.visit(node.right)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1410, in visit_Call
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     args.append(self.visit(arg))
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                 ^^^^^^^^^^^^^^^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1544, in visit
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] triton.compiler.errors.CompilationError: at 100:33:
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         weight_y = tl.load(weight_ptr + y).cast(tl.float32)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Online softmax: 2 loads + 1 store (compared with 3 loads + 1 store for the safe softmax)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Refer to Algorithm 3 in the paper: https://arxiv.org/pdf/1805.02867
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # 3. [Online softmax] first pass: find max + sum
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     m = float("-inf")  # m is the max value. use the notation from the paper
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     d = 0.0  # d is the sum. use the notation from the paper
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     argmax_idx = 0  # Track the index of the maximum value for token accuracy computation
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     if HAS_SOFTCAPPING:
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         ori_X_y = softcap * tanh(ori_X_y / softcap)
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                  ^
+W0429 01:07:27.708000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] IncompatibleTypeErrorImpl('invalid operands of type pointer<fp32> and triton.language.float32')
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Encountered an exception in identify_mutated_tensors, assuming every input is mutated
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Traceback (most recent call last):
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 994, in identify_mutated_tensors
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module, ordered_tensor_names = generate_ttir(
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                         ^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 517, in generate_ttir
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module = src.make_ir(target, options, codegen_fns, module_map, context)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1631, in ast_to_ttir
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     generator.visit(fn.parse())
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 521, in visit_Module
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ast.NodeVisitor.generic_visit(self, node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 426, in generic_visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(item)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 612, in visit_FunctionDef
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(node.body)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 927, in visit_If
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(active_block)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 695, in visit_Assign
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     values = _sanitize_value(self.visit(node.value))
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                              ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 745, in visit_BinOp
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     rhs = self.visit(node.right)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1410, in visit_Call
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     args.append(self.visit(arg))
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                 ^^^^^^^^^^^^^^^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1544, in visit
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] triton.compiler.errors.CompilationError: at 100:33:
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         weight_y = tl.load(weight_ptr + y).cast(tl.float32)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Online softmax: 2 loads + 1 store (compared with 3 loads + 1 store for the safe softmax)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Refer to Algorithm 3 in the paper: https://arxiv.org/pdf/1805.02867
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # 3. [Online softmax] first pass: find max + sum
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     m = float("-inf")  # m is the max value. use the notation from the paper
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     d = 0.0  # d is the sum. use the notation from the paper
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     argmax_idx = 0  # Track the index of the maximum value for token accuracy computation
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     if HAS_SOFTCAPPING:
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         ori_X_y = softcap * tanh(ori_X_y / softcap)
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                  ^
+W0429 01:07:27.766000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] IncompatibleTypeErrorImpl('invalid operands of type pointer<fp32> and triton.language.float32')
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Encountered an exception in identify_mutated_tensors, assuming every input is mutated
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] Traceback (most recent call last):
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 994, in identify_mutated_tensors
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module, ordered_tensor_names = generate_ttir(
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                         ^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py", line 517, in generate_ttir
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ttir_module = src.make_ir(target, options, codegen_fns, module_map, context)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1631, in ast_to_ttir
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     generator.visit(fn.parse())
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 521, in visit_Module
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ast.NodeVisitor.generic_visit(self, node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 426, in generic_visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(item)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 612, in visit_FunctionDef
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(node.body)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 927, in visit_If
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit_compound_statement(active_block)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 514, in visit_compound_statement
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     self.visit(stmt)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 695, in visit_Assign
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     values = _sanitize_value(self.visit(node.value))
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                              ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 745, in visit_BinOp
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     rhs = self.visit(node.right)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1536, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ret = super().visit(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]           ^^^^^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/usr/lib/python3.11/ast.py", line 418, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     return visitor(node)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]            ^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1410, in visit_Call
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     args.append(self.visit(arg))
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                 ^^^^^^^^^^^^^^^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/triton/compiler/code_generator.py", line 1544, in visit
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] triton.compiler.errors.CompilationError: at 100:33:
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         weight_y = tl.load(weight_ptr + y).cast(tl.float32)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Online softmax: 2 loads + 1 store (compared with 3 loads + 1 store for the safe softmax)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # Refer to Algorithm 3 in the paper: https://arxiv.org/pdf/1805.02867
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] 
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     # 3. [Online softmax] first pass: find max + sum
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     m = float("-inf")  # m is the max value. use the notation from the paper
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     d = 0.0  # d is the sum. use the notation from the paper
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     argmax_idx = 0  # Track the index of the maximum value for token accuracy computation
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     ori_X_y = tl.load(X_ptr + y).cast(tl.float32)  # we need to store the original value of X_y for the loss calculation
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]     if HAS_SOFTCAPPING:
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]         ori_X_y = softcap * tanh(ori_X_y / softcap)
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0]                                  ^
+W0429 01:07:27.789000 477728 .venv/lib/python3.11/site-packages/torch/_higher_order_ops/triton_kernel_wrap.py:1026] [13/0] IncompatibleTypeErrorImpl('invalid operands of type pointer<fp32> and triton.language.float32')
+logs/rep_autoresearch_20260428_033810_batch262k_ga2_ligerce_20260429.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model vocab_size=1024 byte_count_override:0
+train_loader:dataset:fineweb10B_sp1024 train_shards:1
+val_loader:shards pattern=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:13949633
+world_size:1 grad_accum_steps:2
+attention_backend:flash_attn4_wrapper has_flash_attn:False
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:4 num_kv_heads:2 qkv_projection:packed
+mlp:outer:BaseMLP recurrent:BaseMLP liger_geglu_available:True
+bigram_hash:buckets:8192 dim:128 heads:2 gate:True scale_init:0.05
+parcae:prelude:1 core:3 coda:2 recurrent_dim:384 recurrence:2/1 iteration:per-batch sampling:fixed injection:diagonal residual_mode:sequential parallel_residual_scope:none parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:immediate parallel_residual_record_controls:True parallel_residual_tied_norm:False parallel_residual_in_fp32:False attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_0 active_effective_layers:[]
+liger_ce:enabled:True real_liger_available:True
+liger_rope:enabled:False real_liger_available:True convention:llama_split_half
+tridao_packed_rope:enabled:True triton_available:True convention:adjacent_pair_interleaved layout:packed_qkv_inplace
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 poe_experts:3 poe_extra_heads:2 poe_head_lr:0.005 matrix_lr:0.04 scalar_lr:0.04 muon_steps:5 muon_wd:0.095 muon_row_normalize:True
+qat:bits:0 start_step:500 backend:torchao group_size:32 activation_bits:0 linear:True embeddings:True tied_output:True export_bits:8
+gptq:enabled:False calibration_batches:32 reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+save_raw_model:False
+train_batch_tokens:262144 train_seq_len:1024 iterations:1000000 warmup_steps:500 max_wallclock_seconds:600.000
+weight_average:ema_enabled:False ema_decay:0.997 ema_update_every:1 swa_enabled:True swa_start_frac:0.2 swa_every:50 priority:swa
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+warmup_step:10/500 train_step:9
+warmup_step:20/500 train_step:19
+warmup_step:30/500 train_step:29
+warmup_step:40/500 train_step:39
+warmup_step:50/500 train_step:49
+warmup_step:60/500 train_step:59
+warmup_step:70/500 train_step:69
+warmup_step:80/500 train_step:79
+warmup_step:90/500 train_step:89
+warmup_step:100/500 train_step:99
+warmup_step:110/500 train_step:109
+warmup_step:120/500 train_step:119
+warmup_step:130/500 train_step:129
+warmup_step:140/500 train_step:139
+warmup_step:150/500 train_step:149
+warmup_step:160/500 train_step:159
+warmup_step:170/500 train_step:169
+warmup_step:180/500 train_step:179
+warmup_step:190/500 train_step:189
+warmup_step:200/500 train_step:199
+warmup_step:210/500 train_step:209
+warmup_step:220/500 train_step:219
+warmup_step:230/500 train_step:229
+warmup_step:240/500 train_step:239
+warmup_step:250/500 train_step:249
+warmup_step:260/500 train_step:259
+warmup_step:270/500 train_step:269
+warmup_step:280/500 train_step:279
+warmup_step:290/500 train_step:289
+warmup_step:300/500 train_step:299
+warmup_step:310/500 train_step:309
+warmup_step:320/500 train_step:319
+warmup_step:330/500 train_step:329
+warmup_step:340/500 train_step:339
+warmup_step:350/500 train_step:349
+warmup_step:360/500 train_step:359
+warmup_step:370/500 train_step:369
+warmup_step:380/500 train_step:379
+warmup_step:390/500 train_step:389
+warmup_step:400/500 train_step:399
+warmup_step:410/500 train_step:409
+warmup_step:420/500 train_step:419
+warmup_step:430/500 train_step:429
+warmup_step:440/500 train_step:439
+warmup_step:450/500 train_step:449
+warmup_step:460/500 train_step:459
+warmup_step:470/500 train_step:469
+warmup_step:480/500 train_step:479
+warmup_step:490/500 train_step:489
+warmup_step:500/500 train_step:499
+step:1/1000000 train_loss:6.9309 train_time:519ms step_avg:519.09ms
+step:2/1000000 train_loss:6.6970 train_time:987ms step_avg:493.59ms
+step:3/1000000 train_loss:18.4298 train_time:1493ms step_avg:497.56ms
+step:4/1000000 train_loss:12.4655 train_time:1995ms step_avg:498.86ms
+step:5/1000000 train_loss:13.2879 train_time:2469ms step_avg:493.78ms
+step:6/1000000 train_loss:11.7845 train_time:2940ms step_avg:490.08ms
+step:7/1000000 train_loss:9.5098 train_time:3421ms step_avg:488.73ms
+step:8/1000000 train_loss:8.4094 train_time:3894ms step_avg:486.75ms
+step:9/1000000 train_loss:10.5426 train_time:4368ms step_avg:485.34ms
+step:10/1000000 train_loss:7.9693 train_time:4839ms step_avg:483.85ms
+step:100/1000000 train_loss:3.4824 train_time:46653ms step_avg:466.53ms
+step:200/1000000 train_loss:2.9311 train_time:93166ms step_avg:465.83ms
+step:300/1000000 train_loss:2.7918 train_time:139725ms step_avg:465.75ms
+step:400/1000000 train_loss:2.6645 train_time:186702ms step_avg:466.76ms
+step:500/1000000 train_loss:2.5574 train_time:233273ms step_avg:466.55ms
+step:600/1000000 train_loss:2.5751 train_time:279873ms step_avg:466.45ms
+step:700/1000000 train_loss:2.4705 train_time:326537ms step_avg:466.48ms
+step:800/1000000 train_loss:2.4426 train_time:373504ms step_avg:466.88ms
+step:900/1000000 train_loss:2.4328 train_time:420190ms step_avg:466.88ms
+step:1000/1000000 train_loss:2.3923 train_time:467074ms step_avg:467.07ms
+swa:start step:1050
+step:1100/1000000 train_loss:2.3232 train_time:513932ms step_avg:467.21ms
+step:1200/1000000 train_loss:2.4235 train_time:560979ms step_avg:467.48ms
+Traceback (most recent call last):
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5817, in <module>
+    main()
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5477, in main
+    val_loss, val_bpb = eval_val(
+                        ^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 1802, in eval_val
+    batch_loss = model(x, y).detach()
+                 ^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 472, in __call__
+    return super().__call__(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1024, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4559, in forward
+    out = self.forward_model(input_ids, labels=target_ids, return_logits=False)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4458, in forward_model
+    x, num_steps_no_grad, num_steps_with_grad, xk = self.iterate_forward(
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4535, in torch_dynamo_resume_in_forward_model_at_4458
+    loss = liger_cross_entropy(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 104, in liger_cross_entropy
+    return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=liger_softcap)(ce_input, flat_target)
+  File "/workspace/parameter-golf/train_gpt_parcae.py", line 104, in torch_dynamo_resume_in_liger_cross_entropy_at_104
+    return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=liger_softcap)(ce_input, flat_target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 2316, in __call__
+    result = self._torchdynamo_orig_backend(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 2052, in __call__
+    result = self._inner_convert(
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 729, in __call__
+    result = _compile(
+             ^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 1827, in _compile
+    guarded_code, tracer_output = compile_inner(code, one_graph, hooks)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_utils_internal.py", line 96, in wrapper_function
+    return function(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 1500, in compile_inner
+    return _compile_inner(code, one_graph, hooks)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 1634, in _compile_inner
+    check_fn = dynamo_output.build_guards(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py", line 904, in build_guards
+    return CheckFunctionManager(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/guards.py", line 3928, in __init__
+    raise AssertionError(
+AssertionError: Guard failed on the same frame it was created. This is a bug - please create an issue.Guard fail reason: 8/1: tensor '___from_numpy(self.softcap)' dispatch key set mismatch. expected DispatchKeySet(CPU, BackendSelect, ADInplaceOrView), actual DispatchKeySet(CPU, BackendSelect)
+
