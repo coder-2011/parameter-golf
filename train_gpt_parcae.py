@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zlib
+from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -271,8 +272,13 @@ class Hyperparameters:
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
     qk_bias = bool(int(os.environ.get("QK_BIAS", "0")))
-    frozen_qk = bool(int(os.environ.get("FROZEN_QK", "0")))
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
+    attn_qkv_mode = os.environ.get("ATTN_QKV_MODE", "packed").strip().lower()
+    rrhp_reduction_factor = int(os.environ.get("RRHP_REDUCTION_FACTOR", "4"))
+    pwa_num_bases = int(os.environ.get("PWA_NUM_BASES", "6"))
+    pwa_permute_size = int(os.environ.get("PWA_PERMUTE_SIZE", "4"))
+    attn_preconv_kernel = int(os.environ.get("ATTN_PRECONV_KERNEL", "0"))
+    attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.05"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     attention_window = int(os.environ.get("ATTENTION_WINDOW", os.environ.get("SLIDING_ATTN_WINDOW", "-1")))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
@@ -3177,24 +3183,6 @@ def swa_dynamic_modulation(args: Hyperparameters, lr_scale: float) -> tuple[int,
     return interval, weight, progress
 
 
-def install_frozen_qk(module: nn.Module) -> list[tuple[Tensor, Tensor, int]]:
-    frozen_qk: list[tuple[Tensor, Tensor, int]] = []
-    for attn in (m for m in module.modules() if isinstance(m, ParcaeCausalSelfAttention)):
-        qk_rows = attn.q_dim + attn.kv_dim
-        weight = attn.c_qkv.weight
-        frozen_qk.append((weight, weight.detach()[:qk_rows].clone(), qk_rows))
-        weight.register_hook(lambda grad, rows=qk_rows: grad.clone().index_fill_(0, torch.arange(rows, device=grad.device), 0))
-        for bias in (attn.q_bias, attn.k_bias):
-            if bias is not None:
-                bias.requires_grad_(False)
-    return frozen_qk
-
-
-@torch.no_grad()
-def restore_frozen_qk(frozen_qk: list[tuple[Tensor, Tensor, int]]) -> None:
-    for weight, frozen, qk_rows in frozen_qk:
-        weight[:qk_rows].copy_(frozen.to(dtype=weight.dtype))
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -3819,6 +3807,64 @@ def get_mlp_class(mlp_class_name: str) -> type[nn.Module]:
     )
 
 
+class RRHPWeight(nn.Module):
+    def __init__(self, rows: int, cols: int, reduced_cols: int):
+        super().__init__()
+        assert reduced_cols > 0
+        assert cols % reduced_cols == 0
+        self.weight_reduced = nn.Parameter(torch.empty(rows, reduced_cols))
+        self.repeat_factor = cols // reduced_cols
+
+    def forward(self) -> Tensor:
+        return self.weight_reduced.repeat_interleave(self.repeat_factor, dim=-1)
+
+
+class RRHPQKVProjection(nn.Module):
+    def __init__(self, dim: int, qkv_out_dim: int, reduction_factor: int):
+        super().__init__()
+        self.weight = RRHPWeight(qkv_out_dim, dim, dim // reduction_factor)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight())
+
+
+class PWAQKVProjection(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        qkv_out_dim: int,
+        reduction_factor: int,
+        num_bases: int,
+        permute_size: int,
+    ):
+        super().__init__()
+        assert num_bases > 0
+        assert 0 < permute_size <= num_bases
+        self.bases = RRHPWeight(num_bases, dim, dim // reduction_factor)
+        flat = torch.tensor([i for p in permutations(range(num_bases), permute_size) for i in p], dtype=torch.long)
+        assert flat.numel() > 0
+        repeats = math.ceil(qkv_out_dim / flat.numel())
+        self.register_buffer("idx", flat.repeat(repeats)[:qkv_out_dim], persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.bases()[self.idx])
+
+
+class CausalDepthwisePreAttentionConv(nn.Module):
+    def __init__(self, dim: int, kernel_size: int, scale_init: float):
+        super().__init__()
+        if kernel_size <= 1:
+            raise ValueError(f"ATTN_PRECONV_KERNEL must be > 1 when enabled, got {kernel_size}")
+        self.kernel_size = kernel_size
+        self.weight = nn.Parameter(torch.empty(dim, 1, kernel_size))
+        self.scale = nn.Parameter(torch.full((dim,), float(scale_init), dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
+        y = F.conv1d(y, self.weight.to(dtype=x.dtype), groups=x.size(-1)).transpose(1, 2)
+        return x + self.scale.to(dtype=x.dtype)[None, None, :] * y
+
+
 class ParcaeCausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -3835,35 +3881,44 @@ class ParcaeCausalSelfAttention(nn.Module):
         liger_rope: bool = False,
         tridao_packed_rope: bool = False,
         attention_window: int = -1,
+        qkv_mode: str = "packed",
+        rrhp_reduction_factor: int = 4,
+        pwa_num_bases: int = 6,
+        pwa_permute_size: int = 4,
+        attn_preconv_kernel: int = 0,
+        attn_preconv_scale_init: float = 0.05,
     ):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f'dim={dim} must be divisible by num_heads={num_heads}')
-        if num_heads % num_kv_heads != 0:
-            raise ValueError(f'num_heads={num_heads} must be divisible by num_kv_heads={num_kv_heads}')
+        assert dim % num_heads == 0
+        assert num_heads % num_kv_heads == 0
         self.n_head = num_heads
         self.n_kv_head = num_kv_heads
         self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError('head_dim must be even for RoPE')
+        assert self.head_dim % 2 == 0
         self.dim = dim
         self.q_dim = num_heads * self.head_dim
         self.kv_dim = num_kv_heads * self.head_dim
-        if rope_dims <= 0 or rope_dims > self.head_dim or rope_dims % 2 != 0:
-            raise ValueError(f"rope_dims must be a positive even value <= head_dim; got {rope_dims} for head_dim={self.head_dim}")
+        assert 0 < rope_dims <= self.head_dim and rope_dims % 2 == 0
         self.rope_dims = rope_dims
         self.liger_rope = liger_rope
         self.tridao_packed_rope = tridao_packed_rope
         self.attention_window = attention_window
-        if self.tridao_packed_rope and self.liger_rope:
-            raise ValueError("TRIDAO_PACKED_ROPE and LIGER_ROPE are mutually exclusive")
+        assert not (self.tridao_packed_rope and self.liger_rope)
         if self.tridao_packed_rope and _tridao_rotary_kernel is None:
             raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
-        if self.tridao_packed_rope and (qk_bias or clip_qkv is not None):
-            raise ValueError("TRIDAO_PACKED_ROPE=1 currently requires QK_BIAS=0 and CLIP_QKV unset")
+        assert not (self.tridao_packed_rope and (qk_bias or clip_qkv is not None))
+        assert qkv_mode in {"packed", "rrhp", "pwa"}
+        assert rrhp_reduction_factor > 0
+        assert qkv_mode == "packed" or dim % rrhp_reduction_factor == 0
         self.qk_norm = qk_norm
         self.clip_qkv = clip_qkv
-        self.c_qkv = CastedLinear(dim, self.q_dim + 2 * self.kv_dim, bias=False)
+        qkv_out_dim = self.q_dim + 2 * self.kv_dim
+        if qkv_mode == "rrhp":
+            self.qkv_proj = RRHPQKVProjection(dim, qkv_out_dim, rrhp_reduction_factor)
+        elif qkv_mode == "pwa":
+            self.qkv_proj = PWAQKVProjection(dim, qkv_out_dim, rrhp_reduction_factor, pwa_num_bases, pwa_permute_size)
+        else:
+            self.qkv_proj = CastedLinear(dim, qkv_out_dim, bias=False)
         self.c_proj = CastedLinear(dim, dim, bias=False)
         self.q_bias = nn.Parameter(torch.zeros(1, 1, self.n_head, self.head_dim)) if qk_bias else None
         self.k_bias = nn.Parameter(torch.zeros(1, 1, self.n_kv_head, self.head_dim)) if qk_bias else None
@@ -3873,11 +3928,14 @@ class ParcaeCausalSelfAttention(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         qkv_key = prefix + "c_qkv.weight"
+        qkv_proj_key = prefix + "qkv_proj.weight"
         q_key = prefix + "c_q.weight"
         k_key = prefix + "c_k.weight"
         v_key = prefix + "c_v.weight"
-        if qkv_key not in state_dict and all(key in state_dict for key in (q_key, k_key, v_key)):
-            state_dict[qkv_key] = torch.cat((state_dict.pop(q_key), state_dict.pop(k_key), state_dict.pop(v_key)), dim=0)
+        if qkv_proj_key not in state_dict and qkv_key in state_dict:
+            state_dict[qkv_proj_key] = state_dict.pop(qkv_key)
+        if qkv_proj_key not in state_dict and all(key in state_dict for key in (q_key, k_key, v_key)):
+            state_dict[qkv_proj_key] = torch.cat((state_dict.pop(q_key), state_dict.pop(k_key), state_dict.pop(v_key)), dim=0)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
@@ -3890,7 +3948,7 @@ class ParcaeCausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
-        qkv = self.c_qkv(x)
+        qkv = self.qkv_proj(x)
         use_tridao_packed_rope = self.tridao_packed_rope and qkv.is_cuda
         if use_tridao_packed_rope:
             qkv = qkv.view(bsz, seqlen, self.n_head + 2 * self.n_kv_head, self.head_dim)
@@ -3977,12 +4035,23 @@ class TransformerPreNormBlock(nn.Module):
         liger_rope: bool = False,
         tridao_packed_rope: bool = False,
         attention_window: int = -1,
+        qkv_mode: str = "packed",
+        rrhp_reduction_factor: int = 4,
+        pwa_num_bases: int = 6,
+        pwa_permute_size: int = 4,
+        attn_preconv_kernel: int = 0,
+        attn_preconv_scale_init: float = 0.05,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
         self.record_residual = record_residual
         self.ln_scale_factor = 1.0 / math.sqrt(residual_layer_idx + 1) if ln_scale else 1.0
         self.norm_1 = ParcaeRMSNorm(dim)
+        self.attn_preconv = (
+            CausalDepthwisePreAttentionConv(dim, attn_preconv_kernel, attn_preconv_scale_init)
+            if attn_preconv_kernel > 1
+            else None
+        )
         self.attn = ParcaeCausalSelfAttention(
             dim=dim,
             num_heads=num_heads,
@@ -3997,6 +4066,10 @@ class TransformerPreNormBlock(nn.Module):
             liger_rope=liger_rope,
             tridao_packed_rope=tridao_packed_rope,
             attention_window=attention_window,
+            qkv_mode=qkv_mode,
+            rrhp_reduction_factor=rrhp_reduction_factor,
+            pwa_num_bases=pwa_num_bases,
+            pwa_permute_size=pwa_permute_size,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = get_mlp_class(mlp_class_name)
@@ -4022,7 +4095,8 @@ class TransformerPreNormBlock(nn.Module):
                 x0 = x
             mix = self.resid_mix.to(dtype=x.dtype)
             x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-            attn_out = self.attn(self.norm_1(x_in) * self.ln_scale_factor, freqs_cos, freqs_sin, mask, **kwargs)
+            attn_in = self._attn_input(self.norm_1(x_in) * self.ln_scale_factor)
+            attn_out = self.attn(attn_in, freqs_cos, freqs_sin, mask, **kwargs)
             attn_scale = self.attn_scale.to(dtype=x_in.dtype)[None, None, :]
             mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
             if self.parallel_residual:
@@ -4032,9 +4106,12 @@ class TransformerPreNormBlock(nn.Module):
             return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
         if self.parallel_residual:
             x0 = x
-            return x0 + self.attn(self.norm_1(x0), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
-        x = self.attn(self.norm_1(x), freqs_cos, freqs_sin, mask, **kwargs) + x
+            return x0 + self.attn(self._attn_input(self.norm_1(x0)), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
+        x = self.attn(self._attn_input(self.norm_1(x)), freqs_cos, freqs_sin, mask, **kwargs) + x
         return self.mlp(self.norm_2(x)) + x
+
+    def _attn_input(self, x: Tensor) -> Tensor:
+        return x if self.attn_preconv is None else self.attn_preconv(x)
 
     def forward_parallel_delayed(
         self,
@@ -4057,7 +4134,7 @@ class TransformerPreNormBlock(nn.Module):
         norm_source = residual.to(dtype=hidden_states1.dtype) if residual_in_fp32 else residual
         normed1 = self.norm_1(norm_source)
         normed2 = normed1 if tied_norm else self.norm_2(norm_source)
-        hidden_states1 = self.attn(normed1, freqs_cos, freqs_sin, mask, **kwargs)
+        hidden_states1 = self.attn(self._attn_input(normed1), freqs_cos, freqs_sin, mask, **kwargs)
         hidden_states2 = self.mlp(normed2)
         return hidden_states1, hidden_states2, residual
 
@@ -4074,7 +4151,7 @@ class TransformerPreNormBlock(nn.Module):
         if self.record_residual or self.parallel_residual:
             raise RuntimeError("Attention Residuals are mutually exclusive with parallel residuals")
         attn_input = state.mix(self.attn_res_attn)
-        attn_out = self.attn(self.norm_1(attn_input), freqs_cos, freqs_sin, mask, **kwargs)
+        attn_out = self.attn(self._attn_input(self.norm_1(attn_input)), freqs_cos, freqs_sin, mask, **kwargs)
         state.add(attn_out)
         mlp_input = state.mix(self.attn_res_mlp)
         state.add(self.mlp(self.norm_2(mlp_input)))
@@ -4214,6 +4291,11 @@ class GPT(nn.Module):
         self.liger_ce = h.liger_ce
         self.poe_num_experts = h.poe_num_experts
         self.xsa_last_n = h.xsa_last_n
+        self.attn_qkv_mode = h.attn_qkv_mode
+        assert self.attn_qkv_mode in {"packed", "rrhp", "pwa"}
+        assert h.rrhp_reduction_factor > 0
+        assert h.pwa_num_bases > 0
+        assert 0 < h.pwa_permute_size <= h.pwa_num_bases
         if self.xsa_last_n < 0:
             raise ValueError(f"XSA_LAST_N must be non-negative, got {self.xsa_last_n}")
         valid_attn_res_modes = {"none", "full", "block"}
@@ -4315,6 +4397,12 @@ class GPT(nn.Module):
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
                 attention_window=h.attention_window,
+                qkv_mode=h.attn_qkv_mode,
+                rrhp_reduction_factor=h.rrhp_reduction_factor,
+                pwa_num_bases=h.pwa_num_bases,
+                pwa_permute_size=h.pwa_permute_size,
+                attn_preconv_kernel=h.attn_preconv_kernel,
+                attn_preconv_scale_init=h.attn_preconv_scale_init,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -4353,6 +4441,12 @@ class GPT(nn.Module):
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
                 attention_window=h.attention_window,
+                qkv_mode=h.attn_qkv_mode,
+                rrhp_reduction_factor=h.rrhp_reduction_factor,
+                pwa_num_bases=h.pwa_num_bases,
+                pwa_permute_size=h.pwa_permute_size,
+                attn_preconv_kernel=h.attn_preconv_kernel,
+                attn_preconv_scale_init=h.attn_preconv_scale_init,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -4391,6 +4485,12 @@ class GPT(nn.Module):
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
                 attention_window=h.attention_window,
+                qkv_mode=h.attn_qkv_mode,
+                rrhp_reduction_factor=h.rrhp_reduction_factor,
+                pwa_num_bases=h.pwa_num_bases,
+                pwa_permute_size=h.pwa_permute_size,
+                attn_preconv_kernel=h.attn_preconv_kernel,
+                attn_preconv_scale_init=h.attn_preconv_scale_init,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -4475,12 +4575,19 @@ class GPT(nn.Module):
                 if name.endswith(('attn.c_proj', 'mlp.proj', 'mlp.down_proj')):
                     std = (recurrent_std if name.startswith('core_block.') else base_std) / out_proj_divisor
                 elif (
-                    name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_qkv', 'mlp.fc', 'mlp.gate_proj', 'mlp.up_proj', 'lm_head'))
+                    name.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_qkv', 'attn.qkv_proj', 'mlp.fc', 'mlp.gate_proj', 'mlp.up_proj', 'lm_head'))
                     or name.endswith('mlp.router')
                 ):
                     std = recurrent_std if name.startswith('core_block.') else base_std
                 else:
                     continue
+                nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+        for name, module in self.named_modules():
+            if isinstance(module, RRHPWeight):
+                std = recurrent_std if name.startswith('core_block.') else base_std
+                nn.init.trunc_normal_(module.weight_reduced, mean=0.0, std=std, a=-3 * std, b=3 * std)
+            if isinstance(module, CausalDepthwisePreAttentionConv):
+                std = recurrent_std if name.startswith('core_block.') else base_std
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
         if self.recurrent_dim == self.outer_dim:
             nn.init.eye_(self.project_out.weight)
@@ -5410,7 +5517,6 @@ def main() -> None:
     base_model = GPT(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
     prepare_torchao_qat(base_model, args)
-    frozen_qk = install_frozen_qk(base_model) if args.frozen_qk else []
     base_model.set_training_step(0)
     if args.compile_model:
         compiled_model = torch.compile(base_model, dynamic=False)
@@ -5499,8 +5605,13 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"qkv_projection:packed window:{args.attention_window} "
-        f"frozen_qk:{args.frozen_qk} frozen_qk_layers:{len(frozen_qk)}"
+        f"qkv_projection:{args.attn_qkv_mode} rrhp_reduction_factor:{args.rrhp_reduction_factor} "
+        f"pwa_num_bases:{args.pwa_num_bases} pwa_permute_size:{args.pwa_permute_size} "
+        f"window:{args.attention_window}"
+    )
+    log0(
+        f"attn_preconv:kernel:{args.attn_preconv_kernel} "
+        f"scale_init:{args.attn_preconv_scale_init:g}"
     )
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
@@ -5657,8 +5768,6 @@ def main() -> None:
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
-            if frozen_qk:
-                restore_frozen_qk(frozen_qk)
             zero_grad_all()
             if len(warmup_schedule) <= 20 or (warmup_index + 1) % 10 == 0 or warmup_index + 1 == len(warmup_schedule):
                 log0(f"warmup_step:{warmup_index + 1}/{len(warmup_schedule)} train_step:{warmup_step}")
@@ -5757,8 +5866,6 @@ def main() -> None:
         )
         for opt in optimizers:
             opt.step()
-        if frozen_qk:
-            restore_frozen_qk(frozen_qk)
         zero_grad_all()
 
         if ema_state is not None and next_step % args.ema_update_every == 0:
