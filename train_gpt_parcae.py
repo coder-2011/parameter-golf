@@ -278,7 +278,8 @@ class Hyperparameters:
     pwa_num_bases = int(os.environ.get("PWA_NUM_BASES", "6"))
     pwa_permute_size = int(os.environ.get("PWA_PERMUTE_SIZE", "4"))
     attn_preconv_kernel = int(os.environ.get("ATTN_PRECONV_KERNEL", "0"))
-    attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.05"))
+    attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.005"))
+    attn_preconv_lr = float(os.environ.get("ATTN_PRECONV_LR", "0.001"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     attention_window = int(os.environ.get("ATTENTION_WINDOW", os.environ.get("SLIDING_ATTN_WINDOW", "-1")))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
@@ -3833,21 +3834,37 @@ class PWAQKVProjection(nn.Module):
         self,
         dim: int,
         qkv_out_dim: int,
-        reduction_factor: int,
         num_bases: int,
         permute_size: int,
     ):
         super().__init__()
         assert num_bases > 0
         assert 0 < permute_size <= num_bases
-        self.bases = RRHPWeight(num_bases, dim, dim // reduction_factor)
+        self.bases = nn.Parameter(torch.empty(num_bases, dim))
         flat = torch.tensor([i for p in permutations(range(num_bases), permute_size) for i in p], dtype=torch.long)
         assert flat.numel() > 0
         repeats = math.ceil(qkv_out_dim / flat.numel())
         self.register_buffer("idx", flat.repeat(repeats)[:qkv_out_dim], persistent=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.bases()[self.idx])
+        return F.linear(x, self.bases[self.idx])
+
+
+class PWAQKDenseVProjection(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        qk_out_dim: int,
+        v_out_dim: int,
+        num_bases: int,
+        permute_size: int,
+    ):
+        super().__init__()
+        self.qk_proj = PWAQKVProjection(dim, qk_out_dim, num_bases, permute_size)
+        self.v_proj = CastedLinear(dim, v_out_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.cat((self.qk_proj(x), self.v_proj(x)), dim=-1)
 
 
 class CausalDepthwisePreAttentionConv(nn.Module):
@@ -3907,7 +3924,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         if self.tridao_packed_rope and _tridao_rotary_kernel is None:
             raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
         assert not (self.tridao_packed_rope and (qk_bias or clip_qkv is not None))
-        assert qkv_mode in {"packed", "rrhp", "pwa"}
+        assert qkv_mode in {"packed", "rrhp", "pwa", "pwa_qk_dense_v"}
         assert rrhp_reduction_factor > 0
         assert qkv_mode == "packed" or dim % rrhp_reduction_factor == 0
         self.qk_norm = qk_norm
@@ -3916,7 +3933,9 @@ class ParcaeCausalSelfAttention(nn.Module):
         if qkv_mode == "rrhp":
             self.qkv_proj = RRHPQKVProjection(dim, qkv_out_dim, rrhp_reduction_factor)
         elif qkv_mode == "pwa":
-            self.qkv_proj = PWAQKVProjection(dim, qkv_out_dim, rrhp_reduction_factor, pwa_num_bases, pwa_permute_size)
+            self.qkv_proj = PWAQKVProjection(dim, qkv_out_dim, pwa_num_bases, pwa_permute_size)
+        elif qkv_mode == "pwa_qk_dense_v":
+            self.qkv_proj = PWAQKDenseVProjection(dim, self.q_dim + self.kv_dim, self.kv_dim, pwa_num_bases, pwa_permute_size)
         else:
             self.qkv_proj = CastedLinear(dim, qkv_out_dim, bias=False)
         self.c_proj = CastedLinear(dim, dim, bias=False)
@@ -4292,7 +4311,7 @@ class GPT(nn.Module):
         self.poe_num_experts = h.poe_num_experts
         self.xsa_last_n = h.xsa_last_n
         self.attn_qkv_mode = h.attn_qkv_mode
-        assert self.attn_qkv_mode in {"packed", "rrhp", "pwa"}
+        assert self.attn_qkv_mode in {"packed", "rrhp", "pwa", "pwa_qk_dense_v"}
         assert h.rrhp_reduction_factor > 0
         assert h.pwa_num_bases > 0
         assert 0 < h.pwa_permute_size <= h.pwa_num_bases
@@ -4586,6 +4605,9 @@ class GPT(nn.Module):
             if isinstance(module, RRHPWeight):
                 std = recurrent_std if name.startswith('core_block.') else base_std
                 nn.init.trunc_normal_(module.weight_reduced, mean=0.0, std=std, a=-3 * std, b=3 * std)
+            if isinstance(module, PWAQKVProjection):
+                std = recurrent_std if name.startswith('core_block.') else base_std
+                nn.init.trunc_normal_(module.bases, mean=0.0, std=std, a=-3 * std, b=3 * std)
             if isinstance(module, CausalDepthwisePreAttentionConv):
                 std = recurrent_std if name.startswith('core_block.') else base_std
                 nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
@@ -5542,12 +5564,17 @@ def main() -> None:
     def is_token_embedding_param(name: str) -> bool:
         return name in {'tok_emb.weight', 'bigram_hash.embed.weight'}
 
+    def is_attn_preconv_param(name: str) -> bool:
+        return '.attn_preconv.' in name
+
     matrix_params = []
     scalar_params = []
     for name, p in named_params:
         if not p.requires_grad:
             continue
         if is_token_embedding_param(name):
+            continue
+        if is_attn_preconv_param(name):
             continue
         if base_model.lm_head is not None and name == 'lm_head.weight':
             continue
@@ -5585,6 +5612,15 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon]
     optimizers.append(optimizer_scalar)
+    preconv_params = [p for name, p in named_params if p.requires_grad and is_attn_preconv_param(name)]
+    if preconv_params:
+        optimizer_preconv = torch.optim.Adam(
+            [{'params': preconv_params, 'lr': args.attn_preconv_lr, 'base_lr': args.attn_preconv_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_preconv)
     head_params = []
     if base_model.lm_head is not None:
         head_params.append(base_model.lm_head.weight)
@@ -5597,6 +5633,18 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    seen_optimizer_params: set[int] = set()
+    duplicate_optimizer_shapes: list[tuple[int, ...]] = []
+    for opt in optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                param_id = id(p)
+                if param_id in seen_optimizer_params:
+                    duplicate_optimizer_shapes.append(tuple(p.shape))
+                seen_optimizer_params.add(param_id)
+    if duplicate_optimizer_shapes:
+        raise RuntimeError(f"duplicate parameters found across optimizer groups: {duplicate_optimizer_shapes[:8]}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -5611,7 +5659,7 @@ def main() -> None:
     )
     log0(
         f"attn_preconv:kernel:{args.attn_preconv_kernel} "
-        f"scale_init:{args.attn_preconv_scale_init:g}"
+        f"scale_init:{args.attn_preconv_scale_init:g} lr:{args.attn_preconv_lr:g}"
     )
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
