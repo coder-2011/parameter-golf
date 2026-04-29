@@ -34,16 +34,20 @@ def first_train_shard(data_path: Path) -> Path:
 
 
 class HedgehogFeatureMap(nn.Module):
-    def __init__(self, head_dim: int, clamp: float):
+    def __init__(self, head_dim: int, activation: str):
         super().__init__()
-        self.clamp = clamp
+        self.activation = activation
         self.proj = nn.Linear(head_dim, head_dim)
         nn.init.eye_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x).clamp(min=-self.clamp, max=self.clamp)
-        return torch.cat((torch.exp(x), torch.exp(-x)), dim=-1)
+        x = self.proj(x)
+        if self.activation == "exp":
+            return torch.cat((torch.exp(x), torch.exp(-x)), dim=-1)
+        if self.activation == "softmax":
+            return torch.cat((F.softmax(x, dim=-1), F.softmax(-x, dim=-1)), dim=-1)
+        raise ValueError(f"unsupported Hedgehog activation: {self.activation}")
 
 
 class SoftmaxCausalAttention(nn.Module):
@@ -72,31 +76,49 @@ class SoftmaxCausalAttention(nn.Module):
 
 
 class HedgehogCausalAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, clamp: float):
+    def __init__(self, dim: int, heads: int, feature_activation: str):
         super().__init__()
         if dim % heads != 0:
             raise ValueError(f"dim={dim} must be divisible by heads={heads}")
         self.heads = heads
         self.head_dim = dim // heads
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
-        self.q_map = HedgehogFeatureMap(self.head_dim, clamp)
-        self.k_map = HedgehogFeatureMap(self.head_dim, clamp)
+        self.q_map = HedgehogFeatureMap(self.head_dim, feature_activation)
+        self.k_map = HedgehogFeatureMap(self.head_dim, feature_activation)
         self.out = nn.Linear(dim, dim, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def qkv_heads(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, dim = x.shape
         qkv = self.qkv(x).view(batch, seq_len, 3, self.heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q = self.q_map(q.transpose(1, 2))
-        k = self.k_map(k.transpose(1, 2))
-        v = v.transpose(1, 2)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, dim = x.shape
+        q, k, v = self.qkv_heads(x)
+        q = self.q_map(q)
+        k = self.k_map(k)
         k_prefix = k.cumsum(dim=2)
         kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k, v).cumsum(dim=2)
         numer = torch.einsum("bhtf,bhtfd->bhtd", q, kv_prefix)
         denom = torch.einsum("bhtf,bhtf->bht", q, k_prefix).unsqueeze(-1).clamp_min(1e-6)
         y = (numer / denom).transpose(1, 2).contiguous().view(batch, seq_len, dim)
         return self.out(y)
+
+    def attention_mimicry_loss(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, _ = self.qkv_heads(x)
+        true_scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        seq_len = x.shape[1]
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device).tril()
+        true_log_weights = F.log_softmax(true_scores.masked_fill(~mask, float("-inf")), dim=-1)
+        true_weights = true_log_weights.exp().masked_fill(~mask, 0.0)
+
+        q_features = self.q_map(q)
+        k_features = self.k_map(k)
+        pred_scores = torch.matmul(q_features, k_features.transpose(-2, -1))
+        pred_log_weights = F.log_softmax(pred_scores.masked_fill(~mask, float("-inf")), dim=-1)
+        pred_log_weights = pred_log_weights.masked_fill(~mask, 0.0)
+        return -(true_weights * pred_log_weights).sum(dim=-1).mean()
 
 
 class TinyHedgehogLM(nn.Module):
@@ -108,14 +130,14 @@ class TinyHedgehogLM(nn.Module):
         depth: int,
         mlp_mult: int,
         attention: str,
-        clamp: float,
+        feature_activation: str,
     ):
         super().__init__()
         attn_cls = SoftmaxCausalAttention if attention == "softmax" else HedgehogCausalAttention
         self.emb = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList()
         for _ in range(depth):
-            attn = attn_cls(dim, heads) if attention == "softmax" else attn_cls(dim, heads, clamp)
+            attn = attn_cls(dim, heads) if attention == "softmax" else attn_cls(dim, heads, feature_activation)
             self.blocks.append(
                 nn.ModuleList(
                     [
@@ -140,6 +162,19 @@ class TinyHedgehogLM(nn.Module):
             x = x + attn(norm1(x))
             x = x + mlp(norm2(x))
         return self.head(self.norm(x))
+
+    def attention_mimicry_loss(self, idx: torch.Tensor) -> torch.Tensor:
+        x = self.emb(idx)
+        losses = []
+        for norm1, attn, norm2, mlp in self.blocks:
+            attn_in = norm1(x)
+            if isinstance(attn, HedgehogCausalAttention):
+                losses.append(attn.attention_mimicry_loss(attn_in))
+            x = x + attn(attn_in)
+            x = x + mlp(norm2(x))
+        if not losses:
+            return x.new_zeros(())
+        return torch.stack(losses).mean()
 
 
 def next_batch(
@@ -176,7 +211,8 @@ def main() -> None:
     parser.add_argument("--mlp-mult", type=int, default=4)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--clamp", type=float, default=8.0)
+    parser.add_argument("--feature-activation", choices=("softmax", "exp"), default="softmax")
+    parser.add_argument("--mimicry-weight", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -199,7 +235,7 @@ def main() -> None:
         depth=args.depth,
         mlp_mult=args.mlp_mult,
         attention=args.attention,
-        clamp=args.clamp,
+        feature_activation=args.feature_activation,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -211,7 +247,9 @@ def main() -> None:
         y = y_cpu.to(device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
-        loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), y.reshape(-1))
+        lm_loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), y.reshape(-1))
+        mimicry_loss = model.attention_mimicry_loss(x) if args.mimicry_weight else logits.new_zeros(())
+        loss = lm_loss + args.mimicry_weight * mimicry_loss
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -220,12 +258,14 @@ def main() -> None:
 
     finite = bool(torch.isfinite(logits).all().item())
     print(
-        f"attention={args.attention} device={device.type} torch={torch.__version__} "
+        f"attention={args.attention} feature_activation={args.feature_activation} "
+        f"mimicry_weight={args.mimicry_weight:g} device={device.type} torch={torch.__version__} "
         f"shard={shard} tokens={tuple(x.shape)}"
     )
     print(
         f"logits={tuple(logits.shape)} finite_logits={finite} "
-        f"loss={last_loss:.6f} grad_norm={last_grad_norm:.6f}"
+        f"loss={last_loss:.6f} lm_loss={float(lm_loss.detach()):.6f} "
+        f"mimicry_loss={float(mimicry_loss.detach()):.6f} grad_norm={last_grad_norm:.6f}"
     )
     print(f"params={sum(p.numel() for p in model.parameters())}")
 

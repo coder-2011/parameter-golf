@@ -69,6 +69,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attention_type = os.environ.get("ATTENTION_TYPE", "softmax")
+    hedgehog_feature_activation = os.environ.get("HEDGEHOG_FEATURE_ACTIVATION", "softmax")
+    hedgehog_mimicry_weight = float(os.environ.get("HEDGEHOG_MIMICRY_WEIGHT", 0.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -552,6 +555,22 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+class HedgehogFeatureMap(nn.Module):
+    def __init__(self, num_heads: int, head_dim: int, activation: str):
+        super().__init__()
+        if activation not in {"softmax", "exp"}:
+            raise ValueError(f"HEDGEHOG_FEATURE_ACTIVATION must be softmax or exp, got {activation}")
+        self.activation = activation
+        self.weight = nn.Parameter(torch.eye(head_dim).repeat(num_heads, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(num_heads, head_dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.einsum("bhtd,hdf->bhtf", x, self.weight.to(dtype=x.dtype)) + self.bias.to(dtype=x.dtype)[None, :, None, :]
+        if self.activation == "softmax":
+            return torch.cat((F.softmax(x, dim=-1), F.softmax(-x, dim=-1)), dim=-1)
+        return torch.cat((torch.exp(x), torch.exp(-x)), dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -560,12 +579,21 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        attention_type: str,
+        hedgehog_feature_activation: str,
+        hedgehog_mimicry_weight: float,
     ):
         super().__init__()
+        if attention_type not in {"softmax", "hedgehog"}:
+            raise ValueError(f"ATTENTION_TYPE must be softmax or hedgehog, got {attention_type}")
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+        if hedgehog_mimicry_weight < 0.0:
+            raise ValueError(f"HEDGEHOG_MIMICRY_WEIGHT must be non-negative, got {hedgehog_mimicry_weight}")
+        self.attention_type = attention_type
+        self.hedgehog_mimicry_weight = hedgehog_mimicry_weight
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
@@ -579,9 +607,12 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        if attention_type == "hedgehog":
+            self.q_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_activation)
+            self.k_map = HedgehogFeatureMap(num_heads, self.head_dim, hedgehog_feature_activation)
 
-    def forward(self, x: Tensor) -> Tensor:
-        bsz, seqlen, dim = x.shape
+    def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        bsz, seqlen, _ = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -591,16 +622,58 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        return q, k, v
+
+    def _repeat_kv_for_gqa(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        if self.num_kv_heads == self.num_heads:
+            return k, v
+        repeats = self.num_heads // self.num_kv_heads
+        return k.repeat_interleave(repeats, dim=1), v.repeat_interleave(repeats, dim=1)
+
+    def _hedgehog_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        k, v = self._repeat_kv_for_gqa(k, v)
+        q_features = self.q_map(q)
+        k_features = self.k_map(k)
+        k_prefix = k_features.cumsum(dim=2)
+        kv_prefix = torch.einsum("bhtf,bhtd->bhtfd", k_features, v).cumsum(dim=2)
+        numer = torch.einsum("bhtf,bhtfd->bhtd", q_features, kv_prefix)
+        denom = torch.einsum("bhtf,bhtf->bht", q_features, k_prefix).unsqueeze(-1).clamp_min(1e-6)
+        return numer / denom
+
+    def _hedgehog_mimicry_loss(self, q: Tensor, k: Tensor) -> Tensor:
+        k, _ = self._repeat_kv_for_gqa(k, k)
+        true_scores = torch.matmul(q, k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        seq_len = q.size(2)
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device).tril()
+        true_log_weights = F.log_softmax(true_scores.masked_fill(~mask, float("-inf")), dim=-1)
+        true_weights = true_log_weights.exp().masked_fill(~mask, 0.0)
+        pred_scores = torch.matmul(self.q_map(q), self.k_map(k).transpose(-2, -1))
+        pred_log_weights = F.log_softmax(pred_scores.masked_fill(~mask, float("-inf")), dim=-1)
+        pred_log_weights = pred_log_weights.masked_fill(~mask, 0.0)
+        return -(true_weights * pred_log_weights).sum(dim=-1).mean()
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q, k, v = self._project_qkv(x)
+        if self.attention_type == "hedgehog":
+            y = self._hedgehog_attention(q, k, v)
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
+
+    def attention_mimicry_loss(self, x: Tensor) -> Tensor:
+        if self.attention_type != "hedgehog" or self.hedgehog_mimicry_weight == 0.0:
+            return x.new_zeros(())
+        q, k, _ = self._project_qkv(x)
+        return self._hedgehog_mimicry_loss(q, k)
 
 
 class MLP(nn.Module):
@@ -626,23 +699,42 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attention_type: str,
+        hedgehog_feature_activation: str,
+        hedgehog_mimicry_weight: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            attention_type,
+            hedgehog_feature_activation,
+            hedgehog_mimicry_weight,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def mixed_input(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        x = self.mixed_input(x, x0)
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+
+    def attention_mimicry_loss(self, x: Tensor, x0: Tensor) -> Tensor:
+        x = self.mixed_input(x, x0)
+        return self.attn.attention_mimicry_loss(self.attn_norm(x))
 
 
 class GPT(nn.Module):
@@ -659,6 +751,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attention_type: str,
+        hedgehog_feature_activation: str,
+        hedgehog_mimicry_weight: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,6 +761,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.hedgehog_mimicry_weight = hedgehog_mimicry_weight
+        self.use_hedgehog_mimicry = attention_type == "hedgehog" and hedgehog_mimicry_weight > 0.0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -680,6 +777,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attention_type,
+                    hedgehog_feature_activation,
+                    hedgehog_mimicry_weight,
                 )
                 for i in range(num_layers)
             ]
@@ -702,15 +802,21 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        mimicry_losses: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
+            if self.training and self.use_hedgehog_mimicry:
+                mimicry_losses.append(self.blocks[i].attention_mimicry_loss(x, x0))
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block = self.blocks[self.num_encoder_layers + i]
+            if self.training and self.use_hedgehog_mimicry:
+                mimicry_losses.append(block.attention_mimicry_loss(x, x0))
+            x = block(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -721,7 +827,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if mimicry_losses:
+            loss = loss + self.hedgehog_mimicry_weight * torch.stack(mimicry_losses).mean()
+        return loss
 
 
 # -----------------------------
@@ -835,6 +944,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attention_type=args.attention_type,
+        hedgehog_feature_activation=args.hedgehog_feature_activation,
+        hedgehog_mimicry_weight=args.hedgehog_mimicry_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -852,12 +964,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and not name.endswith(".bias") and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or name.endswith(".bias") or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -896,7 +1008,11 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"attention_mode:{args.attention_type} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
+        f"hedgehog_feature_activation:{args.hedgehog_feature_activation} "
+        f"hedgehog_mimicry_weight:{args.hedgehog_mimicry_weight:g}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
