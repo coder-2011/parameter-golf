@@ -48,6 +48,29 @@ Fixed-PWA same-budget follow-up:
   budget after scaling, but quality is far worse than the packed-QKV current best
   (`1.41159149`). The loss gap is too large to explain as a minor LR issue.
 
+PWA/conv audit after the poor PWA and conv runs:
+
+- Code audit found the current PWA class had regressed to wrapping its basis rows in
+  `RRHPWeight`, so PWA was also applying RRHP-style input-column compression. That has
+  been corrected back to full-width learned bases.
+- Added `ATTN_QKV_MODE=pwa_qk_dense_v` for the next controlled PWA test. It applies PWA
+  to Q/K rows only and leaves V as an independent dense projection, because the earlier
+  PWA path compressed/tied V and likely damaged content flow.
+- Added a fail-fast optimizer duplicate check across all optimizer groups.
+- The first pre-attention conv full run
+  `runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_preconv3_int6rans_20260429`
+  used `ATTN_PRECONV_KERNEL=3`, `ATTN_PRECONV_SCALE_INIT=0.05`, and let the 3-D conv
+  weights fall into the scalar Adam group at `SCALAR_LR=0.02`. It hit `train_loss:nan`
+  at step `2` and stayed NaN through the last logged step `2500`; no final score.
+- Fix: pre-attention conv params now use their own Adam group via `ATTN_PRECONV_LR`
+  (default `0.001`) and the default conv residual scale was lowered to `0.005`.
+- Smoke after the fix:
+  `runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_preconv3_safe_smoke_20260429`.
+  It stayed finite, reached step `804` in a 90s train cap, `step_avg:111.98ms`, and
+  final exact int6 RANS+zlib BPB `3.33867651`. This proves the NaN was fixed, but the
+  early quality is much worse than the no-conv SOTA trajectory, so a full conv rerun is
+  not justified under this exact conv design.
+
 ### Quick tokenizer sweep: SP1024 vs SP1892 vs SP4096
 
 Goal: get a low-impact directional comparison of tokenizer choices without tying up the GPU. This is not an official challenge-quality comparison: each run used a tiny matched train/val slice rather than full validation, and the first `131072` validation tokens cover different byte spans for different tokenizers. The comparison is still useful as a quick same-code, same-shape signal.
