@@ -3627,11 +3627,12 @@ def _tridao_apply_rotary_emb_qkv(
     num_heads_k = (qkv.shape[2] - num_heads_q) // 2
     if qkv.shape[2] != num_heads_q + 2 * num_heads_k:
         raise ValueError(f"invalid packed QKV head count: total={qkv.shape[2]} num_heads_q={num_heads_q}")
-    qk = qkv[:, :, : num_heads_q + num_heads_k]
+    q = qkv[:, :, :num_heads_q]
+    k = qkv[:, :, num_heads_q : num_heads_q + num_heads_k]
+    v = qkv[:, :, num_heads_q + num_heads_k :]
+    qk = torch.cat((q, k), dim=2).contiguous()
     qk = _tridao_apply_rotary(qk, cos, sin, interleaved=interleaved, inplace=inplace, conjugate=conjugate)
-    if not inplace:
-        qkv = torch.cat([qk, qkv[:, :, num_heads_q + num_heads_k :]], dim=2)
-    return qkv
+    return torch.cat((qk, v), dim=2)
 
 
 class _TridaoPackedQKVRoPE(torch.autograd.Function):
@@ -3881,7 +3882,7 @@ class CausalDepthwisePreAttentionConv(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         y = F.pad(x.transpose(1, 2), (self.kernel_size - 1, 0))
         y = F.conv1d(y, self.weight.to(dtype=x.dtype), groups=x.size(-1)).transpose(1, 2)
-        return x + self.scale.to(dtype=x.dtype)[None, None, :] * y
+        return x + self.scale.to(dtype=x.dtype)[None, None, :] * (y - x)
 
 
 class ParcaeCausalSelfAttention(nn.Module):
@@ -4612,8 +4613,8 @@ class GPT(nn.Module):
                 std = (recurrent_std if name.startswith('core_block.') else base_std) * self.pwa_init_scale
                 nn.init.trunc_normal_(module.bases, mean=0.0, std=std, a=-3 * std, b=3 * std)
             if isinstance(module, CausalDepthwisePreAttentionConv):
-                std = recurrent_std if name.startswith('core_block.') else base_std
-                nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+                nn.init.zeros_(module.weight)
+                nn.init.ones_(module.weight[:, :, -1])
         if self.recurrent_dim == self.outer_dim:
             nn.init.eye_(self.project_out.weight)
         else:
