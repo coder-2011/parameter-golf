@@ -51,6 +51,28 @@ try:
 except Exception:
     LigerRopeFunction = None
 
+try:
+    from liger_kernel.ops.softmax import LigerSoftmaxFunction
+except Exception:
+    LigerSoftmaxFunction = None
+
+
+def liger_softmax(x: Tensor, dim: int = -1) -> Tensor:
+    if LigerSoftmaxFunction is None or x.device.type != "cuda" or not torch.is_floating_point(x):
+        return F.softmax(x, dim=dim)
+    dim = dim if dim >= 0 else x.dim() + dim
+    if dim == x.dim() - 1:
+        return LigerSoftmaxFunction.apply(x)
+    y = LigerSoftmaxFunction.apply(x.movedim(dim, -1).contiguous())
+    return y.movedim(-1, dim)
+
+
+def liger_log_softmax(x: Tensor, dim: int = -1) -> Tensor:
+    if LigerSoftmaxFunction is None or x.device.type != "cuda" or not torch.is_floating_point(x):
+        return F.log_softmax(x, dim=dim)
+    return liger_softmax(x, dim=dim).log()
+
+
 def liger_cross_entropy(
     logits: Tensor,
     target: Tensor,
@@ -72,8 +94,11 @@ def liger_cross_entropy(
         if softcap is not None:
             logits_f = softcap * torch.tanh(logits_f / softcap)
         return F.cross_entropy(logits_f, flat_target, ignore_index=ignore_index)
-    ce_input = flat_logits.clone() if preserve_input else flat_logits
-    return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=softcap)(ce_input, flat_target)
+    if softcap is not None:
+        ce_input = softcap * torch.tanh(flat_logits.float() / softcap)
+    else:
+        ce_input = flat_logits.clone() if preserve_input else flat_logits
+    return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=None)(ce_input, flat_target)
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -167,6 +192,10 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.2))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+    swa_dynamic = bool(int(os.environ.get("SWA_DYNAMIC", "0")))
+    swa_dynamic_min_every = int(os.environ.get("SWA_DYNAMIC_MIN_EVERY", 1))
+    swa_dynamic_power = float(os.environ.get("SWA_DYNAMIC_POWER", 1.0))
+    swa_dynamic_weight_max = float(os.environ.get("SWA_DYNAMIC_WEIGHT_MAX", 2.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     qat_bits = int(os.environ.get("QAT_BITS", 0))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 500))
@@ -176,6 +205,7 @@ class Hyperparameters:
     qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "1")))
     qat_tied_output = bool(int(os.environ.get("QAT_TIED_OUTPUT", "1")))
     quant_bits = int(os.environ.get("QUANT_BITS", qat_bits if qat_bits > 0 else 8))
+    rans_int6 = bool(int(os.environ.get("RANS_INT6", "0")))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 32))
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
@@ -243,6 +273,7 @@ class Hyperparameters:
     qk_bias = bool(int(os.environ.get("QK_BIAS", "0")))
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
+    attention_window = int(os.environ.get("ATTENTION_WINDOW", os.environ.get("SLIDING_ATTN_WINDOW", "-1")))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
     gradient_checkpointing = bool(int(os.environ.get("GRADIENT_CHECKPOINTING", "0")))
     activation_checkpoint_impl = os.environ.get("ACTIVATION_CHECKPOINT_IMPL", "none")
@@ -251,8 +282,9 @@ class Hyperparameters:
     monitoring = bool(int(os.environ.get("MONITORING", "0")))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "0")))
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
-    liger_ce = bool(int(os.environ.get("LIGER_CE", "0")))
+    liger_ce = bool(int(os.environ.get("LIGER_CE", "1")))
     liger_rope = bool(int(os.environ.get("LIGER_ROPE", "0")))
+    tridao_packed_rope = bool(int(os.environ.get("TRIDAO_PACKED_ROPE", "1" if triton is not None else "0")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
     poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
@@ -1574,7 +1606,7 @@ def eval_val_sliding_hashed_ngram(
                     seg_model_p = np.exp(-seg_nll)
                     log_probs_np = None
                     if adaptive or mix_mode == "expert":
-                        log_probs = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                        log_probs = liger_log_softmax(logits_f[i, s:wlen], dim=-1)
                         if mix_mode == "expert":
                             log_probs_np = log_probs.cpu().numpy()
                         if adaptive:
@@ -1958,7 +1990,7 @@ def eval_val_sliding(
                     if ngram_enabled and not ngram_cutoff_hit:
                         seg_nll_np = scored_nll.cpu().numpy()
                         seg_model_p = np.exp(-seg_nll_np)
-                        log_probs = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                        log_probs = liger_log_softmax(logits_f[i, s:wlen], dim=-1)
                         log_probs_np = log_probs.cpu().numpy()
                         if adaptive:
                             probs = log_probs.exp()
@@ -2298,6 +2330,11 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 QUANT_SCALE_EPS = 2.0 ** -24  # Smallest positive fp16 subnormal; scales are stored as fp16.
+RANS_INT6_MAGIC = b"R6A1"
+RANS_INT6_PREC = 15
+RANS_INT6_TOTAL = 1 << RANS_INT6_PREC
+RANS_INT6_LOWER = 1 << 23
+RANS_INT6_ALPHABET = 64
 
 def signed_quant_max(bits: int) -> int:
     if bits < 2 or bits > 8:
@@ -2439,6 +2476,124 @@ def unpack_quantized_tensor(packed: Tensor, shape: tuple[int, ...], bits: int) -
     q = vals.astype(np.int16, copy=False) - qmax
     return torch.from_numpy(q.astype(np.int8, copy=False)).reshape(shape).contiguous()
 
+
+def _build_rans_int6_freqs(symbols: np.ndarray) -> list[int]:
+    counts = np.bincount(symbols.astype(np.int64, copy=False), minlength=RANS_INT6_ALPHABET)
+    present = counts > 0
+    n_present = int(present.sum())
+    if n_present == 0:
+        raise ValueError("cannot rANS-code an empty int6 tensor")
+    remaining = RANS_INT6_TOTAL - n_present
+    if remaining < 0:
+        raise ValueError(f"too many symbols for RANS_INT6_TOTAL={RANS_INT6_TOTAL}: {n_present}")
+
+    freqs = np.zeros(RANS_INT6_ALPHABET, dtype=np.int64)
+    freqs[present] = 1
+    total = int(counts[present].sum())
+    freqs[present] += np.floor(counts[present] / total * remaining).astype(np.int64)
+
+    deficit = RANS_INT6_TOTAL - int(freqs.sum())
+    if deficit:
+        for idx in np.argsort(-counts):
+            if deficit == 0:
+                break
+            if present[idx]:
+                freqs[idx] += 1
+                deficit -= 1
+    if int(freqs.sum()) != RANS_INT6_TOTAL:
+        raise AssertionError("rANS int6 frequency table does not sum to RANS_INT6_TOTAL")
+    return freqs.tolist()
+
+
+def _rans_int6_encode_symbols(symbols: np.ndarray, freqs: list[int]) -> bytes:
+    cum = [0] * (len(freqs) + 1)
+    for i, freq in enumerate(freqs):
+        cum[i + 1] = cum[i] + int(freq)
+
+    state = RANS_INT6_LOWER
+    out = bytearray()
+    for sym in symbols[::-1]:
+        s = int(sym)
+        freq = int(freqs[s])
+        start = int(cum[s])
+        max_state = (freq * (RANS_INT6_LOWER >> RANS_INT6_PREC)) << 8
+        while state >= max_state:
+            out.append(state & 0xFF)
+            state >>= 8
+        state = (state // freq) * RANS_INT6_TOTAL + start + (state % freq)
+
+    for _ in range(4):
+        out.append(state & 0xFF)
+        state >>= 8
+    out.reverse()
+    return bytes(out)
+
+
+def _rans_int6_decode_symbols(data: bytes, freqs: list[int], count: int) -> np.ndarray:
+    cum = [0] * (len(freqs) + 1)
+    for i, freq in enumerate(freqs):
+        cum[i + 1] = cum[i] + int(freq)
+    if cum[-1] != RANS_INT6_TOTAL:
+        raise ValueError(f"rANS int6 frequency total must be {RANS_INT6_TOTAL}, got {cum[-1]}")
+
+    sym_table = np.empty(RANS_INT6_TOTAL, dtype=np.uint8)
+    for s, freq in enumerate(freqs):
+        if freq:
+            sym_table[cum[s]:cum[s + 1]] = s
+
+    data_view = memoryview(data)
+    if len(data_view) < 4:
+        raise ValueError("rANS int6 stream is too short")
+    pos = 0
+    state = 0
+    for _ in range(4):
+        state = (state << 8) | int(data_view[pos])
+        pos += 1
+
+    symbols = np.empty(count, dtype=np.uint8)
+    for i in range(count):
+        slot = state & (RANS_INT6_TOTAL - 1)
+        s = int(sym_table[slot])
+        symbols[i] = s
+        state = int(freqs[s]) * (state >> RANS_INT6_PREC) + slot - int(cum[s])
+        while state < RANS_INT6_LOWER:
+            if pos >= len(data_view):
+                raise ValueError(f"rANS int6 stream exhausted at symbol {i}/{count}")
+            state = (state << 8) | int(data_view[pos])
+            pos += 1
+    return symbols
+
+
+def rans_int6_encode_tensor(q: Tensor) -> Tensor:
+    q_np = q.detach().cpu().reshape(-1).to(torch.int16).numpy()
+    symbols = (q_np + 32).astype(np.uint8, copy=False)
+    if symbols.size and (int(symbols.min()) < 0 or int(symbols.max()) >= RANS_INT6_ALPHABET):
+        raise ValueError("rANS int6 expects quantized values in [-32, 31]")
+    freqs = _build_rans_int6_freqs(symbols)
+    encoded = _rans_int6_encode_symbols(symbols, freqs)
+    header = bytearray(RANS_INT6_MAGIC)
+    header.extend(int(symbols.size).to_bytes(8, "little"))
+    for freq in freqs:
+        header.extend(int(freq).to_bytes(2, "little"))
+    blob = bytes(header) + encoded
+    return torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy()).contiguous()
+
+
+def rans_int6_decode_tensor(blob: Tensor, shape: tuple[int, ...]) -> Tensor:
+    data = blob.detach().cpu().contiguous().numpy().tobytes()
+    if data[:4] != RANS_INT6_MAGIC:
+        raise ValueError(f"bad rANS int6 magic {data[:4]!r}")
+    count = int.from_bytes(data[4:12], "little")
+    if math.prod(shape) != count:
+        raise ValueError(f"rANS int6 count {count} does not match tensor shape {shape}")
+    freqs = [
+        int.from_bytes(data[12 + 2 * i:14 + 2 * i], "little")
+        for i in range(RANS_INT6_ALPHABET)
+    ]
+    symbols = _rans_int6_decode_symbols(data[12 + 2 * RANS_INT6_ALPHABET:], freqs, count)
+    q = symbols.astype(np.int16, copy=False) - 32
+    return torch.from_numpy(q.astype(np.int8, copy=False)).reshape(shape).contiguous()
+
 def store_quantized_tensor(
     name: str,
     q: Tensor,
@@ -2451,13 +2606,15 @@ def store_quantized_tensor(
     q_shapes[name] = tuple(q.shape)
     return tensor_nbytes(stored)
 
-def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
+def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8, use_rans_int6: bool = False):
     # Single supported clean-script export format:
     # - per-row signed int payload for 2D float tensors
     # - per-tensor signed int payload for other float tensors
     # - exact passthrough for non-floats
     # - passthrough for small float tensors, stored as fp16 to save bytes
     signed_quant_max(bits)
+    if use_rans_int6 and bits != 6:
+        raise ValueError(f"RANS_INT6 requires QUANT_BITS=6, got {bits}")
     quantized: dict[str, Tensor] = {}
     q_shapes: dict[str, tuple[int, ...]] = {}
     scales: dict[str, Tensor] = {}
@@ -2491,13 +2648,23 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8):
 
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t, bits)
-        stats["quant_payload_bytes"] += store_quantized_tensor(name, q, bits, quantized, q_shapes)
+        if use_rans_int6:
+            stored = rans_int6_encode_tensor(q)
+            quantized[name] = stored
+            q_shapes[name] = tuple(q.shape)
+            stats["quant_payload_bytes"] += tensor_nbytes(stored)
+        else:
+            stats["quant_payload_bytes"] += store_quantized_tensor(name, q, bits, quantized, q_shapes)
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["quant_payload_bytes"] += tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": f"int{bits}_clean_per_row_packed_v2" if bits < 8 else "int8_clean_per_row_v2",
+        "__quant_format__": (
+            "int6_rans_per_row_v1"
+            if use_rans_int6
+            else f"int{bits}_clean_per_row_packed_v2" if bits < 8 else "int8_clean_per_row_v2"
+        ),
         "bits": bits,
         "quantized": quantized,
         "q_shapes": q_shapes,
@@ -2514,9 +2681,14 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     bits = int(obj.get("bits", 8))
     q_shapes = obj.get("q_shapes", {})
+    quant_format = str(obj.get("__quant_format__", ""))
+    use_rans_int6 = "int6_rans" in quant_format
     for name, q in obj["quantized"].items():
         if name in q_shapes:
-            q = unpack_quantized_tensor(q, tuple(q_shapes[name]), bits)
+            if use_rans_int6:
+                q = rans_int6_decode_tensor(q, tuple(q_shapes[name]))
+            else:
+                q = unpack_quantized_tensor(q, tuple(q_shapes[name]), bits)
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         if s.ndim > 0:
@@ -2728,6 +2900,8 @@ def quantize_state_dict_gptq_int(
     args: Hyperparameters,
 ):
     signed_quant_max(args.quant_bits)
+    if args.rans_int6 and args.quant_bits != 6:
+        raise ValueError(f"RANS_INT6 requires QUANT_BITS=6, got {args.quant_bits}")
     quantized: dict[str, Tensor] = {}
     q_shapes: dict[str, tuple[int, ...]] = {}
     scales: dict[str, Tensor] = {}
@@ -2793,14 +2967,22 @@ def quantize_state_dict_gptq_int(
             q, s = quantize_float_tensor(t, bits=args.quant_bits)
             stats["num_fallback_tensors"] += 1
             methods[name] = f"per_row_int{args.quant_bits}"
-        stats["quant_payload_bytes"] += store_quantized_tensor(name, q, args.quant_bits, quantized, q_shapes)
+        if args.rans_int6:
+            stored = rans_int6_encode_tensor(q)
+            quantized[name] = stored
+            q_shapes[name] = tuple(q.shape)
+            stats["quant_payload_bytes"] += tensor_nbytes(stored)
+        else:
+            stats["quant_payload_bytes"] += store_quantized_tensor(name, q, args.quant_bits, quantized, q_shapes)
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["quant_payload_bytes"] += tensor_nbytes(s)
 
     obj: dict[str, object] = {
         "__quant_format__": (
-            f"gptq_int{args.quant_bits}_per_row_fallback_packed_v2"
+            "gptq_int6_rans_per_row_fallback_v1"
+            if args.rans_int6
+            else f"gptq_int{args.quant_bits}_per_row_fallback_packed_v2"
             if args.quant_bits < 8
             else "gptq_int8_per_row_fallback_v2"
         ),
@@ -2933,7 +3115,9 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 class ParameterAverager:
     """FP32 parameter-only EMA/SWA without per-step state_dict walks."""
 
-    def __init__(self, module: nn.Module, *, cpu: bool = False):
+    def __init__(self, module: nn.Module, *, cpu: bool = False, initial_weight: float = 1.0):
+        if initial_weight <= 0.0:
+            raise ValueError(f"initial weight-average weight must be positive, got {initial_weight}")
         self.names: list[str] = []
         self.params: list[Tensor] = []
         self.avg_params: list[Tensor] = []
@@ -2943,9 +3127,12 @@ class ParameterAverager:
             self.names.append(name)
             self.params.append(param)
             avg = param.detach().float().clone()
+            if initial_weight != 1.0:
+                avg.mul_(initial_weight)
             self.avg_params.append(avg.cpu() if cpu else avg)
         self.cpu = cpu
         self.count = 1
+        self.weight_sum = float(initial_weight)
 
     @torch.no_grad()
     def update_ema(self, decay: float) -> None:
@@ -2960,13 +3147,16 @@ class ParameterAverager:
             avg.mul_(decay).add_(param.float().to(device=avg.device), alpha=1.0 - decay)
 
     @torch.no_grad()
-    def add_swa(self) -> None:
+    def add_swa(self, weight: float = 1.0) -> None:
+        if weight <= 0.0:
+            raise ValueError(f"SWA snapshot weight must be positive, got {weight}")
         for avg, param in zip(self.avg_params, self.params, strict=True):
-            avg.add_(param.detach().float().to(device=avg.device))
+            avg.add_(param.detach().float().to(device=avg.device), alpha=weight)
         self.count += 1
+        self.weight_sum += float(weight)
 
-    def load_into(self, module: nn.Module, *, divisor: int = 1) -> None:
-        if divisor <= 0:
+    def load_into(self, module: nn.Module, *, divisor: float = 1.0) -> None:
+        if divisor <= 0.0:
             raise ValueError(f"weight-average divisor must be positive, got {divisor}")
         load_state = module.state_dict()
         for name, avg in zip(self.names, self.avg_params, strict=True):
@@ -2974,6 +3164,16 @@ class ParameterAverager:
             value = avg / divisor if divisor != 1 else avg
             load_state[name] = value.to(device=ref.device, dtype=ref.dtype)
         module.load_state_dict(load_state, strict=True)
+
+
+def swa_dynamic_modulation(args: Hyperparameters, lr_scale: float) -> tuple[int, float, float]:
+    start_frac = max(float(args.swa_start_frac), 1e-12)
+    progress = max(0.0, min(1.0, (start_frac - float(lr_scale)) / start_frac))
+    shaped = progress ** float(args.swa_dynamic_power)
+    interval_float = args.swa_dynamic_min_every + (args.swa_every - args.swa_dynamic_min_every) * (1.0 - shaped)
+    interval = max(args.swa_dynamic_min_every, int(round(interval_float)))
+    weight = 1.0 + (float(args.swa_dynamic_weight_max) - 1.0) * shaped
+    return interval, weight, progress
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
@@ -3254,6 +3454,210 @@ def apply_liger_rotary_emb(q: Tensor, k: Tensor, freqs_cos: Tensor, freqs_sin: T
     )
 
 
+if triton is not None:
+    @triton.jit
+    def _tridao_rotary_kernel(
+        OUT,
+        X,
+        COS,
+        SIN,
+        seqlen,
+        nheads,
+        seqlen_ro,
+        stride_out_batch,
+        stride_out_seqlen,
+        stride_out_nheads,
+        stride_out_headdim,
+        stride_x_batch,
+        stride_x_seqlen,
+        stride_x_nheads,
+        stride_x_headdim,
+        ROTARY_DIM: tl.constexpr,
+        INTERLEAVED: tl.constexpr,
+        CONJUGATE: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        BLOCK_K: tl.constexpr = triton.next_power_of_2(ROTARY_DIM)
+        ROTARY_DIM_HALF: tl.constexpr = ROTARY_DIM // 2
+        pid_head = tl.program_id(axis=0)
+        pid_m = tl.program_id(axis=1)
+        pid_batch = tl.program_id(axis=2)
+        if pid_m * BLOCK_M >= seqlen:
+            return
+
+        rh = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rk_half = tl.arange(0, BLOCK_K // 2)
+        cos_offsets = rm[:, None] * ROTARY_DIM_HALF + rk_half[None, :]
+        cos_mask = (rm[:, None] < seqlen_ro) & (rk_half[None, :] < ROTARY_DIM_HALF)
+        cos = tl.load(COS + cos_offsets, mask=cos_mask, other=1.0).to(tl.float32)
+        sin = tl.load(SIN + cos_offsets, mask=cos_mask, other=0.0).to(tl.float32)
+        if CONJUGATE:
+            sin = -sin
+
+        if not INTERLEAVED:
+            x_offsets = (
+                pid_batch * stride_x_batch
+                + rh[:, None, None] * stride_x_nheads
+                + rm[None, :, None] * stride_x_seqlen
+                + rk_half[None, None, :] * stride_x_headdim
+            )
+            out_offsets = (
+                pid_batch * stride_out_batch
+                + rh[:, None, None] * stride_out_nheads
+                + rm[None, :, None] * stride_out_seqlen
+                + rk_half[None, None, :] * stride_out_headdim
+            )
+            mask = (rh[:, None, None] < nheads) & (rm[None, :, None] < seqlen) & (rk_half[None, None, :] < ROTARY_DIM_HALF)
+            x0 = tl.load(X + x_offsets, mask=mask, other=0.0).to(tl.float32)
+            x1 = tl.load(X + x_offsets + ROTARY_DIM_HALF * stride_x_headdim, mask=mask, other=0.0).to(tl.float32)
+            out0 = x0 * cos - x1 * sin
+            out1 = x0 * sin + x1 * cos
+            tl.store(OUT + out_offsets, out0, mask=mask)
+            tl.store(OUT + out_offsets + ROTARY_DIM_HALF * stride_out_headdim, out1, mask=mask)
+        else:
+            rk = tl.arange(0, BLOCK_K)
+            x_offsets = (
+                pid_batch * stride_x_batch
+                + rh[:, None, None] * stride_x_nheads
+                + rm[None, :, None] * stride_x_seqlen
+                + rk[None, None, :] * stride_x_headdim
+            )
+            out_offsets = (
+                pid_batch * stride_out_batch
+                + rh[:, None, None] * stride_out_nheads
+                + rm[None, :, None] * stride_out_seqlen
+                + rk[None, None, :] * stride_out_headdim
+            )
+            mask = (rh[:, None, None] < nheads) & (rm[None, :, None] < seqlen) & (rk[None, None, :] < ROTARY_DIM)
+            x = tl.load(X + x_offsets, mask=mask, other=0.0).to(tl.float32)
+            x0, x1 = tl.split(tl.reshape(x, [BLOCK_H, BLOCK_M, BLOCK_K // 2, 2]))
+            out0 = x0 * cos - x1 * sin
+            out1 = x0 * sin + x1 * cos
+            out = tl.reshape(tl.join(out0, out1), [BLOCK_H, BLOCK_M, BLOCK_K])
+            tl.store(OUT + out_offsets, out, mask=mask)
+else:
+    _tridao_rotary_kernel = None
+
+
+def _tridao_apply_rotary(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    *,
+    interleaved: bool,
+    inplace: bool,
+    conjugate: bool = False,
+) -> Tensor:
+    if _tridao_rotary_kernel is None:
+        raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
+    if not x.is_cuda:
+        raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires CUDA tensors")
+    batch, seqlen, nheads, headdim = x.shape
+    seqlen_ro, rotary_dim_half = cos.shape
+    rotary_dim = rotary_dim_half * 2
+    if sin.shape != cos.shape:
+        raise ValueError(f"sin shape {tuple(sin.shape)} must match cos shape {tuple(cos.shape)}")
+    if rotary_dim > headdim:
+        raise ValueError(f"rotary_dim={rotary_dim} must be <= headdim={headdim}")
+    if headdim > 256:
+        raise ValueError("Tri Dao rotary kernel supports headdim <= 256")
+    if seqlen_ro < seqlen:
+        raise ValueError(f"seqlen_ro={seqlen_ro} must be >= seqlen={seqlen}")
+
+    output = x if inplace else torch.empty_like(x)
+    if rotary_dim < headdim and not inplace:
+        output[..., rotary_dim:].copy_(x[..., rotary_dim:])
+    block_m = 8 if rotary_dim <= 128 else 4
+    grid = lambda META: (triton.cdiv(nheads, META["BLOCK_H"]), triton.cdiv(seqlen, META["BLOCK_M"]), batch)
+    with torch.cuda.device(x.device.index):
+        torch.library.wrap_triton(_tridao_rotary_kernel)[grid](
+            output,
+            x,
+            cos.contiguous(),
+            sin.contiguous(),
+            seqlen,
+            nheads,
+            seqlen_ro,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            output.stride(3),
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            x.stride(3),
+            rotary_dim,
+            interleaved,
+            conjugate,
+            BLOCK_H=2,
+            BLOCK_M=block_m,
+        )
+    return output
+
+
+def _tridao_apply_rotary_emb_qkv(
+    qkv: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    *,
+    num_heads_q: int,
+    interleaved: bool,
+    inplace: bool,
+    conjugate: bool = False,
+) -> Tensor:
+    if qkv.dim() != 4:
+        raise ValueError(f"packed QKV must be [B, T, Hq + 2*Hkv, D], got {tuple(qkv.shape)}")
+    if not qkv.is_contiguous():
+        if inplace:
+            raise ValueError("packed QKV RoPE requires contiguous qkv for the in-place fast path")
+        qkv = qkv.contiguous()
+    num_heads_k = (qkv.shape[2] - num_heads_q) // 2
+    if qkv.shape[2] != num_heads_q + 2 * num_heads_k:
+        raise ValueError(f"invalid packed QKV head count: total={qkv.shape[2]} num_heads_q={num_heads_q}")
+    qk = qkv[:, :, : num_heads_q + num_heads_k]
+    qk = _tridao_apply_rotary(qk, cos, sin, interleaved=interleaved, inplace=inplace, conjugate=conjugate)
+    if not inplace:
+        qkv = torch.cat([qk, qkv[:, :, num_heads_q + num_heads_k :]], dim=2)
+    return qkv
+
+
+class _TridaoPackedQKVRoPE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv: Tensor, cos: Tensor, sin: Tensor, num_heads_q: int):
+        ctx.save_for_backward(cos, sin)
+        ctx.num_heads_q = num_heads_q
+        return _tridao_apply_rotary_emb_qkv(
+            qkv,
+            cos,
+            sin,
+            num_heads_q=num_heads_q,
+            interleaved=True,
+            inplace=True,
+        )
+
+    @staticmethod
+    def backward(ctx, dqkv: Tensor):
+        cos, sin = ctx.saved_tensors
+        dqkv = _tridao_apply_rotary_emb_qkv(
+            dqkv.contiguous(),
+            cos,
+            sin,
+            num_heads_q=ctx.num_heads_q,
+            interleaved=True,
+            inplace=True,
+            conjugate=True,
+        )
+        return dqkv, None, None, None
+
+
+def apply_tridao_packed_qkv_rotary_emb(qkv: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, rope_dims: int, num_heads_q: int) -> Tensor:
+    cos = freqs_cos[0, :, 0, : rope_dims // 2].contiguous()
+    sin = freqs_sin[0, :, 0, : rope_dims // 2].contiguous()
+    return _TridaoPackedQKVRoPE.apply(qkv, cos, sin, num_heads_q)
+
+
 def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
@@ -3284,7 +3688,7 @@ class AttentionResidualMixer(nn.Module):
             values = stacked.float()
             keys = F.rms_norm(values, (values.size(-1),), eps=self.eps)
             logits = torch.einsum("d,nbtd->nbt", self.pseudo_query.float(), keys)
-            weights = F.softmax(logits, dim=0)
+            weights = liger_softmax(logits, dim=0)
             mixed = torch.einsum("nbt,nbtd->btd", weights, values)
         return mixed.to(dtype=stacked.dtype)
 
@@ -3409,6 +3813,8 @@ class ParcaeCausalSelfAttention(nn.Module):
         clip_qkv: float | None,
         rope_dims: int,
         liger_rope: bool = False,
+        tridao_packed_rope: bool = False,
+        attention_window: int = -1,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -3427,6 +3833,14 @@ class ParcaeCausalSelfAttention(nn.Module):
             raise ValueError(f"rope_dims must be a positive even value <= head_dim; got {rope_dims} for head_dim={self.head_dim}")
         self.rope_dims = rope_dims
         self.liger_rope = liger_rope
+        self.tridao_packed_rope = tridao_packed_rope
+        self.attention_window = attention_window
+        if self.tridao_packed_rope and self.liger_rope:
+            raise ValueError("TRIDAO_PACKED_ROPE and LIGER_ROPE are mutually exclusive")
+        if self.tridao_packed_rope and _tridao_rotary_kernel is None:
+            raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
+        if self.tridao_packed_rope and (qk_bias or clip_qkv is not None):
+            raise ValueError("TRIDAO_PACKED_ROPE=1 currently requires QK_BIAS=0 and CLIP_QKV unset")
         self.qk_norm = qk_norm
         self.clip_qkv = clip_qkv
         self.c_qkv = CastedLinear(dim, self.q_dim + 2 * self.kv_dim, bias=False)
@@ -3456,10 +3870,19 @@ class ParcaeCausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q, k, v = self.c_qkv(x).split((self.q_dim, self.kv_dim, self.kv_dim), dim=-1)
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_kv_head, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+        qkv = self.c_qkv(x)
+        use_tridao_packed_rope = self.tridao_packed_rope and qkv.is_cuda
+        if use_tridao_packed_rope:
+            qkv = qkv.view(bsz, seqlen, self.n_head + 2 * self.n_kv_head, self.head_dim)
+            qkv = apply_tridao_packed_qkv_rotary_emb(qkv, freqs_cos, freqs_sin, self.rope_dims, self.n_head)
+            q = qkv[:, :, : self.n_head]
+            k = qkv[:, :, self.n_head : self.n_head + self.n_kv_head]
+            v = qkv[:, :, self.n_head + self.n_kv_head :]
+        else:
+            q, k, v = qkv.split((self.q_dim, self.kv_dim, self.kv_dim), dim=-1)
+            q = q.view(bsz, seqlen, self.n_head, self.head_dim)
+            k = k.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+            v = v.view(bsz, seqlen, self.n_kv_head, self.head_dim)
 
         ve = kwargs.get('ve')
         if ve is not None and self.ve_gate is not None:
@@ -3476,10 +3899,11 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = (q + self.q_bias).to(q.dtype)
             k = (k + self.k_bias).to(k.dtype)
 
-        if self.liger_rope:
-            q, k = apply_liger_rotary_emb(q, k, freqs_cos, freqs_sin, self.rope_dims)
-        else:
-            q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
+        if not use_tridao_packed_rope:
+            if self.liger_rope:
+                q, k = apply_liger_rotary_emb(q, k, freqs_cos, freqs_sin, self.rope_dims)
+            else:
+                q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
         if self.qk_norm:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
@@ -3490,6 +3914,7 @@ class ParcaeCausalSelfAttention(nn.Module):
                 k.contiguous(),
                 v.contiguous(),
                 causal=True,
+                window_size=(self.attention_window, 0),
             )
         else:
             q_sdpa = q.transpose(1, 2)
@@ -3530,6 +3955,8 @@ class TransformerPreNormBlock(nn.Module):
         residual_layer_idx: int,
         attn_res_enabled: bool = False,
         liger_rope: bool = False,
+        tridao_packed_rope: bool = False,
+        attention_window: int = -1,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -3548,6 +3975,8 @@ class TransformerPreNormBlock(nn.Module):
             clip_qkv=clip_qkv,
             rope_dims=rope_dims,
             liger_rope=liger_rope,
+            tridao_packed_rope=tridao_packed_rope,
+            attention_window=attention_window,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = get_mlp_class(mlp_class_name)
@@ -3864,6 +4293,8 @@ class GPT(nn.Module):
                 residual_layer_idx=i,
                 attn_res_enabled=self._attn_res_enabled_for("prelude"),
                 liger_rope=h.liger_rope,
+                tridao_packed_rope=h.tridao_packed_rope,
+                attention_window=h.attention_window,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -3900,6 +4331,8 @@ class GPT(nn.Module):
                 residual_layer_idx=i + self.n_layers_in_prelude,
                 attn_res_enabled=self._attn_res_enabled_for("core"),
                 liger_rope=h.liger_rope,
+                tridao_packed_rope=h.tridao_packed_rope,
+                attention_window=h.attention_window,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -3936,6 +4369,8 @@ class GPT(nn.Module):
                 residual_layer_idx=i + self.n_layers_in_prelude + self.n_layers_in_recurrent_block,
                 attn_res_enabled=self._attn_res_enabled_for("coda"),
                 liger_rope=h.liger_rope,
+                tridao_packed_rope=h.tridao_packed_rope,
+                attention_window=h.attention_window,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -4671,10 +5106,19 @@ def main() -> None:
     if args.qat_bits != 0 and not (1 <= args.qat_bits <= 8):
         raise ValueError(f"TorchAO QAT supports QAT_BITS in [1, 8], got {args.qat_bits}")
     signed_quant_max(args.quant_bits)
+    if args.rans_int6 and args.quant_bits != 6:
+        raise ValueError(f"RANS_INT6=1 requires QUANT_BITS=6, got {args.quant_bits}")
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
     if args.liger_rope and LigerRopeFunction is None:
         raise RuntimeError("LIGER_ROPE=1 requires installing liger-kernel")
+    if args.tridao_packed_rope:
+        if _tridao_rotary_kernel is None:
+            raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
+        if args.liger_rope:
+            raise ValueError("TRIDAO_PACKED_ROPE and LIGER_ROPE are mutually exclusive")
+        if args.qk_bias or args.clip_qkv is not None:
+            raise ValueError("TRIDAO_PACKED_ROPE=1 currently requires QK_BIAS=0 and CLIP_QKV unset")
     if "NUM_LAYERS" in os.environ:
         raise ValueError("NUM_LAYERS is ignored by train_gpt_parcae.py; use N_LAYERS_IN_PRELUDE, N_LAYERS_IN_RECURRENT_BLOCK, and N_LAYERS_IN_CODA")
     if "QK_GAIN_INIT" in os.environ:
@@ -4693,6 +5137,14 @@ def main() -> None:
         raise ValueError(f"SWA_START_FRAC must be in [0, 1], got {args.swa_start_frac}")
     if args.swa_every <= 0:
         raise ValueError(f"SWA_EVERY must be positive, got {args.swa_every}")
+    if args.swa_dynamic_min_every <= 0:
+        raise ValueError(f"SWA_DYNAMIC_MIN_EVERY must be positive, got {args.swa_dynamic_min_every}")
+    if args.swa_dynamic and args.swa_dynamic_min_every > args.swa_every:
+        raise ValueError("SWA_DYNAMIC_MIN_EVERY must be <= SWA_EVERY when SWA_DYNAMIC=1")
+    if args.swa_dynamic_power <= 0.0:
+        raise ValueError(f"SWA_DYNAMIC_POWER must be positive, got {args.swa_dynamic_power}")
+    if args.swa_dynamic_weight_max < 1.0:
+        raise ValueError(f"SWA_DYNAMIC_WEIGHT_MAX must be >= 1, got {args.swa_dynamic_weight_max}")
     if args.residual_mode not in {"sequential", "parallel"}:
         raise ValueError(f"RESIDUAL_MODE must be sequential or parallel, got {args.residual_mode!r}")
     if args.parallel_residual_scope not in {"none", "core", "all"}:
@@ -4828,9 +5280,9 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", max(1, 8 // world_size)))
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -5024,7 +5476,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_backend:flash_attn4_wrapper has_flash_attn:{HAS_FLASH_ATTN}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} qkv_projection:packed")
+    log0(
+        f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
+        f"qkv_projection:packed window:{args.attention_window}"
+    )
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
         f"liger_geglu_available:{LigerGELUMulFunction is not None}"
@@ -5053,6 +5508,10 @@ def main() -> None:
         f"liger_rope:enabled:{args.liger_rope} real_liger_available:{LigerRopeFunction is not None} "
         "convention:llama_split_half"
     )
+    log0(
+        f"tridao_packed_rope:enabled:{args.tridao_packed_rope} triton_available:{_tridao_rotary_kernel is not None} "
+        "convention:adjacent_pair_interleaved layout:packed_qkv_inplace"
+    )
     attn_res_params = sum(
         p.numel()
         for module in base_model.modules()
@@ -5076,7 +5535,8 @@ def main() -> None:
         f"qat:bits:{args.qat_bits} start_step:{args.qat_start_step} "
         f"backend:torchao group_size:{args.qat_group_size} "
         f"activation_bits:{args.qat_activation_bits} linear:{args.qat_linear} "
-        f"embeddings:{args.qat_embeddings} tied_output:{args.qat_tied_output} export_bits:{args.quant_bits}"
+        f"embeddings:{args.qat_embeddings} tied_output:{args.qat_tied_output} export_bits:{args.quant_bits} "
+        f"rans_int6:{args.rans_int6}"
     )
     log0(
         f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
@@ -5094,7 +5554,11 @@ def main() -> None:
         f"weight_average:ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay:g} "
         f"ema_update_every:{args.ema_update_every} "
         f"swa_enabled:{args.swa_enabled} swa_start_frac:{args.swa_start_frac:g} "
-        f"swa_every:{args.swa_every} priority:{weight_average_priority}"
+        f"swa_every:{args.swa_every} swa_dynamic:{args.swa_dynamic} "
+        f"swa_dynamic_min_every:{args.swa_dynamic_min_every} "
+        f"swa_dynamic_power:{args.swa_dynamic_power:g} "
+        f"swa_dynamic_weight_max:{args.swa_dynamic_weight_max:g} "
+        f"priority:{weight_average_priority}"
     )
     log0(
         f"ttt:enabled:{args.ttt_enabled} stride:{args.eval_stride} chunk_tokens:{args.ttt_chunk_tokens} "
@@ -5194,6 +5658,7 @@ def main() -> None:
     ema_state = ParameterAverager(base_model, cpu=False) if args.ema_enabled else None
     ema_last_step = 0
     swa_state: ParameterAverager | None = None
+    swa_last_step = 0
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -5273,12 +5738,25 @@ def main() -> None:
         if ema_state is not None and next_step % args.ema_update_every == 0:
             ema_state.update_ema(args.ema_decay ** (next_step - ema_last_step))
             ema_last_step = next_step
-        elif args.swa_enabled and scale < args.swa_start_frac and next_step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = ParameterAverager(base_model, cpu=True)
-                log0(f"swa:start step:{next_step}")
+        elif args.swa_enabled and scale < args.swa_start_frac:
+            swa_interval = args.swa_every
+            swa_weight = 1.0
+            swa_progress = 0.0
+            if args.swa_dynamic:
+                swa_interval, swa_weight, swa_progress = swa_dynamic_modulation(args, scale)
+                swa_due = swa_state is None or next_step - swa_last_step >= swa_interval
             else:
-                swa_state.add_swa()
+                swa_due = next_step % args.swa_every == 0
+            if swa_due:
+                if swa_state is None:
+                    swa_state = ParameterAverager(base_model, cpu=True, initial_weight=swa_weight)
+                    log0(
+                        f"swa:start step:{next_step} dynamic:{args.swa_dynamic} "
+                        f"interval:{swa_interval} weight:{swa_weight:.4f} progress:{swa_progress:.4f}"
+                    )
+                else:
+                    swa_state.add_swa(swa_weight)
+                swa_last_step = next_step
 
         torch.cuda.synchronize()
         step = next_step
@@ -5310,8 +5788,8 @@ def main() -> None:
         ema_state.load_into(base_model)
         del ema_state
     elif args.swa_enabled and swa_state is not None and swa_state.count > 1:
-        log0(f"swa:applying averaged {swa_state.count} checkpoints")
-        swa_state.load_into(base_model, divisor=swa_state.count)
+        log0(f"swa:applying averaged {swa_state.count} checkpoints weight_sum:{swa_state.weight_sum:.4f}")
+        swa_state.load_into(base_model, divisor=swa_state.weight_sum)
         del swa_state
     elif args.swa_enabled:
         log0(f"swa:skipped count:{swa_state.count if swa_state is not None else 0}")
@@ -5350,10 +5828,14 @@ def main() -> None:
             f"in {1000.0 * (time.perf_counter() - t_gptq):.0f}ms"
         )
         quant_obj, quant_stats = quantize_state_dict_gptq_int(base_model.state_dict(), hessians, args)
-        quant_format = f"gptq_int{args.quant_bits}"
+        quant_format = f"gptq_int{args.quant_bits}{'_rans' if args.rans_int6 else ''}"
     else:
-        quant_obj, quant_stats = quantize_state_dict_int(base_model.state_dict(), bits=args.quant_bits)
-        quant_format = f"int{args.quant_bits}"
+        quant_obj, quant_stats = quantize_state_dict_int(
+            base_model.state_dict(),
+            bits=args.quant_bits,
+            use_rans_int6=args.rans_int6,
+        )
+        quant_format = f"int{args.quant_bits}{'_rans' if args.rans_int6 else ''}"
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
