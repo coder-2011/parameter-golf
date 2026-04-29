@@ -143,6 +143,7 @@ export GPTQ_QUANTIZE_EMBEDDINGS=${GPTQ_QUANTIZE_EMBEDDINGS:-1}
 export GPTQ_MATRIX_CLIP_SIGMAS=${GPTQ_MATRIX_CLIP_SIGMAS:-12.85}
 export GPTQ_EMBED_CLIP_SIGMAS=${GPTQ_EMBED_CLIP_SIGMAS:-20.0}
 export SAVE_RAW_MODEL=${SAVE_RAW_MODEL:-0}
+export RANS_INT6=${RANS_INT6:-0}
 export XSA_LAST_N=${XSA_LAST_N:-0}
 export ATTN_RES_MODE=${ATTN_RES_MODE:-none}
 export ATTN_RES_SCOPE=${ATTN_RES_SCOPE:-all}
@@ -236,10 +237,10 @@ if [[ ! -f "${LOGFILE}" ]]; then
     exit 1
 fi
 
-ROUNDTRIP_LINE=$(grep -E 'final_(gptq_)?int[0-9]+_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 || true)
+ROUNDTRIP_LINE=$(grep -E 'final_(gptq_)?int[0-9]+(_rans)?_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 || true)
 FINAL_STEP_LINE=$(grep -E 'step:[0-9]+/[0-9]+ val_loss:' "${LOGFILE}" | tail -n1 || true)
 STOP_LINE=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 || true)
-SUBMISSION_LINE=$(grep -E 'Total submission size (gptq_)?int[0-9]+\+zlib:' "${LOGFILE}" | tail -n1 || true)
+SUBMISSION_LINE=$(grep -E 'Total submission size (gptq_)?int[0-9]+(_rans)?\+zlib:' "${LOGFILE}" | tail -n1 || true)
 
 VAL_BPB=$(sed -E 's/.*val_bpb:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
 VAL_LOSS=$(sed -E 's/.*val_loss:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")

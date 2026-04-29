@@ -41,6 +41,23 @@ def test_liger_ce_cpu_fallback_applies_softcap_before_cross_entropy():
     assert torch.allclose(logits.grad, ref_logits.grad)
 
 
+def test_liger_ce_compile_path_uses_torch_cross_entropy(monkeypatch):
+    torch.manual_seed(123)
+    logits = (torch.randn(11, 23) * 2.0).requires_grad_(True)
+    target = torch.randint(0, 23, (11,))
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    softcap = 7.0
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    loss = pg.liger_cross_entropy(logits, target, assume_no_ignore=True, softcap=softcap)
+    ref = F.cross_entropy(softcap * torch.tanh(ref_logits / softcap), target)
+    loss.backward()
+    ref.backward()
+
+    assert torch.allclose(loss, ref)
+    assert torch.allclose(logits.grad, ref_logits.grad)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton CE kernel")
 def test_liger_ce_cuda_matches_torch_cross_entropy_with_ignore_index():
     torch.manual_seed(123)

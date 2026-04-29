@@ -1,3 +1,24 @@
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break from `Tensor.item()`, consider setting:
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] or:
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] to include these operations in the captured graph.
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] Graph break: from user code at:
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 4867, in torch_dynamo_resume_in_forward_model_at_4790
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss = liger_cross_entropy(
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 102, in liger_cross_entropy
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=None)(ce_input, flat_target)
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/transformers/cross_entropy.py", line 41, in forward
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy = LigerCrossEntropyFunction.apply(
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/autograd_function.py", line 880, in inner
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     outs = orig_fwd(*args, **kwargs)
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 473, in forward
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     loss, z_loss, token_accuracy, _input = cross_entropy_forward(
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/liger_kernel/ops/cross_entropy.py", line 334, in cross_entropy_forward
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0]     n_non_ignore = target_mask.sum().item()
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
+W0429 06:14:21.467000 512892 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [4/0] 
 logs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_pwa_qk_dense_v_int6rans_20260429.txt
 val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0
 train_loader:dataset:fineweb10B_sp1892 train_shards:1
@@ -25,104 +46,106 @@ weight_average:ema_enabled:False ema_decay:0.997 ema_update_every:1 swa_enabled:
 ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1
 sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
 seed:1337
-Traceback (most recent call last):
-  File "/workspace/parameter-golf/train_gpt_parcae.py", line 6231, in <module>
-    main()
-  File "/workspace/parameter-golf/train_gpt_parcae.py", line 5833, in main
-    warmup_loss = model(x, y)
-                  ^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 472, in __call__
-    return super().__call__(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1024, in compile_wrapper
-    return fn(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4890, in forward
-    out = self.forward_model(input_ids, labels=target_ids, return_logits=False)
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/train_gpt_parcae.py", line 4737, in forward_model
-    def forward_model(
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1263, in _fn
-    return fn(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/aot_autograd.py", line 1200, in forward
-    return compiled_fn(full_args)
-           ^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 566, in runtime_wrapper
-    all_outs = call_func_at_runtime_with_args(
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
-    out = normalize_as_list(f(args))
-                            ^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 105, in g
-    return f(*args)
-           ^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/autograd/function.py", line 596, in apply
-    return super().apply(*args, **kwargs)  # type: ignore[misc]
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2503, in forward
-    fw_outs = call_func_at_runtime_with_args(
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
-    out = normalize_as_list(f(args))
-                            ^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 783, in wrapper
-    return compiled_fn(runtime_args)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 1011, in inner_fn
-    outs = compiled_fn(args)
-           ^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/output_code.py", line 656, in __call__
-    return self.current_callable(inputs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/utils.py", line 3401, in run
-    out = model(new_inputs)
-          ^^^^^^^^^^^^^^^^^
-  File "/tmp/torchinductor_root/qa/cqabrpno64r7yiytis6lg65rs2pt5njvule3zb5go3g62oz5znet.py", line 1410, in call
-    triton_poi_fused_as_strided_clone_6.run(buf13, buf14, 33554176, stream=stream0)
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1448, in run
-    self.autotune_to_one_config(*args, **kwargs)
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1176, in autotune_to_one_config
-    timings = self.benchmark_all_configs(*args, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1138, in benchmark_all_configs
-    timings = {
-              ^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1139, in <dictcomp>
-    launcher: self.bench(launcher, *args, **kwargs)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 999, in bench
-    return benchmarker.benchmark(
-           ^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
-    return fn(self, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 206, in benchmark
-    return self.benchmark_gpu(_callable, warmup=warmup, rep=rep, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
-    return fn(self, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_inductor/runtime/benchmarking.py", line 380, in benchmark_gpu
-    torch.cuda.synchronize()
-  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py", line 1162, in synchronize
-    return torch._C._cuda_synchronize()
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-torch.AcceleratorError: CUDA error: an illegal memory access was encountered
-Search for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
-CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
-For debugging consider passing CUDA_LAUNCH_BLOCKING=1
-Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
-
+warmup_step:10/200 train_step:9
+warmup_step:20/200 train_step:19
+warmup_step:30/200 train_step:29
+warmup_step:40/200 train_step:39
+warmup_step:50/200 train_step:49
+warmup_step:60/200 train_step:59
+warmup_step:70/200 train_step:69
+warmup_step:80/200 train_step:79
+warmup_step:90/200 train_step:89
+warmup_step:100/200 train_step:99
+warmup_step:110/200 train_step:109
+warmup_step:120/200 train_step:119
+warmup_step:130/200 train_step:129
+warmup_step:140/200 train_step:139
+warmup_step:150/200 train_step:149
+warmup_step:160/200 train_step:159
+warmup_step:170/200 train_step:169
+warmup_step:180/200 train_step:179
+warmup_step:190/200 train_step:189
+warmup_step:200/200 train_step:199
+step:1/1000000 train_loss:7.5506 train_time:91ms step_avg:90.56ms
+step:2/1000000 train_loss:7.4561 train_time:198ms step_avg:98.81ms
+step:3/1000000 train_loss:17.5241 train_time:307ms step_avg:102.41ms
+step:4/1000000 train_loss:9.6989 train_time:410ms step_avg:102.46ms
+step:5/1000000 train_loss:11.5392 train_time:508ms step_avg:101.58ms
+step:6/1000000 train_loss:10.6260 train_time:606ms step_avg:101.03ms
+step:7/1000000 train_loss:10.1205 train_time:703ms step_avg:100.39ms
+step:8/1000000 train_loss:10.4826 train_time:800ms step_avg:100.01ms
+step:9/1000000 train_loss:9.8258 train_time:909ms step_avg:101.00ms
+step:10/1000000 train_loss:9.4918 train_time:1009ms step_avg:100.87ms
+step:100/1000000 train_loss:4.3697 train_time:9172ms step_avg:91.72ms
+step:200/1000000 train_loss:4.2246 train_time:18239ms step_avg:91.19ms
+step:300/1000000 train_loss:4.0006 train_time:27328ms step_avg:91.09ms
+step:400/1000000 train_loss:4.0310 train_time:36437ms step_avg:91.09ms
+step:500/1000000 train_loss:3.8192 train_time:45578ms step_avg:91.16ms
+step:600/1000000 train_loss:3.9074 train_time:54707ms step_avg:91.18ms
+step:700/1000000 train_loss:3.7559 train_time:63849ms step_avg:91.21ms
+step:800/1000000 train_loss:3.6085 train_time:73013ms step_avg:91.27ms
+step:900/1000000 train_loss:3.7343 train_time:82177ms step_avg:91.31ms
+step:1000/1000000 train_loss:3.6257 train_time:91349ms step_avg:91.35ms
+step:1100/1000000 train_loss:3.6831 train_time:100530ms step_avg:91.39ms
+step:1200/1000000 train_loss:3.5264 train_time:109716ms step_avg:91.43ms
+step:1300/1000000 train_loss:3.5266 train_time:118888ms step_avg:91.45ms
+step:1400/1000000 train_loss:3.5908 train_time:128086ms step_avg:91.49ms
+step:1500/1000000 train_loss:3.5566 train_time:137304ms step_avg:91.54ms
+step:1600/1000000 train_loss:3.4209 train_time:146502ms step_avg:91.56ms
+step:1700/1000000 train_loss:3.4254 train_time:155703ms step_avg:91.59ms
+step:1800/1000000 train_loss:3.3853 train_time:164921ms step_avg:91.62ms
+step:1900/1000000 train_loss:3.3968 train_time:174126ms step_avg:91.65ms
+step:2000/1000000 train_loss:3.4947 train_time:183340ms step_avg:91.67ms
+step:2100/1000000 train_loss:3.3980 train_time:192585ms step_avg:91.71ms
+step:2200/1000000 train_loss:3.3792 train_time:201868ms step_avg:91.76ms
+step:2300/1000000 train_loss:3.3515 train_time:211137ms step_avg:91.80ms
+step:2400/1000000 train_loss:3.3495 train_time:220354ms step_avg:91.81ms
+step:2500/1000000 train_loss:3.4342 train_time:229594ms step_avg:91.84ms
+step:2600/1000000 train_loss:3.4032 train_time:238855ms step_avg:91.87ms
+step:2700/1000000 train_loss:3.3018 train_time:248063ms step_avg:91.88ms
+step:2800/1000000 train_loss:3.2840 train_time:257271ms step_avg:91.88ms
+step:2900/1000000 train_loss:3.3544 train_time:266499ms step_avg:91.90ms
+step:3000/1000000 train_loss:3.3503 train_time:275730ms step_avg:91.91ms
+step:3100/1000000 train_loss:3.2720 train_time:285410ms step_avg:92.07ms
+step:3200/1000000 train_loss:3.2934 train_time:294644ms step_avg:92.08ms
+step:3300/1000000 train_loss:3.2003 train_time:303871ms step_avg:92.08ms
+step:3400/1000000 train_loss:3.3905 train_time:313120ms step_avg:92.09ms
+step:3500/1000000 train_loss:3.2591 train_time:322367ms step_avg:92.10ms
+step:3600/1000000 train_loss:3.2058 train_time:331638ms step_avg:92.12ms
+step:3700/1000000 train_loss:3.0653 train_time:340878ms step_avg:92.13ms
+step:3800/1000000 train_loss:3.2686 train_time:350145ms step_avg:92.14ms
+step:3900/1000000 train_loss:3.2344 train_time:359379ms step_avg:92.15ms
+step:4000/1000000 train_loss:3.5245 train_time:368674ms step_avg:92.17ms
+step:4100/1000000 train_loss:3.5087 train_time:377924ms step_avg:92.18ms
+step:4200/1000000 train_loss:3.2787 train_time:387177ms step_avg:92.18ms
+step:4300/1000000 train_loss:3.1433 train_time:396432ms step_avg:92.19ms
+step:4400/1000000 train_loss:3.2388 train_time:405678ms step_avg:92.20ms
+step:4500/1000000 train_loss:3.2325 train_time:414925ms step_avg:92.21ms
+step:4600/1000000 train_loss:3.2321 train_time:424144ms step_avg:92.21ms
+step:4700/1000000 train_loss:3.2659 train_time:433394ms step_avg:92.21ms
+step:4800/1000000 train_loss:3.3483 train_time:442656ms step_avg:92.22ms
+step:4900/1000000 train_loss:3.1901 train_time:451915ms step_avg:92.23ms
+step:5000/1000000 train_loss:3.2326 train_time:461158ms step_avg:92.23ms
+step:5100/1000000 train_loss:3.2004 train_time:470440ms step_avg:92.24ms
+step:5200/1000000 train_loss:3.1320 train_time:479675ms step_avg:92.25ms
+step:5300/1000000 train_loss:3.1172 train_time:488919ms step_avg:92.25ms
+step:5400/1000000 train_loss:3.1798 train_time:498186ms step_avg:92.26ms
+step:5500/1000000 train_loss:3.2807 train_time:507468ms step_avg:92.27ms
+step:5600/1000000 train_loss:3.0176 train_time:516685ms step_avg:92.27ms
+step:5700/1000000 train_loss:3.0906 train_time:525946ms step_avg:92.27ms
+step:5800/1000000 train_loss:3.0532 train_time:535196ms step_avg:92.28ms
+step:5900/1000000 train_loss:3.2491 train_time:544450ms step_avg:92.28ms
+swa:start step:5903 dynamic:True interval:50 weight:1.0000 progress:0.0004
+step:6000/1000000 train_loss:3.0089 train_time:553836ms step_avg:92.31ms
+step:6100/1000000 train_loss:3.1905 train_time:563138ms step_avg:92.32ms
+step:6200/1000000 train_loss:3.1703 train_time:572869ms step_avg:92.40ms
+step:6300/1000000 train_loss:2.9805 train_time:582167ms step_avg:92.41ms
+step:6400/1000000 train_loss:3.0665 train_time:591471ms step_avg:92.42ms
+step:6491/1000000 val_loss:3.0479 val_bpb:1.5505 train_time:600008ms step_avg:92.44ms
+stopping_early: wallclock_cap train_time:600008ms step:6491/1000000
+peak memory allocated: 4928 MiB reserved: 6464 MiB
+swa:applying averaged 22 checkpoints weight_sum:33.6408
+Serialized model int6_rans+zlib: 13966620 bytes (payload:14032233 raw_torch:14068435 payload_ratio:2.84x)
+Total submission size int6_rans+zlib: 14250127 bytes
+final_int6_rans_zlib_roundtrip val_loss:3.0572 val_bpb:1.5552 eval_time:41051ms
+final_int6_rans_zlib_roundtrip_exact val_loss:3.05722506 val_bpb:1.55520458

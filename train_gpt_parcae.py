@@ -84,7 +84,13 @@ def liger_cross_entropy(
 ) -> Tensor:
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_target = target.reshape(-1)
-    if LigerCrossEntropyLoss is None or flat_logits.device.type != "cuda" or not torch.is_floating_point(flat_logits):
+    is_compiling = getattr(torch.compiler, "is_compiling", torch._dynamo.is_compiling)()
+    if (
+        is_compiling
+        or LigerCrossEntropyLoss is None
+        or flat_logits.device.type != "cuda"
+        or not torch.is_floating_point(flat_logits)
+    ):
         logits_f = flat_logits.float()
         if softcap is not None:
             logits_f = softcap * torch.tanh(logits_f / softcap)
