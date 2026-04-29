@@ -271,6 +271,7 @@ class Hyperparameters:
     prelude_norm = bool(int(os.environ.get("PRELUDE_NORM", "0")))
     qk_norm = bool(int(os.environ.get("QK_NORM", "0")))
     qk_bias = bool(int(os.environ.get("QK_BIAS", "0")))
+    frozen_qk = bool(int(os.environ.get("FROZEN_QK", "0")))
     clip_qkv = None if os.environ.get("CLIP_QKV") is None else float(os.environ.get("CLIP_QKV", "0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     attention_window = int(os.environ.get("ATTENTION_WINDOW", os.environ.get("SLIDING_ATTN_WINDOW", "-1")))
@@ -3175,6 +3176,25 @@ def swa_dynamic_modulation(args: Hyperparameters, lr_scale: float) -> tuple[int,
     weight = 1.0 + (float(args.swa_dynamic_weight_max) - 1.0) * shaped
     return interval, weight, progress
 
+
+def install_frozen_qk(module: nn.Module) -> list[tuple[Tensor, Tensor, int]]:
+    frozen_qk: list[tuple[Tensor, Tensor, int]] = []
+    for attn in (m for m in module.modules() if isinstance(m, ParcaeCausalSelfAttention)):
+        qk_rows = attn.q_dim + attn.kv_dim
+        weight = attn.c_qkv.weight
+        frozen_qk.append((weight, weight.detach()[:qk_rows].clone(), qk_rows))
+        weight.register_hook(lambda grad, rows=qk_rows: grad.clone().index_fill_(0, torch.arange(rows, device=grad.device), 0))
+        for bias in (attn.q_bias, attn.k_bias):
+            if bias is not None:
+                bias.requires_grad_(False)
+    return frozen_qk
+
+
+@torch.no_grad()
+def restore_frozen_qk(frozen_qk: list[tuple[Tensor, Tensor, int]]) -> None:
+    for weight, frozen, qk_rows in frozen_qk:
+        weight[:qk_rows].copy_(frozen.to(dtype=weight.dtype))
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -5390,6 +5410,7 @@ def main() -> None:
     base_model = GPT(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
     prepare_torchao_qat(base_model, args)
+    frozen_qk = install_frozen_qk(base_model) if args.frozen_qk else []
     base_model.set_training_step(0)
     if args.compile_model:
         compiled_model = torch.compile(base_model, dynamic=False)
@@ -5478,7 +5499,8 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
-        f"qkv_projection:packed window:{args.attention_window}"
+        f"qkv_projection:packed window:{args.attention_window} "
+        f"frozen_qk:{args.frozen_qk} frozen_qk_layers:{len(frozen_qk)}"
     )
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
@@ -5635,6 +5657,8 @@ def main() -> None:
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
+            if frozen_qk:
+                restore_frozen_qk(frozen_qk)
             zero_grad_all()
             if len(warmup_schedule) <= 20 or (warmup_index + 1) % 10 == 0 or warmup_index + 1 == len(warmup_schedule):
                 log0(f"warmup_step:{warmup_index + 1}/{len(warmup_schedule)} train_step:{warmup_step}")
@@ -5733,6 +5757,8 @@ def main() -> None:
         )
         for opt in optimizers:
             opt.step()
+        if frozen_qk:
+            restore_frozen_qk(frozen_qk)
         zero_grad_all()
 
         if ema_state is not None and next_step % args.ema_update_every == 0:
