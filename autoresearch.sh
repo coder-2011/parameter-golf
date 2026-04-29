@@ -38,9 +38,10 @@ export TOKENIZER_PATH="./data_sp1892/tokenizers/fineweb_1892_bpe.model"
 export VOCAB_SIZE=1892
 export MLP_MULT=3
 export EMBED_LR=0.3
+export ROPE_BASE=10000
+export QK_NORM=1
+export LIGER_ROPE=1
 # ======================================================
-
-# --- external variables with defaults ---
 export RUN_ID
 export DATA_PATH=${DATA_PATH:-"./data/datasets/fineweb10B_sp1024"}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-"./data/tokenizers/fineweb_1024_bpe.model"}
@@ -106,12 +107,12 @@ export LOGIT_SCALE=1.0
 export LOGIT_SOFTCAP=30.0
 export POE_NUM_EXPERTS=${POE_NUM_EXPERTS:-1}
 export POE_HEAD_LR=${POE_HEAD_LR:-0.008}
-export EMBED_LR=0.6
-export HEAD_LR=0.008
-export TIED_EMBED_LR=0.05
-export TIED_EMBED_INIT_STD=0.005
-export MATRIX_LR=0.04
-export SCALAR_LR=0.04
+export EMBED_LR=${EMBED_LR:-0.6}
+export HEAD_LR=${HEAD_LR:-0.008}
+export TIED_EMBED_LR=${TIED_EMBED_LR:-0.05}
+export TIED_EMBED_INIT_STD=${TIED_EMBED_INIT_STD:-0.005}
+export MATRIX_LR=${MATRIX_LR:-0.04}
+export SCALAR_LR=${SCALAR_LR:-0.04}
 export MUON_BACKEND_STEPS=5
 export MUON_MOMENTUM_WARMUP_START=0.85
 export MUON_MOMENTUM_WARMUP_STEPS=500
