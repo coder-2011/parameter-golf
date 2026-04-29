@@ -36,6 +36,7 @@ export SWA_DYNAMIC=1
 export DATA_PATH="./data_sp1892/datasets/fineweb10B_sp1892"
 export TOKENIZER_PATH="./data_sp1892/tokenizers/fineweb_1892_bpe.model"
 export VOCAB_SIZE=1892
+export N_LAYERS_IN_CODA=3
 export MLP_MULT=3
 export EMBED_LR=0.3
 export ROPE_BASE=10000
@@ -44,6 +45,7 @@ export LIGER_ROPE=1
 export CODA_MOE_NUM_EXPERTS=4
 export CODA_MOE_TOP_K=1
 export CODA_MOE_MLP_MULT=3
+export BIGRAM_HASH_HEADS=4
 # ======================================================
 export RUN_ID
 export DATA_PATH=${DATA_PATH:-"./data/datasets/fineweb10B_sp1024"}
