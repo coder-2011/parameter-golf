@@ -49,3 +49,14 @@ python train_gpt_parcae.py
 ```
 
 EMA still takes priority over SWA. If `EMA_ENABLED=1`, SWA is not updated or applied.
+
+References:
+
+- Izmailov et al., "Averaging Weights Leads to Wider Optima and Better Generalization":
+  https://arxiv.org/abs/1803.05407
+- Cha et al., "SWAD: Domain Generalization by Seeking Flat Minima":
+  https://arxiv.org/abs/2102.08604
+- Demir et al., "Adaptive Stochastic Weight Averaging":
+  https://arxiv.org/abs/2406.19092
+- PyTorch `AveragedModel` docs:
+  https://docs.pytorch.org/docs/stable/generated/torch.optim.swa_utils.AveragedModel.html
