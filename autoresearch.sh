@@ -41,6 +41,9 @@ export EMBED_LR=0.3
 export ROPE_BASE=10000
 export QK_NORM=1
 export LIGER_ROPE=1
+export CODA_MOE_NUM_EXPERTS=4
+export CODA_MOE_TOP_K=1
+export CODA_MOE_MLP_MULT=3
 # ======================================================
 export RUN_ID
 export DATA_PATH=${DATA_PATH:-"./data/datasets/fineweb10B_sp1024"}
