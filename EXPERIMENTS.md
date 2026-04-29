@@ -76,6 +76,17 @@ PWA/conv audit after the poor PWA and conv runs:
   final exact int6 RANS+zlib BPB `3.33867651`. This proves the NaN was fixed, but the
   early quality is much worse than the no-conv SOTA trajectory, so a full conv rerun is
   not justified under this exact conv design.
+- Full fixed-conv retry:
+  `runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_preconv3_fixed_int6rans_20260429`.
+  It stayed finite but was still clearly broken relative to the no-conv baseline:
+  at step `1800`, train loss was `6.6073` and `111.16ms/step`, while the no-conv SOTA
+  run was `3.0756` and `93.23ms/step` at the same step. The run was interrupted before
+  final export.
+- Implementation correction after that comparison: pre-attention conv now starts as an
+  exact identity delta. The depthwise kernel is initialized to current-token identity
+  and the forward path is `x + scale * (conv(x) - x)`, instead of adding a random conv
+  branch directly. This should make the conv path match the no-conv baseline at init
+  and only learn local offsets.
 
 ### Quick tokenizer sweep: SP1024 vs SP1892 vs SP4096
 
