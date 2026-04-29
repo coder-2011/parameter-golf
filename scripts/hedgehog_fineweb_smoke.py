@@ -142,8 +142,15 @@ class TinyHedgehogLM(nn.Module):
         return self.head(self.norm(x))
 
 
-def next_batch(tokens: torch.Tensor, batch_size: int, seq_len: int, step: int) -> tuple[torch.Tensor, torch.Tensor]:
+def next_batch(
+    tokens: torch.Tensor,
+    batch_size: int,
+    seq_len: int,
+    step: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     span = batch_size * (seq_len + 1)
+    if tokens.numel() <= span:
+        raise ValueError(f"need more than {span} tokens, found {tokens.numel()}")
     start = (step * span) % (tokens.numel() - span)
     chunk = tokens[start : start + span].view(batch_size, seq_len + 1)
     return chunk[:, :-1], chunk[:, 1:]
@@ -172,6 +179,9 @@ def main() -> None:
     parser.add_argument("--clamp", type=float, default=8.0)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
+
+    if args.steps < 1:
+        raise ValueError(f"--steps must be >= 1, got {args.steps}")
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
