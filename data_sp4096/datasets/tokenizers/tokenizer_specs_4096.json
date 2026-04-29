@@ -1,0 +1,8 @@
+[
+  {
+    "name": "sp_bpe_4096",
+    "kind": "sentencepiece_bpe",
+    "vocab_size": 4096,
+    "tokenizer_train_docs": 5000000
+  }
+]
