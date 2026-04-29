@@ -57,6 +57,12 @@ PWA/conv audit after the poor PWA and conv runs:
   to Q/K rows only and leaves V as an independent dense projection, because the earlier
   PWA path compressed/tied V and likely damaged content flow.
 - Added a fail-fast optimizer duplicate check across all optimizer groups.
+- Follow-up optimizer/init fix: PWA shared bases are now excluded from the ordinary
+  Muon + weight-decay matrix group and routed to a separate Adam group controlled by
+  `PWA_LR` with no weight decay. Their init is scaled by `PWA_INIT_SCALE`, defaulting
+  to `1/sqrt(2)`, to reduce the correlated Q/K dot-product variance from reused bases.
+  A focused name smoke with `ATTN_QKV_MODE=pwa_qk_dense_v` confirmed the optimizer
+  filter catches `*.attn.qkv_proj.qk_proj.bases`.
 - The first pre-attention conv full run
   `runs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_preconv3_int6rans_20260429`
   used `ATTN_PRECONV_KERNEL=3`, `ATTN_PRECONV_SCALE_INIT=0.05`, and let the 3-D conv
