@@ -3819,7 +3819,7 @@ class RRHPWeight(nn.Module):
         self.repeat_factor = cols // reduced_cols
 
     def forward(self) -> Tensor:
-        return self.weight_reduced.repeat_interleave(self.repeat_factor, dim=-1)
+        return self.weight_reduced.repeat(1, self.repeat_factor)
 
 
 class RRHPQKVProjection(nn.Module):
