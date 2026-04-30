@@ -55,13 +55,17 @@ export QK_NORM=1
 export LIGER_ROPE=1
 export LIGER_FUSED_CE=1
 export ROPE_DIMS=32
-export BIGRAM_HASH_HEADS=4
+export BIGRAM_HASH_HEADS=8
 export TIE_EMBEDDINGS=1
 export MLP_CLASS_NAME=FusedLeakyReLUSqMLP
 export RECURRENT_MLP_CLASS_NAME=FusedLeakyReLUSqMLP
-export CODA_MOE_NUM_EXPERTS=4
+export MLP_LEAKY_RELU_SLOPE=0.5
+export POE_NUM_EXPERTS=1
+export CODA_MOE_NUM_EXPERTS=0
 export CODA_MOE_TOP_K=1
-export MUON_WD=0.095
+export DEEPSEEK_MOE_NUM_BASE_EXPERTS=0
+export DEEPSEEK_MOE_ACTIVE_EXPERTS=0
+export MUON_WD=0.105
 export GROUPED_ARTIFACT=1
 export MIXED_QUANT_BITS=0
 export ATTN_PRECONV_KERNEL=0
@@ -72,7 +76,9 @@ export SPARSE_ATTN_GATE=1
 export SPARSE_ATTN_GATE_WINDOW=12
 export SPARSE_ATTN_GATE_INIT_STD=0.0
 export SPARSE_ATTN_GATE_SCALE=1.0
-export TTT_ENABLED=0
+export TTT_ENABLED=1
+export TTT_LR=0.75
+export TTT_MASK=no_qv
 # ======================================================
 
 # --- defaults below pick up EXPT overrides via ${VAR:-default} ---
@@ -262,6 +268,7 @@ export TTT_EPOCHS=${TTT_EPOCHS:-3}
 export TTT_CHUNK_TOKENS=${TTT_CHUNK_TOKENS:-32768}
 export TTT_BATCH_SEQS=${TTT_BATCH_SEQS:-32}
 export TTT_GRAD_CLIP=${TTT_GRAD_CLIP:-1.0}
+export TTT_MASK=${TTT_MASK:-all}
 export SEED=${SEED:-1337}
 
 "${PYTHON_BIN}" train_gpt_parcae.py &

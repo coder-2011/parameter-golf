@@ -513,13 +513,14 @@ linear mode are stale for this branch.
 
 | Variable | Current default | Meaning |
 | --- | --- | --- |
-| `TTT_ENABLED` | `0` | Disabled. |
-| `TTT_LR` | `0.005` | SGD learning rate for test-time training. |
+| `TTT_ENABLED` | `1` | Enabled for current no-Q/V TTT experiment. |
+| `TTT_LR` | `0.75` | SGD learning rate for test-time training. |
 | `TTT_MOMENTUM` | `0.9` | SGD momentum. |
 | `TTT_EPOCHS` | `3` | Per-chunk epochs. |
 | `TTT_CHUNK_TOKENS` | `32768` | Validation chunk size. |
 | `TTT_BATCH_SEQS` | `32` | Batch sequences. |
 | `TTT_GRAD_CLIP` | `1.0` | TTT gradient clipping. |
+| `TTT_MASK` | `no_qv` | Mask Q/V rows in packed QKV during TTT; K rows and other target weights remain trainable. |
 
 TTT scores a validation chunk before training on it, then updates on that chunk
 for future chunks. It can improve eval-only BPB but is too slow unless heavily
