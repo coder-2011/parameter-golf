@@ -19,6 +19,21 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 
+try:
+    from .lossless_caps import (
+        IDENTITY,
+        get_text_transform,
+        get_text_transform_control_symbols,
+        normalize_text_transform_name,
+    )
+except ImportError:
+    from lossless_caps import (
+        IDENTITY,
+        get_text_transform,
+        get_text_transform_control_symbols,
+        normalize_text_transform_name,
+    )
+
 
 DOCS_FILENAME = "docs_selected.jsonl"
 SIDECAR_FILENAME = "docs_selected.source_manifest.json"
@@ -220,21 +235,33 @@ def write_tokenizer_config_export(output_root: Path, selected_specs: list[dict[s
     return path
 
 
-def _iter_sentencepiece_text(docs_jsonl: Path, *, max_docs: int | None = None):
+def _iter_sentencepiece_text(
+    docs_jsonl: Path,
+    *,
+    max_docs: int | None = None,
+    text_transform: str | None = None,
+):
+    transform = get_text_transform(text_transform)
     with docs_jsonl.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f):
             if max_docs is not None and i >= max_docs:
                 break
             text = json.loads(line)["text"].replace("\x00", " ").strip()
             if text:
-                yield text
+                yield transform(text)
 
 
 def build_pure_byte_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokenizers_dir: Path) -> dict[str, Any]:
     del docs_jsonl
     tok = default_pure_byte_tokenizer()
+    text_transform = normalize_text_transform_name(spec.get("text_transform"))
+    transform = get_text_transform(text_transform)
     path = tokenizers_dir / spec.get("filename", "fineweb_pure_byte_260.json")
     tok.save_json(path)
+    manifest = {"path": str(path), "pad_id": tok.pad_id, "unk_id": tok.unk_id}
+    if text_transform != IDENTITY:
+        manifest["text_transform"] = text_transform
+        manifest["text_transform_control_symbols"] = get_text_transform_control_symbols(text_transform)
     return {
         "name": spec.get("name", "pure_byte_260"),
         "kind": "byte",
@@ -242,9 +269,9 @@ def build_pure_byte_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tokeniz
         "vocab_size": tok.vocab_size,
         "bos_id": tok.bos_id,
         "eos_id": tok.eos_id,
-        "encode": tok.encode,
-        "encode_batch": tok.encode_batch,
-        "manifest": {"path": str(path), "pad_id": tok.pad_id, "unk_id": tok.unk_id},
+        "encode": lambda text, tok=tok, transform=transform: tok.encode(transform(text)),
+        "encode_batch": lambda texts, tok=tok, transform=transform: tok.encode_batch([transform(text) for text in texts]),
+        "manifest": manifest,
     }
 
 
@@ -255,6 +282,9 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
         raise RuntimeError("sentencepiece is required for SentencePiece tokenizer exports") from exc
 
     vocab_size = int(spec["vocab_size"])
+    text_transform = normalize_text_transform_name(spec.get("text_transform"))
+    transform = get_text_transform(text_transform)
+    control_symbols = get_text_transform_control_symbols(text_transform)
     prefix = tokenizers_dir / spec.get("model_prefix", f"fineweb_{vocab_size}_bpe")
     model_path = prefix.with_suffix(".model")
     vocab_path = prefix.with_suffix(".vocab")
@@ -277,6 +307,7 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
             "sentence_iterator": _iter_sentencepiece_text(
                 docs_jsonl,
                 max_docs=None if spec.get("tokenizer_train_docs") is None else int(spec["tokenizer_train_docs"]),
+                text_transform=text_transform,
             ),
             "model_prefix": str(prefix),
             "model_type": "bpe",
@@ -293,9 +324,23 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
             "hard_vocab_limit": False,
         }
         kwargs.update(spec.get("trainer_overrides") or {})
+        if control_symbols:
+            existing = kwargs.get("user_defined_symbols")
+            if existing is None:
+                merged_symbols = list(control_symbols)
+            elif isinstance(existing, str):
+                merged_symbols = [part for part in existing.split(",") if part]
+            else:
+                merged_symbols = list(existing)
+            merged_symbols.extend(symbol for symbol in control_symbols if symbol not in merged_symbols)
+            kwargs["user_defined_symbols"] = merged_symbols
         spm.SentencePieceTrainer.train(**kwargs)
 
     tok = spm.SentencePieceProcessor(model_file=str(model_path))
+    manifest = {"model_path": str(model_path), "vocab_path": str(vocab_path)}
+    if text_transform != IDENTITY:
+        manifest["text_transform"] = text_transform
+        manifest["text_transform_control_symbols"] = control_symbols
     return {
         "name": spec.get("name", f"sp_bpe_{vocab_size}"),
         "kind": "sentencepiece_bpe",
@@ -303,9 +348,13 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
         "vocab_size": int(tok.vocab_size()),
         "bos_id": int(tok.bos_id()),
         "eos_id": int(tok.eos_id()),
-        "encode": lambda text, tok=tok: tok.encode(text, out_type=int),
-        "encode_batch": lambda texts, tok=tok: tok.encode(texts, out_type=int, num_threads=TOKENIZER_THREADS),
-        "manifest": {"model_path": str(model_path), "vocab_path": str(vocab_path)},
+        "encode": lambda text, tok=tok, transform=transform: tok.encode(transform(text), out_type=int),
+        "encode_batch": lambda texts, tok=tok, transform=transform: tok.encode(
+            [transform(text) for text in texts],
+            out_type=int,
+            num_threads=TOKENIZER_THREADS,
+        ),
+        "manifest": manifest,
     }
 
 
