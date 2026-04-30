@@ -247,7 +247,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ema_update_every = int(os.environ.get("EMA_UPDATE_EVERY", 1))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.2))
+    swa_start_step = int(os.environ.get("SWA_START_STEP", "1500"))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
     swa_dynamic = bool(int(os.environ.get("SWA_DYNAMIC", "0")))
     swa_dynamic_min_every = int(os.environ.get("SWA_DYNAMIC_MIN_EVERY", 1))
@@ -3831,9 +3831,8 @@ class ParameterAverager:
         module.load_state_dict(load_state, strict=True)
 
 
-def swa_dynamic_modulation(args: Hyperparameters, lr_scale: float) -> tuple[int, float, float]:
-    start_frac = max(float(args.swa_start_frac), 1e-12)
-    progress = max(0.0, min(1.0, (start_frac - float(lr_scale)) / start_frac))
+def swa_dynamic_modulation(args: Hyperparameters, progress: float) -> tuple[int, float, float]:
+    progress = max(0.0, min(1.0, float(progress)))
     shaped = progress ** float(args.swa_dynamic_power)
     interval_float = args.swa_dynamic_min_every + (args.swa_every - args.swa_dynamic_min_every) * (1.0 - shaped)
     interval = max(args.swa_dynamic_min_every, int(round(interval_float)))
@@ -6495,8 +6494,8 @@ def main() -> None:
         raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     if args.ema_update_every <= 0:
         raise ValueError(f"EMA_UPDATE_EVERY must be positive, got {args.ema_update_every}")
-    if not (0.0 <= args.swa_start_frac <= 1.0):
-        raise ValueError(f"SWA_START_FRAC must be in [0, 1], got {args.swa_start_frac}")
+    if args.swa_start_step < 0:
+        raise ValueError(f"SWA_START_STEP must be non-negative, got {args.swa_start_step}")
     if args.swa_every <= 0:
         raise ValueError(f"SWA_EVERY must be positive, got {args.swa_every}")
     if args.swa_dynamic_min_every <= 0:
@@ -6992,7 +6991,7 @@ def main() -> None:
     log0(
         f"weight_average:ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay:g} "
         f"ema_update_every:{args.ema_update_every} "
-        f"swa_enabled:{args.swa_enabled} swa_start_frac:{args.swa_start_frac:g} "
+        f"swa_enabled:{args.swa_enabled} swa_start_step:{args.swa_start_step} "
         f"swa_every:{args.swa_every} swa_dynamic:{args.swa_dynamic} "
         f"swa_dynamic_min_every:{args.swa_dynamic_min_every} "
         f"swa_dynamic_power:{args.swa_dynamic_power:g} "
@@ -7180,16 +7179,21 @@ def main() -> None:
         if ema_state is not None and next_step % args.ema_update_every == 0:
             ema_state.update_ema(args.ema_decay ** (next_step - ema_last_step))
             ema_last_step = next_step
-        elif args.swa_enabled and scale < args.swa_start_frac:
+        elif args.swa_enabled:
+            swa_active = next_step >= args.swa_start_step
+            if max_wallclock_ms is None:
+                progress_denominator = max(args.iterations - args.swa_start_step, 1)
+            else:
+                progress_denominator = max(args.warmdown_iters, 1)
+            swa_progress = (next_step - args.swa_start_step) / progress_denominator if swa_active else 0.0
             swa_interval = args.swa_every
             swa_weight = 1.0
-            swa_progress = 0.0
             if args.swa_dynamic:
-                swa_interval, swa_weight, swa_progress = swa_dynamic_modulation(args, scale)
+                swa_interval, swa_weight, swa_progress = swa_dynamic_modulation(args, swa_progress)
                 swa_due = swa_state is None or next_step - swa_last_step >= swa_interval
             else:
                 swa_due = next_step % args.swa_every == 0
-            if swa_due:
+            if swa_active and swa_due:
                 if swa_state is None:
                     swa_state = ParameterAverager(base_model, cpu=True, initial_weight=swa_weight)
                     log0(
