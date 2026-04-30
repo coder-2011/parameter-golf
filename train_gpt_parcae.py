@@ -368,6 +368,7 @@ class Hyperparameters:
     liger_fused_ce = bool(int(os.environ.get("LIGER_FUSED_CE", "1")))
     liger_rope = bool(int(os.environ.get("LIGER_ROPE", "0")))
     tridao_packed_rope = bool(int(os.environ.get("TRIDAO_PACKED_ROPE", "1" if triton is not None else "0")))
+    fused_qkv_postprocess = bool(int(os.environ.get("FUSED_QKV_POSTPROCESS", "0")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP"))
     mlp_leaky_relu_slope = float(os.environ.get("MLP_LEAKY_RELU_SLOPE", "0.5"))
@@ -4328,6 +4329,258 @@ def apply_tridao_packed_qkv_rotary_emb(qkv: Tensor, freqs_cos: Tensor, freqs_sin
     return _TridaoPackedQKVRoPE.apply(qkv, cos, sin, num_heads_q)
 
 
+if triton is not None:
+    @triton.jit
+    def _fused_qkv_postprocess_fwd_kernel(
+        QKV,
+        Q,
+        K,
+        V,
+        COS,
+        SIN,
+        TOTAL_ROWS: tl.constexpr,
+        SEQLEN: tl.constexpr,
+        H_Q: tl.constexpr,
+        H_KV: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        ROPE_DIMS: tl.constexpr,
+        DO_QK_NORM: tl.constexpr,
+        RMS_EPS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        h_total: tl.constexpr = H_Q + 2 * H_KV
+        row = pid // h_total
+        head = pid - row * h_total
+        offs = tl.arange(0, BLOCK_D)
+        mask = offs < HEAD_DIM
+        qkv_base = (row * h_total + head) * HEAD_DIM
+        x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
+
+        is_q = head < H_Q
+        is_k = (head >= H_Q) & (head < H_Q + H_KV)
+        is_v = head >= H_Q + H_KV
+        y = x
+        rope_mask = offs < ROPE_DIMS
+        pair = offs // 2
+        is_even = (offs & 1) == 0
+        mate_offs = tl.where(is_even, offs + 1, offs - 1)
+        mate = tl.load(QKV + qkv_base + mate_offs, mask=mask & rope_mask, other=0.0).to(tl.float32)
+        token_idx = row - (row // SEQLEN) * SEQLEN
+        cos = tl.load(COS + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=1.0).to(tl.float32)
+        sin = tl.load(SIN + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=0.0).to(tl.float32)
+        rot = tl.where(is_even, x * cos - mate * sin, mate * sin + x * cos)
+        y = tl.where(rope_mask, rot, x)
+        if DO_QK_NORM:
+            ss = tl.sum(tl.where(mask, y * y, 0.0), axis=0)
+            inv_rms = tl.rsqrt(ss / HEAD_DIM + RMS_EPS)
+            y = y * inv_rms
+
+        q_base = (row * H_Q + head) * HEAD_DIM
+        k_head = head - H_Q
+        v_head = head - H_Q - H_KV
+        k_base = (row * H_KV + k_head) * HEAD_DIM
+        v_base = (row * H_KV + v_head) * HEAD_DIM
+        tl.store(Q + q_base + offs, y, mask=mask & is_q)
+        tl.store(K + k_base + offs, y, mask=mask & is_k)
+        tl.store(V + v_base + offs, x, mask=mask & is_v)
+
+
+    @triton.jit
+    def _fused_qkv_postprocess_bwd_kernel(
+        DQ,
+        DK,
+        DV,
+        QKV,
+        DQKV,
+        COS,
+        SIN,
+        TOTAL_ROWS: tl.constexpr,
+        SEQLEN: tl.constexpr,
+        H_Q: tl.constexpr,
+        H_KV: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        ROPE_DIMS: tl.constexpr,
+        DO_QK_NORM: tl.constexpr,
+        RMS_EPS: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        h_total: tl.constexpr = H_Q + 2 * H_KV
+        row = pid // h_total
+        head = pid - row * h_total
+        offs = tl.arange(0, BLOCK_D)
+        mask = offs < HEAD_DIM
+        qkv_base = (row * h_total + head) * HEAD_DIM
+
+        is_q = head < H_Q
+        is_k = (head >= H_Q) & (head < H_Q + H_KV)
+        is_v = head >= H_Q + H_KV
+        q_base = (row * H_Q + head) * HEAD_DIM
+        k_head = head - H_Q
+        v_head = head - H_Q - H_KV
+        k_base = (row * H_KV + k_head) * HEAD_DIM
+        v_base = (row * H_KV + v_head) * HEAD_DIM
+        gq = tl.load(DQ + q_base + offs, mask=mask & is_q, other=0.0).to(tl.float32)
+        gk = tl.load(DK + k_base + offs, mask=mask & is_k, other=0.0).to(tl.float32)
+        gv = tl.load(DV + v_base + offs, mask=mask & is_v, other=0.0)
+        g = gq + gk
+
+        x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
+        rope_mask = offs < ROPE_DIMS
+        pair = offs // 2
+        is_even = (offs & 1) == 0
+        mate_offs = tl.where(is_even, offs + 1, offs - 1)
+        mate = tl.load(QKV + qkv_base + mate_offs, mask=mask & rope_mask, other=0.0).to(tl.float32)
+        token_idx = row - (row // SEQLEN) * SEQLEN
+        cos = tl.load(COS + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=1.0).to(tl.float32)
+        sin = tl.load(SIN + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=0.0).to(tl.float32)
+        z_rot = tl.where(is_even, x * cos - mate * sin, mate * sin + x * cos)
+        z = tl.where(rope_mask, z_rot, x)
+        if DO_QK_NORM:
+            ss = tl.sum(tl.where(mask, z * z, 0.0), axis=0)
+            inv_rms = tl.rsqrt(ss / HEAD_DIM + RMS_EPS)
+            y = z * inv_rms
+            mean_gy = tl.sum(tl.where(mask, g * y, 0.0), axis=0) / HEAD_DIM
+            g = inv_rms * (g - y * mean_gy)
+
+        mate_gq = tl.load(DQ + q_base + mate_offs, mask=mask & rope_mask & is_q, other=0.0).to(tl.float32)
+        mate_gk = tl.load(DK + k_base + mate_offs, mask=mask & rope_mask & is_k, other=0.0).to(tl.float32)
+        mate_g = mate_gq + mate_gk
+        if DO_QK_NORM:
+            mate_x = mate
+            mate_mate = x
+            mate_z_rot = tl.where(is_even, mate_mate * sin + mate_x * cos, mate_x * cos - mate_mate * sin)
+            mate_z = tl.where(rope_mask, mate_z_rot, mate_x)
+            mate_y = mate_z * inv_rms
+            mate_g = inv_rms * (mate_g - mate_y * mean_gy)
+        dx_rot = tl.where(is_even, g * cos + mate_g * sin, -mate_g * sin + g * cos)
+        dx = tl.where(rope_mask, dx_rot, g)
+        out = tl.where(is_v, gv, dx)
+        tl.store(DQKV + qkv_base + offs, out, mask=mask)
+else:
+    _fused_qkv_postprocess_fwd_kernel = None
+    _fused_qkv_postprocess_bwd_kernel = None
+
+
+class _FusedQKVPostprocess(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        qkv: Tensor,
+        freqs_cos: Tensor,
+        freqs_sin: Tensor,
+        num_heads_q: int,
+        num_heads_kv: int,
+        head_dim: int,
+        rope_dims: int,
+        qk_norm: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if _fused_qkv_postprocess_fwd_kernel is None:
+            raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
+        if qkv.dim() != 4:
+            raise ValueError(f"packed QKV must be [B, T, Hq + 2*Hkv, D], got {tuple(qkv.shape)}")
+        if not qkv.is_cuda:
+            raise RuntimeError("fused QKV postprocess requires CUDA tensors")
+        if not qkv.is_contiguous():
+            qkv = qkv.contiguous()
+        batch, seqlen, total_heads, actual_head_dim = qkv.shape
+        expected_heads = num_heads_q + 2 * num_heads_kv
+        if total_heads != expected_heads or actual_head_dim != head_dim:
+            raise ValueError(
+                f"packed QKV shape mismatch: got heads={total_heads}, head_dim={actual_head_dim}; "
+                f"expected heads={expected_heads}, head_dim={head_dim}"
+            )
+        q = torch.empty((batch, seqlen, num_heads_q, head_dim), device=qkv.device, dtype=qkv.dtype)
+        k = torch.empty((batch, seqlen, num_heads_kv, head_dim), device=qkv.device, dtype=qkv.dtype)
+        v = torch.empty((batch, seqlen, num_heads_kv, head_dim), device=qkv.device, dtype=qkv.dtype)
+        cos = freqs_cos[0, :seqlen, 0, : rope_dims // 2].contiguous()
+        sin = freqs_sin[0, :seqlen, 0, : rope_dims // 2].contiguous()
+        block_d = triton.next_power_of_2(head_dim)
+        rms_eps = 1.0e-6
+        grid = (batch * seqlen * total_heads,)
+        with torch.cuda.device(qkv.device.index):
+            torch.library.wrap_triton(_fused_qkv_postprocess_fwd_kernel)[grid](
+                qkv,
+                q,
+                k,
+                v,
+                cos,
+                sin,
+                batch * seqlen,
+                seqlen,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                rope_dims,
+                bool(qk_norm),
+                rms_eps,
+                BLOCK_D=block_d,
+                num_warps=1,
+            )
+        ctx.save_for_backward(qkv, cos, sin)
+        ctx.num_heads_q = num_heads_q
+        ctx.num_heads_kv = num_heads_kv
+        ctx.head_dim = head_dim
+        ctx.rope_dims = rope_dims
+        ctx.qk_norm = bool(qk_norm)
+        return q, k, v
+
+    @staticmethod
+    def backward(ctx, dq: Tensor, dk: Tensor, dv: Tensor):
+        if _fused_qkv_postprocess_bwd_kernel is None:
+            raise RuntimeError("FUSED_QKV_POSTPROCESS backward requires Triton")
+        qkv, cos, sin = ctx.saved_tensors
+        batch, seqlen, total_heads, head_dim = qkv.shape
+        dqkv = torch.empty_like(qkv)
+        block_d = triton.next_power_of_2(head_dim)
+        rms_eps = 1.0e-6
+        grid = (batch * seqlen * total_heads,)
+        with torch.cuda.device(qkv.device.index):
+            torch.library.wrap_triton(_fused_qkv_postprocess_bwd_kernel)[grid](
+                dq.contiguous(),
+                dk.contiguous(),
+                dv.contiguous(),
+                qkv,
+                dqkv,
+                cos,
+                sin,
+                batch * seqlen,
+                seqlen,
+                ctx.num_heads_q,
+                ctx.num_heads_kv,
+                ctx.head_dim,
+                ctx.rope_dims,
+                ctx.qk_norm,
+                rms_eps,
+                BLOCK_D=block_d,
+                num_warps=1,
+            )
+        return dqkv, None, None, None, None, None, None, None
+
+
+def fused_qkv_postprocess(
+    qkv: Tensor,
+    freqs_cos: Tensor,
+    freqs_sin: Tensor,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_dim: int,
+    rope_dims: int,
+    qk_norm: bool,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _FusedQKVPostprocess.apply(
+        qkv,
+        freqs_cos,
+        freqs_sin,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        rope_dims,
+        qk_norm,
+    )
+
+
 def has_ve(layer_idx: int, n_layer: int) -> bool:
     return layer_idx % 2 == (n_layer - 1) % 2
 
@@ -4732,6 +4985,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         rope_dims: int,
         liger_rope: bool = False,
         tridao_packed_rope: bool = False,
+        fused_qkv_postprocess: bool = False,
         attention_window: int = -1,
         qkv_mode: str = "packed",
         rrhp_reduction_factor: int = 4,
@@ -4759,10 +5013,13 @@ class ParcaeCausalSelfAttention(nn.Module):
         self.rope_dims = rope_dims
         self.liger_rope = liger_rope
         self.tridao_packed_rope = tridao_packed_rope
+        self.fused_qkv_postprocess = fused_qkv_postprocess
         self.attention_window = attention_window
         assert not (self.tridao_packed_rope and self.liger_rope)
         if self.tridao_packed_rope and _tridao_rotary_kernel is None:
             raise RuntimeError("TRIDAO_PACKED_ROPE=1 requires Triton")
+        if self.fused_qkv_postprocess and _fused_qkv_postprocess_fwd_kernel is None:
+            raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
         assert not (self.tridao_packed_rope and (qk_bias or clip_qkv is not None))
         assert qkv_mode in {"packed", "rrhp", "pwa", "pwa_qk_dense_v"}
         assert rrhp_reduction_factor > 0
@@ -4822,8 +5079,29 @@ class ParcaeCausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
         qkv = self.qkv_proj(x)
-        use_tridao_packed_rope = self.tridao_packed_rope and qkv.is_cuda
-        if use_tridao_packed_rope:
+        ve = kwargs.get('ve')
+        use_fused_qkv_postprocess = (
+            self.fused_qkv_postprocess
+            and qkv.is_cuda
+            and self.q_bias is None
+            and self.clip_qkv is None
+            and not self.liger_rope
+            and (ve is None or self.ve_gate is None)
+        )
+        use_tridao_packed_rope = self.tridao_packed_rope and qkv.is_cuda and not use_fused_qkv_postprocess
+        if use_fused_qkv_postprocess:
+            qkv = qkv.view(bsz, seqlen, self.n_head + 2 * self.n_kv_head, self.head_dim)
+            q, k, v = fused_qkv_postprocess(
+                qkv,
+                freqs_cos,
+                freqs_sin,
+                self.n_head,
+                self.n_kv_head,
+                self.head_dim,
+                self.rope_dims,
+                self.qk_norm,
+            )
+        elif use_tridao_packed_rope:
             qkv = qkv.view(bsz, seqlen, self.n_head + 2 * self.n_kv_head, self.head_dim)
             qkv = apply_tridao_packed_qkv_rotary_emb(qkv, freqs_cos, freqs_sin, self.rope_dims, self.n_head)
             q = qkv[:, :, : self.n_head]
@@ -4835,7 +5113,6 @@ class ParcaeCausalSelfAttention(nn.Module):
             k = k.view(bsz, seqlen, self.n_kv_head, self.head_dim)
             v = v.view(bsz, seqlen, self.n_kv_head, self.head_dim)
 
-        ve = kwargs.get('ve')
         if ve is not None and self.ve_gate is not None:
             ve = ve.view(bsz, seqlen, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels]))
@@ -4850,12 +5127,12 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = (q + self.q_bias).to(q.dtype)
             k = (k + self.k_bias).to(k.dtype)
 
-        if not use_tridao_packed_rope:
+        if not use_tridao_packed_rope and not use_fused_qkv_postprocess:
             if self.liger_rope:
                 q, k = apply_liger_rotary_emb(q, k, freqs_cos, freqs_sin, self.rope_dims)
             else:
                 q, k = apply_rotary_emb_complex_like(q, k, freqs_cos, freqs_sin, self.rope_dims)
-        if self.qk_norm:
+        if self.qk_norm and not use_fused_qkv_postprocess:
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
 
@@ -4914,6 +5191,7 @@ class TransformerPreNormBlock(nn.Module):
         attn_res_enabled: bool = False,
         liger_rope: bool = False,
         tridao_packed_rope: bool = False,
+        fused_qkv_postprocess: bool = False,
         attention_window: int = -1,
         qkv_mode: str = "packed",
         rrhp_reduction_factor: int = 4,
@@ -4950,6 +5228,7 @@ class TransformerPreNormBlock(nn.Module):
             rope_dims=rope_dims,
             liger_rope=liger_rope,
             tridao_packed_rope=tridao_packed_rope,
+            fused_qkv_postprocess=fused_qkv_postprocess,
             attention_window=attention_window,
             qkv_mode=qkv_mode,
             rrhp_reduction_factor=rrhp_reduction_factor,
@@ -5290,6 +5569,7 @@ class GPT(nn.Module):
                 attn_res_enabled=self._attn_res_enabled_for("prelude"),
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
+                fused_qkv_postprocess=h.fused_qkv_postprocess,
                 attention_window=h.attention_window,
                 qkv_mode=h.attn_qkv_mode,
                 rrhp_reduction_factor=h.rrhp_reduction_factor,
@@ -5339,6 +5619,7 @@ class GPT(nn.Module):
                 attn_res_enabled=self._attn_res_enabled_for("core"),
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
+                fused_qkv_postprocess=h.fused_qkv_postprocess,
                 attention_window=h.attention_window,
                 qkv_mode=h.attn_qkv_mode,
                 rrhp_reduction_factor=h.rrhp_reduction_factor,
@@ -5388,6 +5669,7 @@ class GPT(nn.Module):
                 attn_res_enabled=self._attn_res_enabled_for("coda"),
                 liger_rope=h.liger_rope,
                 tridao_packed_rope=h.tridao_packed_rope,
+                fused_qkv_postprocess=h.fused_qkv_postprocess,
                 attention_window=h.attention_window,
                 qkv_mode=h.attn_qkv_mode,
                 rrhp_reduction_factor=h.rrhp_reduction_factor,
@@ -6195,6 +6477,11 @@ def main() -> None:
             raise ValueError("TRIDAO_PACKED_ROPE and LIGER_ROPE are mutually exclusive")
         if args.qk_bias or args.clip_qkv is not None:
             raise ValueError("TRIDAO_PACKED_ROPE=1 currently requires QK_BIAS=0 and CLIP_QKV unset")
+    if args.fused_qkv_postprocess:
+        if _fused_qkv_postprocess_fwd_kernel is None:
+            raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
+        if args.liger_rope:
+            raise ValueError("FUSED_QKV_POSTPROCESS and LIGER_ROPE are mutually exclusive")
     if "NUM_LAYERS" in os.environ:
         raise ValueError("NUM_LAYERS is ignored by train_gpt_parcae.py; use N_LAYERS_IN_PRELUDE, N_LAYERS_IN_RECURRENT_BLOCK, and N_LAYERS_IN_CODA")
     if "QK_GAIN_INIT" in os.environ:
@@ -6656,6 +6943,11 @@ def main() -> None:
     log0(
         f"tridao_packed_rope:enabled:{args.tridao_packed_rope} triton_available:{_tridao_rotary_kernel is not None} "
         "convention:adjacent_pair_interleaved layout:packed_qkv_inplace"
+    )
+    log0(
+        f"fused_qkv_postprocess:enabled:{args.fused_qkv_postprocess} "
+        f"triton_available:{_fused_qkv_postprocess_fwd_kernel is not None} "
+        "supports:no_qkv_bias,no_clip,no_value_gate fuses:rope,qk_rmsnorm,contiguous_qkv"
     )
     attn_res_params = sum(
         p.numel()

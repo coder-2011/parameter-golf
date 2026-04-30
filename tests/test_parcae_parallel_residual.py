@@ -449,6 +449,61 @@ def test_xsa_zero_values_are_finite_and_leave_attention_output_unchanged():
     assert torch.allclose(actual, y, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or pg.triton is None, reason="requires CUDA and Triton")
+@pytest.mark.parametrize("qk_norm", [False, True])
+def test_fused_qkv_postprocess_matches_reference_forward_backward(qk_norm: bool):
+    torch.manual_seed(123)
+    batch, seq_len, n_head, n_kv_head, head_dim = 2, 7, 4, 2, 8
+    rope_dims = 6
+    qkv = torch.randn(
+        batch,
+        seq_len,
+        n_head + 2 * n_kv_head,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    qkv_ref = qkv.detach().clone().requires_grad_(True)
+    freqs_cos, freqs_sin = [
+        t.to(device="cuda") for t in pg.precompute_freqs_cos_sin(rope_dims, seq_len, 10000.0)
+    ]
+
+    q, k, v = pg.fused_qkv_postprocess(
+        qkv,
+        freqs_cos,
+        freqs_sin,
+        n_head,
+        n_kv_head,
+        head_dim,
+        rope_dims,
+        qk_norm,
+    )
+    q_ref = qkv_ref[:, :, :n_head]
+    k_ref = qkv_ref[:, :, n_head : n_head + n_kv_head]
+    v_ref = qkv_ref[:, :, n_head + n_kv_head :]
+    q_ref, k_ref = pg.apply_rotary_emb_complex_like(q_ref, k_ref, freqs_cos, freqs_sin, rope_dims)
+    if qk_norm:
+        q_ref = F.rms_norm(q_ref, (q_ref.size(-1),))
+        k_ref = F.rms_norm(k_ref, (k_ref.size(-1),))
+
+    qk_atol = 2e-2 if qk_norm else 0.0
+    qk_rtol = 2e-2 if qk_norm else 0.0
+    assert torch.allclose(q, q_ref, atol=qk_atol, rtol=qk_rtol)
+    assert torch.allclose(k, k_ref, atol=qk_atol, rtol=qk_rtol)
+    assert torch.allclose(v, v_ref, atol=0.0, rtol=0.0)
+
+    dq = torch.randn_like(q)
+    dk = torch.randn_like(k)
+    dv = torch.randn_like(v)
+    (q.float() * dq.float()).sum().add_((k.float() * dk.float()).sum()).add_((v.float() * dv.float()).sum()).backward()
+    (q_ref.float() * dq.float()).sum().add_((k_ref.float() * dk.float()).sum()).add_((v_ref.float() * dv.float()).sum()).backward()
+
+    assert qkv.grad is not None
+    assert qkv_ref.grad is not None
+    assert torch.allclose(qkv.grad, qkv_ref.grad, atol=2e-2, rtol=2e-2)
+
+
 def test_sparse_attn_gate_zero_init_halves_attention_output_and_gets_gradient():
     torch.manual_seed(123)
     base = pg.ParcaeCausalSelfAttention(
