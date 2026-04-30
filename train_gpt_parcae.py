@@ -2298,8 +2298,30 @@ def eval_val_ttt(
     stride = args.eval_stride
     total_tokens = val_tokens.numel() - 1
     context_size, chunk_windows = _ttt_chunk_windows(total_tokens, seq_len, stride, args.ttt_chunk_tokens)
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    original_requires_grad = {id(p): p.requires_grad for p in model.parameters()}
+    use_lora = args.ttt_lora_rank > 0
+    if use_lora:
+        for p in model.parameters():
+            p.requires_grad_(False)
+        params = install_ttt_lora_adapters(
+            model,
+            rank=args.ttt_lora_rank,
+            alpha=args.ttt_lora_alpha,
+            min_params=args.ttt_lora_min_params,
+            device=device,
+        )
+        if not params:
+            raise RuntimeError("TTT_LORA_RANK > 0 but no LoRA target parameters were installed")
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.ttt_lora_lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=args.ttt_lora_wd,
+        )
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.SGD(params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     logits_fn = model.forward_logits
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -2307,7 +2329,9 @@ def eval_val_ttt(
     if log_fn is not None:
         log_fn(
             f"ttt:start chunks:{len(chunk_windows)} chunk_tokens:{args.ttt_chunk_tokens} epochs:{args.ttt_epochs} "
-            f"lr:{args.ttt_lr:g} stride:{stride} batch_seqs:{args.ttt_batch_seqs}"
+            f"mode:{'lora' if use_lora else 'full_sgd'} lr:{(args.ttt_lora_lr if use_lora else args.ttt_lr):g} "
+            f"stride:{stride} batch_seqs:{args.ttt_batch_seqs} "
+            f"lora_rank:{args.ttt_lora_rank} lora_params:{sum(p.numel() for p in params) if use_lora else 0}"
         )
 
     def sync_grads(local_tokens: float) -> None:
@@ -2352,7 +2376,8 @@ def eval_val_ttt(
         chunk_seqs = (chunk_end - chunk_start) // seq_len
         if args.ttt_epochs <= 0 or ci == len(chunk_windows) - 1 or chunk_seqs <= 0:
             continue
-        lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(len(chunk_windows) - 1, 1)))
+        base_lr = args.ttt_lora_lr if use_lora else args.ttt_lr
+        lr = base_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(len(chunk_windows) - 1, 1)))
         for group in optimizer.param_groups:
             group["lr"] = lr
         seq_start, seq_end = _rank_bounds(chunk_seqs, rank, world_size)
@@ -2381,6 +2406,10 @@ def eval_val_ttt(
         if log_fn is not None and (ci == 0 or (ci + 1) % 100 == 0 or ci == len(chunk_windows) - 2):
             log_fn(f"ttt:chunk:{ci + 1}/{len(chunk_windows)} lr:{lr:.6g} scored_windows:{len(windows)}")
 
+    if use_lora:
+        remove_ttt_lora_adapters(model)
+        for p in model.parameters():
+            p.requires_grad_(original_requires_grad.get(id(p), p.requires_grad))
     model.eval()
     return _validation_result(args, loss_sum, token_count, byte_count)
 
@@ -3561,6 +3590,57 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+def _is_ttt_lora_target(name: str, module: nn.Module, min_params: int) -> bool:
+    return (
+        isinstance(module, CastedLinear)
+        and module.weight.numel() >= min_params
+        and (".attn." in name or ".mlp." in name)
+    )
+
+
+def install_ttt_lora_adapters(model: nn.Module, rank: int, alpha: float, min_params: int, device: torch.device) -> list[Tensor]:
+    if rank <= 0:
+        return []
+    adapter_params: list[Tensor] = []
+    scale = alpha / rank
+    for name, module in model.named_modules():
+        if not _is_ttt_lora_target(name, module, min_params):
+            continue
+        if not isinstance(module, CastedLinear):
+            continue
+        if hasattr(module, "_ttt_lora_orig_forward"):
+            raise RuntimeError(f"TTT LoRA adapter already installed on {name}")
+        a = torch.empty(rank, module.in_features, device=device, dtype=torch.float32)
+        b = torch.zeros(module.out_features, rank, device=device, dtype=torch.float32)
+        nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+        module.ttt_lora_A = nn.Parameter(a)
+        module.ttt_lora_B = nn.Parameter(b)
+        module.ttt_lora_scale = scale
+        module._ttt_lora_orig_forward = module.forward
+        adapter_params.extend((module.ttt_lora_A, module.ttt_lora_B))
+
+        def make_forward(orig_forward, a_param, b_param, lora_scale):
+            def forward_with_lora(x: Tensor) -> Tensor:
+                base = orig_forward(x)
+                lora = F.linear(F.linear(x, a_param.to(dtype=x.dtype)), b_param.to(dtype=x.dtype))
+                return base + lora_scale * lora
+
+            return forward_with_lora
+
+        module.forward = make_forward(module._ttt_lora_orig_forward, module.ttt_lora_A, module.ttt_lora_B, scale)
+    return adapter_params
+
+
+def remove_ttt_lora_adapters(model: nn.Module) -> None:
+    for module in model.modules():
+        if hasattr(module, "_ttt_lora_orig_forward"):
+            module.forward = module._ttt_lora_orig_forward
+            delattr(module, "_ttt_lora_orig_forward")
+        for attr in ("ttt_lora_A", "ttt_lora_B", "ttt_lora_scale"):
+            if hasattr(module, attr):
+                delattr(module, attr)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -6107,6 +6187,12 @@ def main() -> None:
         raise ValueError(f"TTT_BATCH_SEQS must be positive, got {args.ttt_batch_seqs}")
     if args.ttt_lr < 0 or args.ttt_momentum < 0 or args.ttt_grad_clip < 0:
         raise ValueError("TTT_LR, TTT_MOMENTUM, and TTT_GRAD_CLIP must be non-negative")
+    if args.ttt_lora_rank < 0:
+        raise ValueError(f"TTT_LORA_RANK must be non-negative, got {args.ttt_lora_rank}")
+    if args.ttt_lora_alpha < 0 or args.ttt_lora_lr < 0 or args.ttt_lora_wd < 0:
+        raise ValueError("TTT_LORA_ALPHA, TTT_LORA_LR, and TTT_LORA_WD must be non-negative")
+    if args.ttt_lora_min_params < 0:
+        raise ValueError(f"TTT_LORA_MIN_PARAMS must be non-negative, got {args.ttt_lora_min_params}")
     if args.gptq_enabled:
         if args.gptq_calibration_batches <= 0:
             raise ValueError("GPTQ_CALIBRATION_BATCHES must be positive when GPTQ_ENABLED=1")
