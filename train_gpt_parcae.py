@@ -163,7 +163,8 @@ class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
-    val_files = os.path.join(data_path, "fineweb_val_*.bin")
+    val_files = os.path.join(data_path, "fineweb_val_[0-9]*.bin")
+    val_byte_files = os.path.join(data_path, "fineweb_val_bytes_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     tokenizer_meta_path = os.environ.get("TOKENIZER_META_PATH", "")
     tokenizer_meta_validate = bool(int(os.environ.get("TOKENIZER_META_VALIDATE", "0")))
@@ -722,6 +723,19 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+def load_validation_byte_counts(pattern: str, target_tokens: int) -> Tensor | None:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        return None
+    byte_counts = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if byte_counts.numel() < target_tokens:
+        raise ValueError(
+            f"Validation byte sidecar is shorter than validation tokens: "
+            f"{byte_counts.numel()} < {target_tokens}"
+        )
+    return byte_counts[:target_tokens]
+
+
 def _validation_result(
     args: Hyperparameters,
     loss_sum: Tensor,
@@ -754,6 +768,54 @@ def _token_byte_sum(
     token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
     token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
     return token_bytes.to(torch.float64).sum()
+
+
+def _validation_target_byte_sum(
+    val_byte_counts: Tensor | None,
+    target_start: int,
+    target_end: int,
+    device: torch.device,
+    prev_ids: Tensor,
+    tgt_ids: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> Tensor:
+    if val_byte_counts is not None:
+        return val_byte_counts[target_start:target_end].to(device=device, dtype=torch.float64, non_blocking=True).sum()
+    return _token_byte_sum(
+        prev_ids,
+        tgt_ids,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+
+
+def _validation_target_byte_sum_float(
+    val_byte_counts: Tensor | None,
+    target_start: int,
+    target_end: int,
+    device: torch.device,
+    prev_ids: Tensor,
+    tgt_ids: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> float:
+    return float(
+        _validation_target_byte_sum(
+            val_byte_counts,
+            target_start,
+            target_end,
+            device,
+            prev_ids,
+            tgt_ids,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        ).item()
+    )
 
 
 def _ttt_chunk_windows(total_tokens: int, seq_len: int, stride: int, chunk_tokens: int) -> tuple[int, list[list[int]]]:
@@ -1578,6 +1640,7 @@ def eval_val_sliding_hashed_ngram(
     world_size: int,
     device: torch.device,
     val_tokens: Tensor,
+    val_byte_counts: Tensor | None,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
@@ -1777,14 +1840,16 @@ def eval_val_sliding_hashed_ngram(
                     seg_nll = -np.log(np.clip(seg_model_p, 1e-12, 1.0))
                     loss_sum += float(seg_nll.sum())
                     token_count += float(seg_len)
-                    byte_count += float(
-                        _token_byte_sum(
-                            x[i, s:wlen],
-                            y[i, s:wlen],
-                            base_bytes_lut,
-                            has_leading_space_lut,
-                            is_boundary_token_lut,
-                        ).item()
+                    byte_count += _validation_target_byte_sum_float(
+                        val_byte_counts,
+                        ws + s + 1,
+                        ws + wlen + 1,
+                        device,
+                        x[i, s:wlen],
+                        y[i, s:wlen],
+                        base_bytes_lut,
+                        has_leading_space_lut,
+                        is_boundary_token_lut,
                     )
 
             chunk_start = chunk_idx * chunk_tokens
@@ -1856,6 +1921,7 @@ def eval_val(
     device: torch.device,
     grad_accum_steps: int,
     val_tokens: Tensor,
+    val_byte_counts: Tensor | None,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
@@ -1895,9 +1961,17 @@ def eval_val(
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+            val_byte_count += _validation_target_byte_sum(
+                val_byte_counts,
+                raw_start + 1,
+                raw_end,
+                device,
+                prev_ids,
+                tgt_ids,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1920,6 +1994,7 @@ def eval_val_sliding(
     world_size: int,
     device: torch.device,
     val_tokens: Tensor,
+    val_byte_counts: Tensor | None,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
@@ -2055,7 +2130,11 @@ def eval_val_sliding(
                     scored_nll = nll[i, s:wlen].to(torch.float64)
                     loss_sum += scored_nll.sum()
                     token_count += float(seg_len)
-                    seg_byte_count = _token_byte_sum(
+                    seg_byte_count = _validation_target_byte_sum(
+                        val_byte_counts,
+                        ws + s + 1,
+                        ws + wlen + 1,
+                        device,
                         x[i, s:wlen],
                         y[i, s:wlen],
                         base_bytes_lut,
@@ -2292,6 +2371,7 @@ def eval_val_ttt(
     world_size: int,
     device: torch.device,
     val_tokens: Tensor,
+    val_byte_counts: Tensor | None,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
@@ -2365,13 +2445,17 @@ def eval_val_ttt(
                 x, y, wlens = _window_batch(val_tokens, batch_ws, seq_len, total_tokens, device)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = logits_fn(x)
-                nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
+                    nll = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
                 for i, ws in enumerate(batch_ws):
                     s = 0 if ws == 0 else context_size
                     wlen = wlens[i]
                     loss_sum += nll[i, s:wlen].to(torch.float64).sum()
                     token_count += float(wlen - s)
-                    byte_count += _token_byte_sum(
+                    byte_count += _validation_target_byte_sum(
+                        val_byte_counts,
+                        ws + s + 1,
+                        ws + wlen + 1,
+                        device,
                         x[i, s:wlen],
                         y[i, s:wlen],
                         base_bytes_lut,
@@ -4343,6 +4427,7 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         ROPE_DIMS: tl.constexpr,
         DO_QK_NORM: tl.constexpr,
+        ROPE_INTERLEAVED: tl.constexpr,
         RMS_EPS: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -4364,14 +4449,20 @@ if triton is not None:
 
         y = x
         rope_mask = offs < ROPE_DIMS
-        pair = offs // 2
-        is_even = (offs & 1) == 0
-        mate_offs = tl.where(is_even, offs + 1, offs - 1)
+        rope_half: tl.constexpr = ROPE_DIMS // 2
+        if ROPE_INTERLEAVED:
+            pair = offs // 2
+            is_first = (offs & 1) == 0
+            mate_offs = tl.where(is_first, offs + 1, offs - 1)
+        else:
+            is_first = offs < rope_half
+            pair = tl.where(is_first, offs, offs - rope_half)
+            mate_offs = tl.where(is_first, offs + rope_half, offs - rope_half)
         mate = tl.load(QKV + qkv_base + mate_offs, mask=mask & rope_mask, other=0.0).to(tl.float32)
         token_idx = row - (row // SEQLEN) * SEQLEN
         cos = tl.load(COS + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=1.0).to(tl.float32)
         sin = tl.load(SIN + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=0.0).to(tl.float32)
-        rot = tl.where(is_even, x * cos - mate * sin, mate * sin + x * cos)
+        rot = tl.where(is_first, x * cos - mate * sin, mate * sin + x * cos)
         y = tl.where(rope_mask, rot, x)
         if DO_QK_NORM:
             ss = tl.sum(tl.where(mask, y * y, 0.0), axis=0)
@@ -4399,6 +4490,7 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         ROPE_DIMS: tl.constexpr,
         DO_QK_NORM: tl.constexpr,
+        ROPE_INTERLEAVED: tl.constexpr,
         RMS_EPS: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
@@ -4424,14 +4516,20 @@ if triton is not None:
 
         x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
         rope_mask = offs < ROPE_DIMS
-        pair = offs // 2
-        is_even = (offs & 1) == 0
-        mate_offs = tl.where(is_even, offs + 1, offs - 1)
+        rope_half: tl.constexpr = ROPE_DIMS // 2
+        if ROPE_INTERLEAVED:
+            pair = offs // 2
+            is_first = (offs & 1) == 0
+            mate_offs = tl.where(is_first, offs + 1, offs - 1)
+        else:
+            is_first = offs < rope_half
+            pair = tl.where(is_first, offs, offs - rope_half)
+            mate_offs = tl.where(is_first, offs + rope_half, offs - rope_half)
         mate = tl.load(QKV + qkv_base + mate_offs, mask=mask & rope_mask, other=0.0).to(tl.float32)
         token_idx = row - (row // SEQLEN) * SEQLEN
         cos = tl.load(COS + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=1.0).to(tl.float32)
         sin = tl.load(SIN + token_idx * (ROPE_DIMS // 2) + pair, mask=rope_mask, other=0.0).to(tl.float32)
-        z_rot = tl.where(is_even, x * cos - mate * sin, mate * sin + x * cos)
+        z_rot = tl.where(is_first, x * cos - mate * sin, mate * sin + x * cos)
         z = tl.where(rope_mask, z_rot, x)
         if DO_QK_NORM:
             ss = tl.sum(tl.where(mask, z * z, 0.0), axis=0)
@@ -4446,11 +4544,11 @@ if triton is not None:
         if DO_QK_NORM:
             mate_x = mate
             mate_mate = x
-            mate_z_rot = tl.where(is_even, mate_mate * sin + mate_x * cos, mate_x * cos - mate_mate * sin)
+            mate_z_rot = tl.where(is_first, mate_mate * sin + mate_x * cos, mate_x * cos - mate_mate * sin)
             mate_z = tl.where(rope_mask, mate_z_rot, mate_x)
             mate_y = mate_z * inv_rms
             mate_g = inv_rms * (mate_g - mate_y * mean_gy)
-        dx_rot = tl.where(is_even, g * cos + mate_g * sin, -mate_g * sin + g * cos)
+        dx_rot = tl.where(is_first, g * cos + mate_g * sin, -mate_g * sin + g * cos)
         dx = tl.where(rope_mask, dx_rot, g)
         tl.store(DQKV + qkv_base + offs, dx, mask=mask)
 else:
@@ -4470,6 +4568,7 @@ class _FusedQKVPostprocess(torch.autograd.Function):
         head_dim: int,
         rope_dims: int,
         qk_norm: bool,
+        rope_interleaved: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if _fused_qkv_postprocess_fwd_kernel is None:
             raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
@@ -4508,6 +4607,7 @@ class _FusedQKVPostprocess(torch.autograd.Function):
                 head_dim,
                 rope_dims,
                 bool(qk_norm),
+                bool(rope_interleaved),
                 rms_eps,
                 BLOCK_D=block_d,
                 num_warps=2,
@@ -4518,6 +4618,7 @@ class _FusedQKVPostprocess(torch.autograd.Function):
         ctx.head_dim = head_dim
         ctx.rope_dims = rope_dims
         ctx.qk_norm = bool(qk_norm)
+        ctx.rope_interleaved = bool(rope_interleaved)
         return q, k, v
 
     @staticmethod
@@ -4546,11 +4647,12 @@ class _FusedQKVPostprocess(torch.autograd.Function):
                 ctx.head_dim,
                 ctx.rope_dims,
                 ctx.qk_norm,
+                ctx.rope_interleaved,
                 rms_eps,
                 BLOCK_D=block_d,
                 num_warps=2,
             )
-        return dqkv, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None
 
 
 def fused_qkv_postprocess(
@@ -4562,6 +4664,7 @@ def fused_qkv_postprocess(
     head_dim: int,
     rope_dims: int,
     qk_norm: bool,
+    rope_interleaved: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor]:
     return _FusedQKVPostprocess.apply(
         qkv,
@@ -4572,6 +4675,7 @@ def fused_qkv_postprocess(
         head_dim,
         rope_dims,
         qk_norm,
+        rope_interleaved,
     )
 
 
@@ -5079,7 +5183,6 @@ class ParcaeCausalSelfAttention(nn.Module):
             and qkv.is_cuda
             and self.q_bias is None
             and self.clip_qkv is None
-            and not self.liger_rope
             and (ve is None or self.ve_gate is None)
         )
         use_tridao_packed_rope = self.tridao_packed_rope and qkv.is_cuda and not use_fused_qkv_postprocess
@@ -5094,6 +5197,7 @@ class ParcaeCausalSelfAttention(nn.Module):
                 self.head_dim,
                 self.rope_dims,
                 self.qk_norm,
+                not self.liger_rope,
             )
         elif use_tridao_packed_rope:
             qkv = qkv.view(bsz, seqlen, self.n_head + 2 * self.n_kv_head, self.head_dim)
@@ -6474,8 +6578,6 @@ def main() -> None:
     if args.fused_qkv_postprocess:
         if _fused_qkv_postprocess_fwd_kernel is None:
             raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
-        if args.liger_rope:
-            raise ValueError("FUSED_QKV_POSTPROCESS and LIGER_ROPE are mutually exclusive")
     if "NUM_LAYERS" in os.environ:
         raise ValueError("NUM_LAYERS is ignored by train_gpt_parcae.py; use N_LAYERS_IN_PRELUDE, N_LAYERS_IN_RECURRENT_BLOCK, and N_LAYERS_IN_CODA")
     if "QK_GAIN_INIT" in os.environ:
@@ -6736,11 +6838,13 @@ def main() -> None:
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
+    val_byte_counts = load_validation_byte_counts(args.val_byte_files, val_tokens.numel())
     log0(
         f"val_bpb:enabled tokenizer_kind={tokenizer_metadata.get('tokenizer_kind', 'unknown')} "
         f"tokenizer_path={args.tokenizer_path} meta_path={tokenizer_metadata.get('meta_path')} "
         f"source_model_name={tokenizer_metadata.get('source_model_name')} vocab_size={tokenizer_metadata['vocab_size']} "
-        f"byte_count_override:{args.val_byte_count_override:g}"
+        f"byte_count_override:{args.val_byte_count_override:g} "
+        f"byte_sidecar:{'enabled' if val_byte_counts is not None else 'disabled'}"
     )
     if tokenizer_metadata.get("tokenizer_kind") == "tokenmonster" and args.val_byte_count_override <= 0:
         log0("warning:tokenmonster_byte_count_override_missing bpb_uses_metadata_bytes")
@@ -7129,6 +7233,7 @@ def main() -> None:
                 device,
                 grad_accum_steps,
                 val_tokens,
+                val_byte_counts,
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
@@ -7357,6 +7462,7 @@ def main() -> None:
         device,
         grad_accum_steps,
         val_tokens,
+        val_byte_counts,
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
@@ -7378,6 +7484,7 @@ def main() -> None:
             world_size,
             device,
             val_tokens,
+            val_byte_counts,
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
@@ -7456,6 +7563,7 @@ def main() -> None:
             world_size,
             device,
             val_tokens,
+            val_byte_counts,
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
@@ -7494,6 +7602,7 @@ def main() -> None:
             world_size,
             device,
             val_tokens,
+            val_byte_counts,
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
