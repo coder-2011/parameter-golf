@@ -19,6 +19,19 @@ def _args(**overrides):
         quant_low_bit_patterns=("project_out",),
         quant_keep_float_patterns=(),
         rans_int6=False,
+        gptq_min_numel=0,
+        gptq_quantize_embeddings=True,
+        gptq_matrix_clip_sigmas=12.85,
+        gptq_embed_clip_sigmas=20.0,
+        gptq_blocksize=128,
+        gptq_dampening=0.01,
+        gptq_act_order=True,
+        lqer_enabled=False,
+        lqer_rank=4,
+        lqer_top_k=3,
+        lqer_factor_bits=4,
+        lqer_asym_enabled=True,
+        lqer_asym_group=64,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -116,6 +129,37 @@ def test_gptq_export_uses_dedicated_sparse_gate_method_before_control_passthroug
     assert obj["methods"]["prelude.0.attn.q_gain"] == "passthrough_control_fp16"
     assert stats["num_float_tensors"] == 1
     _assert_sparse_gate_int8_quantized(obj, gate_name, state[gate_name])
+
+
+def test_gptq_lqer_correction_roundtrips_without_extra_state_keys():
+    torch.manual_seed(123)
+    name = "prelude.0.mlp.fc.weight"
+    state = {name: torch.randn(300, 300, dtype=torch.float32)}
+    H = torch.eye(300, dtype=torch.float32)
+
+    obj, stats = pg.quantize_state_dict_gptq_int(
+        state,
+        hessians={name: H},
+        args=_args(
+            quant_bits=6,
+            mixed_quant_bits=False,
+            lqer_enabled=True,
+            lqer_rank=2,
+            lqer_top_k=1,
+            lqer_asym_enabled=False,
+        ),
+    )
+    restored = pg.dequantize_state_dict_int(obj)
+    grouped_blob, _ = pg.serialize_quant_artifact_grouped(obj)
+    grouped_restored = pg.dequantize_state_dict_int(pg.load_quant_artifact(grouped_blob))
+
+    assert set(restored) == {name}
+    assert set(grouped_restored) == {name}
+    assert name in obj["lqer_meta"]
+    assert obj["methods"][name].endswith("+lqer_int4")
+    assert stats["quant_payload_bytes"] > 0
+    assert restored[name].shape == state[name].shape
+    assert torch.equal(grouped_restored[name], restored[name])
 
 
 def test_mixed_quant_rejects_rans_int6():

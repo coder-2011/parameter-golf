@@ -69,6 +69,22 @@ def test_liger_fused_linear_ce_cpu_fallback_matches_scaled_linear_softcap_ce():
     assert torch.allclose(weight.grad, ref_weight.grad)
 
 
+def test_softcapped_cross_entropy_cpu_fallback_matches_torch_cross_entropy():
+    torch.manual_seed(123)
+    logits = (torch.randn(11, 23) * 2.0).requires_grad_(True)
+    target = torch.randint(0, 23, (11,))
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    softcap = 7.0
+
+    loss = pg.softcapped_cross_entropy(logits, target, softcap)
+    ref = F.cross_entropy(softcap * torch.tanh(ref_logits / softcap), target)
+    loss.backward()
+    ref.backward()
+
+    assert torch.allclose(loss, ref)
+    assert torch.allclose(logits.grad, ref_logits.grad)
+
+
 def test_liger_ce_compile_path_uses_torch_cross_entropy(monkeypatch):
     torch.manual_seed(123)
     logits = (torch.randn(11, 23) * 2.0).requires_grad_(True)
@@ -84,6 +100,27 @@ def test_liger_ce_compile_path_uses_torch_cross_entropy(monkeypatch):
 
     assert torch.allclose(loss, ref)
     assert torch.allclose(logits.grad, ref_logits.grad)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or pg._softcapped_ce_fwd_kernel is None,
+    reason="CUDA and Triton required for fused softcapped CE kernel",
+)
+def test_softcapped_cross_entropy_cuda_matches_torch_cross_entropy():
+    torch.manual_seed(123)
+    logits = (torch.randn(19, 257, device="cuda", dtype=torch.float32) * 2.0).requires_grad_(True)
+    target = torch.randint(0, 257, (19,), device="cuda")
+    ref_logits = logits.detach().clone().requires_grad_(True)
+    softcap = 7.0
+
+    loss = pg.softcapped_cross_entropy(logits, target, softcap)
+    ref = F.cross_entropy(softcap * torch.tanh(ref_logits / softcap), target)
+    loss.backward()
+    ref.backward()
+    torch.cuda.synchronize()
+
+    assert torch.allclose(loss, ref, atol=3e-4, rtol=1e-4)
+    assert torch.allclose(logits.grad, ref_logits.grad, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton CE kernel")

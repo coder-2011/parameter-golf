@@ -31,6 +31,8 @@ def _tiny_h() -> pg.Hyperparameters:
     h.curriculum_target = "forward"
     h.injection_type = "diagonal"
     h.residual_mode = "sequential"
+    h.unet_skip_enabled = False
+    h.unet_skip_init = 1.0
     h.parallel_residual_scope = "none"
     h.parallel_residual_start = -1
     h.parallel_residual_ln_scale = True
@@ -38,6 +40,10 @@ def _tiny_h() -> pg.Hyperparameters:
     h.parallel_residual_record_controls = True
     h.parallel_residual_tied_norm = False
     h.parallel_residual_in_fp32 = False
+    h.residual_forget_gate = True
+    h.residual_forget_gate_bias = -4.0
+    h.residual_forget_min_rad = 0.99
+    h.residual_forget_max_rad = 0.999
     h.state_init = "like-init"
     h.prelude_norm = False
     h.qk_norm = False
@@ -65,7 +71,12 @@ def _tiny_h() -> pg.Hyperparameters:
     return h
 
 
-def _block(*, parallel_residual: bool, record_residual: bool) -> pg.TransformerPreNormBlock:
+def _block(
+    *,
+    parallel_residual: bool,
+    record_residual: bool,
+    residual_forget_gate: bool = False,
+) -> pg.TransformerPreNormBlock:
     torch.manual_seed(123)
     return pg.TransformerPreNormBlock(
         dim=16,
@@ -84,6 +95,7 @@ def _block(*, parallel_residual: bool, record_residual: bool) -> pg.TransformerP
         record_residual=record_residual,
         ln_scale=True,
         residual_layer_idx=3,
+        residual_forget_gate=residual_forget_gate,
     )
 
 
@@ -182,6 +194,55 @@ def test_liger_style_gated_mlp_is_wired_into_gpt():
     loss.backward()
     assert model.core_block[0].mlp.gate_proj.weight.grad is not None
     assert torch.isfinite(model.core_block[0].mlp.gate_proj.weight.grad).all()
+
+
+def test_unet_skips_are_default_off_and_zero_init_transparent():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    base = pg.GPT(h)
+    h_skip = _tiny_h()
+    h_skip.unet_skip_enabled = True
+    h_skip.unet_skip_init = 0.0
+    skip_model = pg.GPT(h_skip)
+    skip_model.load_state_dict(base.state_dict(), strict=False)
+    base.eval()
+    skip_model.eval()
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    steps = torch.tensor([0, 1])
+
+    base_logits = base.forward_logits(input_ids, num_steps_pair=steps)
+    skip_logits = skip_model.forward_logits(input_ids, num_steps_pair=steps)
+
+    assert skip_model.num_unet_skips == 1
+    assert skip_model.unet_skip_weights.shape == (1, h.model_dim)
+    assert torch.allclose(skip_logits, base_logits, atol=1e-6, rtol=1e-6)
+
+
+def test_unet_skips_change_forward_and_get_gradient():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.n_layers_in_prelude = 2
+    h.n_layers_in_coda = 2
+    h.unet_skip_enabled = True
+    h.unet_skip_init = 1.0
+    model = pg.GPT(h)
+    model.eval()
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    steps = torch.tensor([0, 1])
+
+    with torch.no_grad():
+        enabled_logits = model.forward_logits(input_ids, num_steps_pair=steps)
+        model.unet_skip_weights.zero_()
+        disabled_logits = model.forward_logits(input_ids, num_steps_pair=steps)
+        model.unet_skip_weights.fill_(1.0)
+    loss = model.forward_model(input_ids, labels=target_ids, num_steps_pair=steps)["loss"]
+
+    assert not torch.allclose(enabled_logits, disabled_logits)
+    assert loss is not None
+    loss.backward()
+    assert model.unet_skip_weights.grad is not None
+    assert torch.isfinite(model.unet_skip_weights.grad).all()
 
 
 def test_fused_leaky_relu_sq_mlp_matches_naive_forward_backward():
@@ -321,6 +382,7 @@ def test_eval_val_ttt_lora_branch_removes_adapters_after_smoke():
         world_size=1,
         device=torch.device("cpu"),
         val_tokens=val_tokens,
+        val_byte_counts=None,
         base_bytes_lut=base_bytes_lut,
         has_leading_space_lut=has_leading_space_lut,
         is_boundary_token_lut=is_boundary_token_lut,
@@ -553,6 +615,91 @@ def test_sparse_attn_gate_zero_init_halves_attention_output_and_gets_gradient():
     assert torch.isfinite(gated.attn_gate_w.grad).all()
 
 
+def test_attn_out_gate_zero_init_is_transparent_and_gets_gradient():
+    torch.manual_seed(123)
+    base = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+    )
+    gated = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+        attn_out_gate=True,
+        sparse_attn_gate_window=4,
+    )
+    gated.load_state_dict(base.state_dict(), strict=False)
+    x = torch.randn(2, 5, 16)
+    freqs_cos, freqs_sin = pg.precompute_freqs_cos_sin(4, 5, 10000.0)
+    mask = torch.zeros(1, 1, 5, 5)
+
+    expected = base(x, freqs_cos, freqs_sin, mask=mask)
+    actual = gated(x, freqs_cos, freqs_sin, mask=mask)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    actual.square().mean().backward()
+    assert gated.attn_gate_proj.weight.grad is not None
+    assert torch.isfinite(gated.attn_gate_proj.weight.grad).all()
+
+
+def test_gated_attn_zero_init_halves_attention_output_and_uses_control_name():
+    torch.manual_seed(123)
+    base = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+    )
+    gated = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+        gated_attn=True,
+        gated_attn_init_std=0.0,
+    )
+    gated.load_state_dict(base.state_dict(), strict=False)
+    x = torch.randn(2, 5, 16)
+    freqs_cos, freqs_sin = pg.precompute_freqs_cos_sin(4, 5, 10000.0)
+    mask = torch.zeros(1, 1, 5, 5)
+
+    expected = base(x, freqs_cos, freqs_sin, mask=mask) * 0.5
+    actual = gated(x, freqs_cos, freqs_sin, mask=mask)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert any(pattern in "attn_gate_w" for pattern in pg.CONTROL_TENSOR_NAME_PATTERNS)
+    actual.square().mean().backward()
+    assert gated.attn_gate_w.grad is not None
+    assert torch.isfinite(gated.attn_gate_w.grad).all()
+
+
 def test_sparse_attn_gate_is_wired_into_gpt_and_control_tensor_patterns():
     torch.manual_seed(123)
     h = _tiny_h()
@@ -685,6 +832,59 @@ def test_record_sequential_block_matches_reference_formula():
     )
 
     assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_residual_forget_gate_matches_reference_formula():
+    block = _block(parallel_residual=False, record_residual=True, residual_forget_gate=True)
+    x = torch.randn(2, 5, 16)
+    x0 = torch.randn(2, 5, 16)
+
+    freqs_cos, freqs_sin = _freqs()
+    actual = block(x, freqs_cos, freqs_sin, x0=x0)
+
+    mix = block.resid_mix.to(dtype=x.dtype)
+    x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    attn_in = block.norm_1(x_in) * block.ln_scale_factor
+    attn_out = block.attn(attn_in, freqs_cos, freqs_sin)
+    forget = block.residual_forget
+    assert forget is not None
+    x_after_attn = (
+        forget(x_in, attn_in)
+        + block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+    )
+    mlp_in = block.norm_2(x_after_attn) * block.ln_scale_factor
+    expected = (
+        forget(x_after_attn, mlp_in)
+        + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * block.mlp(mlp_in)
+    )
+
+    assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_residual_forget_gate_is_wired_into_gpt_backward():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.residual_forget_gate = True
+    model = pg.GPT(h)
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    forget_params = [
+        p
+        for name, p in model.named_parameters()
+        if ".residual_forget." in name
+    ]
+    assert forget_params
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in forget_params)
 
 
 def test_delayed_parallel_block_stream_matches_immediate_parallel_stack():

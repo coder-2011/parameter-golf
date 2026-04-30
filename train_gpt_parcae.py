@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from itertools import permutations
 from pathlib import Path
 
@@ -31,6 +32,11 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from utils.flash_attention import HAS_FLASH_ATTN, flash_attn
+
+try:
+    from flash_attn_interface import flash_attn_varlen_func
+except Exception:
+    flash_attn_varlen_func = None
 
 try:
     import triton
@@ -150,6 +156,258 @@ def liger_fused_linear_cross_entropy(
         accum_dtype=torch.float32,
     )(scaled_weight, flat_hidden, flat_target, scaled_bias)
 
+
+_FUSED_CE_LIBRARY = "pgparcae_fusedce"
+_FUSED_CE_BLOCK_SIZE = 1024
+_FUSED_CE_NUM_WARPS = 4
+
+
+if triton is not None:
+    @triton.jit
+    def _softcapped_ce_fwd_kernel(
+        logits_ptr,
+        losses_ptr,
+        lse_ptr,
+        targets_ptr,
+        stride_logits_n,
+        stride_logits_v,
+        n_rows,
+        n_cols,
+        softcap,
+        block_size: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0).to(tl.int64)
+        logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+        max_val = -float("inf")
+        sum_exp = 0.0
+        two_softcap = 2.0 * softcap
+        inv_half_softcap = 2.0 / softcap
+        for off in range(0, n_cols, block_size):
+            cols = off + tl.arange(0, block_size)
+            mask = cols < n_cols
+            val = tl.load(logits_row_ptr + cols * stride_logits_v, mask=mask, other=-float("inf")).to(tl.float32)
+            # 2C*sigmoid(2x/C) is C*tanh(x/C) plus a row-constant C.
+            z = two_softcap * tl.sigmoid(val * inv_half_softcap)
+            z = tl.where(mask, z, -float("inf"))
+            curr_max = tl.max(z, axis=0)
+            new_max = tl.maximum(max_val, curr_max)
+            sum_exp = sum_exp * tl.exp(max_val - new_max) + tl.sum(tl.exp(z - new_max), axis=0)
+            max_val = new_max
+        lse = max_val + tl.log(sum_exp)
+        tl.store(lse_ptr + row_idx, lse)
+        target = tl.load(targets_ptr + row_idx).to(tl.int32)
+        target_val = tl.load(logits_row_ptr + target * stride_logits_v).to(tl.float32)
+        target_z = two_softcap * tl.sigmoid(target_val * inv_half_softcap)
+        tl.store(losses_ptr + row_idx, lse - target_z)
+
+
+    @triton.jit
+    def _softcapped_ce_bwd_kernel(
+        grad_logits_ptr,
+        grad_losses_ptr,
+        lse_ptr,
+        logits_ptr,
+        targets_ptr,
+        stride_logits_n,
+        stride_logits_v,
+        stride_grad_n,
+        stride_grad_v,
+        n_rows,
+        n_cols,
+        softcap,
+        block_size: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0).to(tl.int64)
+        logits_row_ptr = logits_ptr + row_idx * stride_logits_n
+        grad_row_ptr = grad_logits_ptr + row_idx * stride_grad_n
+        lse = tl.load(lse_ptr + row_idx)
+        grad_loss = tl.load(grad_losses_ptr + row_idx).to(tl.float32)
+        target = tl.load(targets_ptr + row_idx).to(tl.int32)
+        two_softcap = 2.0 * softcap
+        inv_half_softcap = 2.0 / softcap
+        dz_dx_scale = two_softcap * inv_half_softcap
+        for off in range(0, n_cols, block_size):
+            cols = off + tl.arange(0, block_size)
+            mask = cols < n_cols
+            val = tl.load(logits_row_ptr + cols * stride_logits_v, mask=mask, other=0.0).to(tl.float32)
+            sigmoid_u = tl.sigmoid(val * inv_half_softcap)
+            z = two_softcap * sigmoid_u
+            probs = tl.exp(z - lse)
+            grad_z = grad_loss * (probs - tl.where(cols == target, 1.0, 0.0))
+            grad_x = grad_z * (dz_dx_scale * sigmoid_u * (1.0 - sigmoid_u))
+            tl.store(grad_row_ptr + cols * stride_grad_v, grad_x, mask=mask)
+else:
+    _softcapped_ce_fwd_kernel = None
+    _softcapped_ce_bwd_kernel = None
+
+
+def _validate_softcapped_ce_inputs(logits: Tensor, targets: Tensor, softcap: float) -> tuple[Tensor, Tensor]:
+    if logits.ndim != 2:
+        raise ValueError(f"Expected logits.ndim=2, got {logits.ndim}")
+    if targets.ndim != 1:
+        raise ValueError(f"Expected targets.ndim=1, got {targets.ndim}")
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(f"Expected matching rows, got logits={tuple(logits.shape)} targets={tuple(targets.shape)}")
+    if not logits.is_cuda or not targets.is_cuda:
+        raise ValueError("softcapped_cross_entropy requires CUDA tensors")
+    if softcap <= 0.0:
+        raise ValueError(f"softcap must be positive, got {softcap}")
+    if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"Unsupported logits dtype: {logits.dtype}")
+    logits = logits.contiguous()
+    targets = targets.contiguous()
+    if targets.dtype != torch.int64:
+        targets = targets.to(dtype=torch.int64)
+    return logits, targets
+
+
+@torch.library.custom_op(
+    f"{_FUSED_CE_LIBRARY}::softcapped_ce",
+    mutates_args=(),
+    schema="(Tensor logits, Tensor targets, float softcap) -> (Tensor, Tensor)",
+)
+def softcapped_ce_op(logits: Tensor, targets: Tensor, softcap: float) -> tuple[Tensor, Tensor]:
+    if _softcapped_ce_fwd_kernel is None:
+        raise RuntimeError("softcapped_ce_op requires Triton")
+    logits, targets = _validate_softcapped_ce_inputs(logits, targets, float(softcap))
+    n_rows, n_cols = logits.shape
+    losses = torch.empty((n_rows,), device=logits.device, dtype=torch.float32)
+    lse = torch.empty((n_rows,), device=logits.device, dtype=torch.float32)
+    _softcapped_ce_fwd_kernel[(n_rows,)](
+        logits,
+        losses,
+        lse,
+        targets,
+        logits.stride(0),
+        logits.stride(1),
+        n_rows,
+        n_cols,
+        float(softcap),
+        block_size=_FUSED_CE_BLOCK_SIZE,
+        num_warps=_FUSED_CE_NUM_WARPS,
+    )
+    return losses, lse
+
+
+@softcapped_ce_op.register_fake
+def _(logits: Tensor, targets: Tensor, softcap: float):
+    if logits.ndim != 2 or targets.ndim != 1:
+        raise ValueError("softcapped_ce fake impl expects 2D logits and 1D targets")
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(f"Expected matching rows, got logits={tuple(logits.shape)} targets={tuple(targets.shape)}")
+    n_rows = logits.shape[0]
+    return (
+        logits.new_empty((n_rows,), dtype=torch.float32),
+        logits.new_empty((n_rows,), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op(
+    f"{_FUSED_CE_LIBRARY}::softcapped_ce_backward",
+    mutates_args=(),
+    schema="(Tensor logits, Tensor targets, Tensor lse, Tensor grad_losses, float softcap) -> Tensor",
+)
+def softcapped_ce_backward_op(
+    logits: Tensor,
+    targets: Tensor,
+    lse: Tensor,
+    grad_losses: Tensor,
+    softcap: float,
+) -> Tensor:
+    if _softcapped_ce_bwd_kernel is None:
+        raise RuntimeError("softcapped_ce_backward_op requires Triton")
+    logits, targets = _validate_softcapped_ce_inputs(logits, targets, float(softcap))
+    lse = lse.contiguous()
+    grad_losses = grad_losses.contiguous().to(dtype=torch.float32)
+    if lse.ndim != 1 or grad_losses.ndim != 1:
+        raise ValueError("Expected 1D lse and grad_losses")
+    if lse.shape[0] != logits.shape[0] or grad_losses.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"Expected row-aligned lse/grad_losses, got logits={tuple(logits.shape)} "
+            f"lse={tuple(lse.shape)} grad_losses={tuple(grad_losses.shape)}"
+        )
+    grad_logits = torch.empty_like(logits)
+    n_rows, n_cols = logits.shape
+    _softcapped_ce_bwd_kernel[(n_rows,)](
+        grad_logits,
+        grad_losses,
+        lse,
+        logits,
+        targets,
+        logits.stride(0),
+        logits.stride(1),
+        grad_logits.stride(0),
+        grad_logits.stride(1),
+        n_rows,
+        n_cols,
+        float(softcap),
+        block_size=_FUSED_CE_BLOCK_SIZE,
+        num_warps=_FUSED_CE_NUM_WARPS,
+    )
+    return grad_logits
+
+
+@softcapped_ce_backward_op.register_fake
+def _(logits: Tensor, targets: Tensor, lse: Tensor, grad_losses: Tensor, softcap: float):
+    if logits.ndim != 2 or targets.ndim != 1 or lse.ndim != 1 or grad_losses.ndim != 1:
+        raise ValueError("softcapped_ce_backward fake impl expects 2D logits and 1D row tensors")
+    if logits.shape[0] != targets.shape[0] or logits.shape[0] != lse.shape[0] or logits.shape[0] != grad_losses.shape[0]:
+        raise ValueError("softcapped_ce_backward fake impl expects row-aligned tensors")
+    return logits.new_empty(logits.shape)
+
+
+def _softcapped_ce_setup_context(ctx, inputs, output) -> None:
+    logits, targets, softcap = inputs
+    _losses, lse = output
+    ctx.save_for_backward(logits, targets, lse)
+    ctx.softcap = float(softcap)
+
+
+def _softcapped_ce_backward(ctx, grad_losses: Tensor, grad_lse: Tensor | None):
+    del grad_lse
+    logits, targets, lse = ctx.saved_tensors
+    grad_logits = getattr(torch.ops, _FUSED_CE_LIBRARY).softcapped_ce_backward(
+        logits,
+        targets,
+        lse,
+        grad_losses,
+        ctx.softcap,
+    )
+    return grad_logits, None, None
+
+
+softcapped_ce_op.register_autograd(_softcapped_ce_backward, setup_context=_softcapped_ce_setup_context)
+
+
+def softcapped_cross_entropy(
+    logits: Tensor,
+    targets: Tensor,
+    softcap: float,
+    reduction: str = "mean",
+) -> Tensor:
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    if (
+        _softcapped_ce_fwd_kernel is None
+        or flat_logits.device.type != "cuda"
+        or not torch.is_floating_point(flat_logits)
+    ):
+        capped = softcap * torch.tanh(flat_logits.float() / softcap)
+        loss = F.cross_entropy(capped, flat_targets, reduction=reduction)
+        return loss.reshape(targets.shape) if reduction == "none" else loss
+    losses, _lse = getattr(torch.ops, _FUSED_CE_LIBRARY).softcapped_ce(
+        flat_logits,
+        flat_targets,
+        float(softcap),
+    )
+    if reduction == "none":
+        return losses.reshape(targets.shape)
+    if reduction == "sum":
+        return losses.sum()
+    if reduction == "mean":
+        return losses.mean()
+    raise ValueError(f"Unsupported reduction={reduction!r}")
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -236,13 +494,14 @@ class Hyperparameters:
     ngram_expert_topk = int(os.environ.get("NGRAM_EXPERT_TOPK", 8))
     ngram_expert_boost_scale = float(os.environ.get("NGRAM_EXPERT_BOOST_SCALE", 0.25))
     ngram_expert_max_boost = float(os.environ.get("NGRAM_EXPERT_MAX_BOOST", 12.0))
-
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 500))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    document_packing = bool(int(os.environ.get("DOCUMENT_PACKING", os.environ.get("DOCUMENT_PACKING_ENABLED", "0"))))
+    document_packing_cu_bucket_size = int(os.environ.get("DOCUMENT_PACKING_CU_BUCKET_SIZE", "64"))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", os.environ.get("EMA", "0"))))
@@ -280,6 +539,7 @@ class Hyperparameters:
     rans_int6 = bool(int(os.environ.get("RANS_INT6", "0")))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 32))
+    gptq_calibration_mode = os.environ.get("GPTQ_CALIBRATION_MODE", "stream").strip().lower()
     gptq_reserve_seconds = float(os.environ.get("GPTQ_RESERVE_SECONDS", 12.0))
     gptq_blocksize = int(os.environ.get("GPTQ_BLOCKSIZE", 128))
     gptq_dampening = float(os.environ.get("GPTQ_DAMPENING", 0.01))
@@ -288,6 +548,12 @@ class Hyperparameters:
     gptq_quantize_embeddings = bool(int(os.environ.get("GPTQ_QUANTIZE_EMBEDDINGS", "1")))
     gptq_matrix_clip_sigmas = float(os.environ.get("GPTQ_MATRIX_CLIP_SIGMAS", 12.85))
     gptq_embed_clip_sigmas = float(os.environ.get("GPTQ_EMBED_CLIP_SIGMAS", 20.0))
+    lqer_enabled = bool(int(os.environ.get("LQER_ENABLED", "0")))
+    lqer_rank = int(os.environ.get("LQER_RANK", 4))
+    lqer_top_k = int(os.environ.get("LQER_TOP_K", 3))
+    lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
+    lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
+    lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
     quant_keep_float_patterns = tuple(
         pattern.strip()
         for pattern in os.environ.get("QUANT_KEEP_FLOAT_PATTERNS", "").split(",")
@@ -329,6 +595,8 @@ class Hyperparameters:
     curriculum_target = os.environ.get("CURRICULUM_TARGET", "forward")
     injection_type = os.environ.get("INJECTION_TYPE", "diagonal")
     residual_mode = os.environ.get("RESIDUAL_MODE", "sequential")
+    unet_skip_enabled = bool(int(os.environ.get("UNET_SKIP_ENABLED", os.environ.get("UNET_SKIPS", "0"))))
+    unet_skip_init = float(os.environ.get("UNET_SKIP_INIT", "1.0"))
     parallel_residual_scope = os.environ.get("PARALLEL_RESIDUAL_SCOPE", "none")
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", "-1"))
     parallel_residual_ln_scale = bool(int(os.environ.get("PARALLEL_RESIDUAL_LN_SCALE", "1")))
@@ -336,6 +604,10 @@ class Hyperparameters:
     parallel_residual_record_controls = bool(int(os.environ.get("PARALLEL_RESIDUAL_RECORD_CONTROLS", "1")))
     parallel_residual_tied_norm = bool(int(os.environ.get("PARALLEL_RESIDUAL_TIED_NORM", "0")))
     parallel_residual_in_fp32 = bool(int(os.environ.get("PARALLEL_RESIDUAL_IN_FP32", "0")))
+    residual_forget_gate = bool(int(os.environ.get("RESIDUAL_FORGET_GATE", "1")))
+    residual_forget_gate_bias = float(os.environ.get("RESIDUAL_FORGET_GATE_BIAS", "-4.0"))
+    residual_forget_min_rad = float(os.environ.get("RESIDUAL_FORGET_MIN_RAD", "0.99"))
+    residual_forget_max_rad = float(os.environ.get("RESIDUAL_FORGET_MAX_RAD", "0.999"))
     attn_res_mode = os.environ.get("ATTN_RES_MODE", "none").strip().lower()
     attn_res_scope = os.environ.get("ATTN_RES_SCOPE", "all").strip().lower()
     attn_res_block_size = int(os.environ.get("ATTN_RES_BLOCK_SIZE", 2))
@@ -352,8 +624,12 @@ class Hyperparameters:
     attn_preconv_kernel = int(os.environ.get("ATTN_PRECONV_KERNEL", "0"))
     attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.005"))
     attn_preconv_lr = float(os.environ.get("ATTN_PRECONV_LR", "0.001"))
-    sparse_attn_gate = bool(int(os.environ.get("SPARSE_ATTN_GATE", "0")))
-    sparse_attn_gate_window = int(os.environ.get("SPARSE_ATTN_GATE_WINDOW", "12"))
+    attn_out_gate = bool(int(os.environ.get("ATTN_OUT_GATE_ENABLED", os.environ.get("ATTN_OUT_GATE", "0"))))
+    attn_out_gate_src = os.environ.get("ATTN_OUT_GATE_SRC", "proj").strip().lower()
+    gated_attn = bool(int(os.environ.get("GATED_ATTN_ENABLED", os.environ.get("GATED_ATTN", "0"))))
+    gated_attn_init_std = float(os.environ.get("GATED_ATTN_INIT_STD", "0.01"))
+    sparse_attn_gate = bool(int(os.environ.get("SPARSE_ATTN_GATE", os.environ.get("SPARSE_ATTN_GATE_ENABLED", "0"))))
+    sparse_attn_gate_window = int(os.environ.get("SPARSE_ATTN_GATE_WINDOW", os.environ.get("GATE_WINDOW", "12")))
     sparse_attn_gate_init_std = float(os.environ.get("SPARSE_ATTN_GATE_INIT_STD", "0.0"))
     sparse_attn_gate_scale = float(os.environ.get("SPARSE_ATTN_GATE_SCALE", "1.0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
@@ -368,6 +644,7 @@ class Hyperparameters:
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     liger_ce = bool(int(os.environ.get("LIGER_CE", "1")))
     liger_fused_ce = bool(int(os.environ.get("LIGER_FUSED_CE", "1")))
+    fused_softcapped_ce = bool(int(os.environ.get("FUSED_SOFTCAPPED_CE", os.environ.get("FUSED_CE_ENABLED", "0"))))
     liger_rope = bool(int(os.environ.get("LIGER_ROPE", "0")))
     tridao_packed_rope = bool(int(os.environ.get("TRIDAO_PACKED_ROPE", "1" if triton is not None else "0")))
     fused_qkv_postprocess = bool(int(os.environ.get("FUSED_QKV_POSTPROCESS", "0")))
@@ -389,6 +666,7 @@ class Hyperparameters:
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_ns_coeffs = os.environ.get("MUON_NS_COEFFS", "classic").strip().lower()
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     muon_row_normalize = bool(int(os.environ.get("MUON_ROW_NORMALIZE", "1")))
@@ -398,16 +676,30 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+_PE_COEFFS = (
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+)
+_MUON_NS_COEFFS = os.environ.get("MUON_NS_COEFFS", "classic").strip().lower()
+
+
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
-    a, b, c = (3.4445, -4.7750, 2.0315)
+    use_pe = _MUON_NS_COEFFS in {"pe", "polar", "polar_express"}
     X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
+    if use_pe:
+        coeffs = _PE_COEFFS[:steps] if steps <= len(_PE_COEFFS) else _PE_COEFFS
+    else:
+        coeffs = tuple((3.4445, -4.7750, 2.0315) for _ in range(steps))
+    for a, b, c in coeffs:
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
@@ -3067,6 +3359,15 @@ def rans_int6_decode_tensor(blob: Tensor, shape: tuple[int, ...]) -> Tensor:
     q = symbols.astype(np.int16, copy=False) - 32
     return torch.from_numpy(q.astype(np.int8, copy=False)).reshape(shape).contiguous()
 
+
+def init_log_radius_param_(tensor: Tensor, min_rad: float, max_rad: float, eps: float = 1e-8) -> None:
+    if not (0.0 < min_rad <= max_rad < 1.0):
+        raise ValueError(f"radius bounds must satisfy 0 < min <= max < 1, got {min_rad}, {max_rad}")
+    with torch.no_grad():
+        tensor.uniform_(min_rad ** 2 + eps, max_rad ** 2 + eps)
+        tensor.log_().mul_(0.5)
+        tensor.neg_().exp_().sub_(1.0).log_()
+
 def store_quantized_tensor(
     name: str,
     q: Tensor,
@@ -3282,12 +3583,38 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
+        if ".__lqer__." in name:
+            continue
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
+    lqer_meta = obj.get("lqer_meta", {})
+    if isinstance(lqer_meta, dict):
+        passthrough = obj["passthrough"]
+        for name, info in lqer_meta.items():
+            if name not in out:
+                continue
+            prefix = f"{name}.__lqer__."
+            base = out[name].float()
+            if info == "asym":
+                qA = passthrough[prefix + "qA"].float()
+                sA = passthrough[prefix + "sA"].float()
+                qB = passthrough[prefix + "qB"].float()
+                sB = passthrough[prefix + "sB"].float()
+                group = int(passthrough[prefix + "group"].item())
+                A = qA * sA
+                B = (qB.reshape(-1, group) * sB.view(-1, 1)).reshape(qB.shape)
+            else:
+                qA = passthrough[prefix + "qA"].float()
+                sA = passthrough[prefix + "sA"].float()
+                qB = passthrough[prefix + "qB"].float()
+                sB = passthrough[prefix + "sB"].float()
+                A = qA * sA.view(-1, 1)
+                B = qB * sB.view(-1, 1)
+            out[name] = (base + A @ B).to(dtype=out[name].dtype).contiguous()
     return out
 
 
@@ -3394,11 +3721,24 @@ def collect_gptq_hessians(
     old_monitoring = model.monitoring
     model.eval()
     model.monitoring = False
-    loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    if args.gptq_calibration_mode == "shuffled":
+        loader = ShuffledSequenceLoader(args, rank, world_size, device)
+
+        def next_calibration_batch() -> Tensor:
+            x, _ = loader.next_batch(args.train_batch_tokens, grad_accum_steps)
+            return x
+
+    else:
+        loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+        def next_calibration_batch() -> Tensor:
+            x, _ = loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            return x
+
     try:
         with torch.inference_mode():
             for _ in range(args.gptq_calibration_batches):
-                x, _ = loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x = next_calibration_batch()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     model.forward_logits(x)
     finally:
@@ -3504,6 +3844,28 @@ def gptq_quantize_weight(
     return Q.contiguous(), scale.contiguous()
 
 
+def _lqer_pack(A: Tensor, B: Tensor, bits: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    qmax = signed_quant_max(bits)
+    sA = (A.abs().amax(dim=1).clamp_min(QUANT_SCALE_EPS) / qmax).to(torch.float16)
+    sB = (B.abs().amax(dim=1).clamp_min(QUANT_SCALE_EPS) / qmax).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float().view(-1, 1)), -qmax, qmax).to(torch.int8)
+    qB = torch.clamp(torch.round(B / sB.float().view(-1, 1)), -qmax, qmax).to(torch.int8)
+    return qA.contiguous(), sA.contiguous(), qB.contiguous(), sB.contiguous()
+
+
+def _lqer_pack_asym(A: Tensor, B: Tensor, group: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    if group <= 0:
+        raise ValueError(f"LQER_ASYM_GROUP must be positive, got {group}")
+    sA = (A.abs().amax().clamp_min(QUANT_SCALE_EPS) / 1.5).to(torch.float16)
+    qA = torch.clamp(torch.round(A / sA.float()), -2, 1).to(torch.int8)
+    if B.numel() % group != 0:
+        raise ValueError(f"LQER asym group {group} must divide B.numel={B.numel()}")
+    B_grouped = B.reshape(-1, group)
+    sB = (B_grouped.abs().amax(dim=-1).clamp_min(QUANT_SCALE_EPS) / 7.5).to(torch.float16)
+    qB = torch.clamp(torch.round(B_grouped / sB.float().view(-1, 1)), -8, 7).to(torch.int8).reshape(B.shape)
+    return qA.contiguous(), sA.contiguous(), qB.contiguous(), sB.contiguous()
+
+
 def quantize_state_dict_gptq_int(
     state_dict: dict[str, Tensor],
     hessians: dict[str, Tensor],
@@ -3522,6 +3884,8 @@ def quantize_state_dict_gptq_int(
     passthrough_orig_dtypes: dict[str, str] = {}
     methods: dict[str, str] = {}
     tensor_bits: dict[str, int] = {}
+    lqer_candidates: list[tuple[str, Tensor, float]] = []
+    lqer_meta: dict[str, str] = {}
     stats = dict.fromkeys(
         (
             "param_count",
@@ -3604,6 +3968,13 @@ def quantize_state_dict_gptq_int(
             q, s = quantize_float_tensor(t, bits=tensor_bits[name])
             stats["num_fallback_tensors"] += 1
             methods[name] = f"per_row_int{tensor_bits[name]}"
+        if args.lqer_enabled and use_gptq and t.ndim == 2:
+            if s.ndim > 0:
+                deq = q.float() * s.float().view(q.shape[0], 1)
+            else:
+                deq = q.float() * float(s.item())
+            err = t.float() - deq
+            lqer_candidates.append((name, err, float(err.norm().item())))
         if args.rans_int6:
             stored = rans_int6_encode_tensor(q)
             quantized[name] = stored
@@ -3614,6 +3985,39 @@ def quantize_state_dict_gptq_int(
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["quant_payload_bytes"] += tensor_nbytes(s)
+
+    if args.lqer_enabled and lqer_candidates:
+        top = sorted(lqer_candidates, key=lambda item: -item[2])[: args.lqer_top_k]
+        for name, err, _norm in top:
+            U, S, Vh = torch.linalg.svd(err, full_matrices=False)
+            rank = min(args.lqer_rank, int(S.numel()))
+            if rank <= 0:
+                continue
+            A = (U[:, :rank] * S[:rank]).contiguous()
+            B = Vh[:rank, :].contiguous()
+            prefix = f"{name}.__lqer__."
+            if args.lqer_asym_enabled and B.numel() % args.lqer_asym_group == 0:
+                qA, sA, qB, sB = _lqer_pack_asym(A, B, args.lqer_asym_group)
+                lqer_meta[name] = "asym"
+                passthrough[prefix + "group"] = torch.tensor(args.lqer_asym_group, dtype=torch.int64)
+                stats["quant_payload_bytes"] += tensor_nbytes(passthrough[prefix + "group"])
+            else:
+                qA, sA, qB, sB = _lqer_pack(A, B, args.lqer_factor_bits)
+                lqer_meta[name] = f"int{args.lqer_factor_bits}"
+            passthrough[prefix + "qA"] = qA
+            passthrough[prefix + "sA"] = sA
+            passthrough[prefix + "qB"] = qB
+            passthrough[prefix + "sB"] = sB
+            stats["quant_payload_bytes"] += sum(
+                tensor_nbytes(t)
+                for t in (
+                    passthrough[prefix + "qA"],
+                    passthrough[prefix + "sA"],
+                    passthrough[prefix + "qB"],
+                    passthrough[prefix + "sB"],
+                )
+            )
+            methods[name] = methods.get(name, "unknown") + "+lqer_" + lqer_meta[name]
 
     obj: dict[str, object] = {
         "__quant_format__": (
@@ -3634,6 +4038,8 @@ def quantize_state_dict_gptq_int(
         "passthrough": passthrough,
         "methods": methods,
     }
+    if lqer_meta:
+        obj["lqer_meta"] = lqer_meta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
@@ -3658,6 +4064,70 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+_SHARD_HEADER_BYTES = 256 * np.dtype("<i4").itemsize
+_SHARD_NTOKENS_CACHE: dict[str, int] = {}
+_MMAP_CACHE: dict[str, np.memmap] = {}
+BOS_ID = 1
+
+
+def _read_num_tokens(file: Path) -> int:
+    key = str(file)
+    cached = _SHARD_NTOKENS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    n = int(header[2])
+    _SHARD_NTOKENS_CACHE[key] = n
+    return n
+
+
+def _get_shard_memmap(file: Path) -> np.memmap:
+    key = str(file)
+    cached = _MMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n = _read_num_tokens(file)
+    mm = np.memmap(file, mode="r", dtype="<u2", offset=_SHARD_HEADER_BYTES, shape=(n,))
+    _MMAP_CACHE[key] = mm
+    return mm
+
+
+def _next_multiple(value: int, divisor: int) -> int:
+    return ((value + divisor - 1) // divisor) * divisor
+
+
+def _build_cu_seqlens(
+    bos_pos: list[int],
+    total_len: int,
+    device: torch.device,
+    max_doc_len: int = 0,
+    bucket_size: int = 64,
+) -> tuple[Tensor, int]:
+    if total_len <= 0:
+        raise ValueError("total_len must be positive")
+    if not bos_pos or bos_pos[0] != 0:
+        bos_pos = [0] + bos_pos
+    seg_starts: list[int] = []
+    starts_with_end = bos_pos + [total_len]
+    for start, end in zip(starts_with_end[:-1], starts_with_end[1:], strict=True):
+        if max_doc_len > 0:
+            pos = start
+            while pos < end:
+                seg_starts.append(pos)
+                pos += max_doc_len
+        else:
+            seg_starts.append(start)
+    boundaries = seg_starts + [total_len]
+    padded_len = _next_multiple(len(boundaries), bucket_size)
+    cu = torch.full((padded_len,), total_len, dtype=torch.int32, device=device)
+    cu[: len(boundaries)] = torch.tensor(boundaries, dtype=torch.int32, device=device)
+    seg_ends = seg_starts[1:] + [total_len]
+    max_seqlen = max(end - start for start, end in zip(seg_starts, seg_ends, strict=True))
+    return cu, max_seqlen
 
 
 class TokenStream:
@@ -3731,6 +4201,153 @@ class DistributedTokenLoader:
         local = chunk[start : start + local_tokens + 1].to(dtype=torch.int64)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+class DocumentPackingLoader:
+    _shard_pool = ThreadPoolExecutor(1)
+
+    def __init__(self, args: Hyperparameters, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.pin_memory = device.type == "cuda" and torch.cuda.is_available()
+        self.cu_bucket_size = args.document_packing_cu_bucket_size
+        self.max_seq_len = args.train_seq_len
+        self.files = [Path(p) for p in sorted(glob.glob(args.train_files))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {args.train_files}")
+        self.file_iter = iter(self.files)
+        self._init_shard(load_data_shard(next(self.file_iter)))
+        self._next_shard = self._submit_next_shard()
+        self._batch_pool = ThreadPoolExecutor(1)
+        self._prefetch_queue = []
+
+    def _init_shard(self, tokens: Tensor) -> None:
+        self.tokens = tokens
+        self.shard_size = tokens.numel()
+        bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.bos_idx = bos_idx if bos_idx.size > 0 else np.array([0], dtype=np.int64)
+        self.cursor = int(self.bos_idx[0])
+
+    def _submit_next_shard(self):
+        try:
+            path = next(self.file_iter)
+            return self._shard_pool.submit(load_data_shard, path)
+        except StopIteration:
+            return None
+
+    def _advance_shard(self) -> None:
+        if self._next_shard is None:
+            self.file_iter = iter(self.files)
+            self._next_shard = self._shard_pool.submit(load_data_shard, next(self.file_iter))
+        self._init_shard(self._next_shard.result())
+        self._next_shard = self._submit_next_shard()
+
+    def _local_doc_starts(self, local_start: int, total_len: int) -> list[int]:
+        lo = np.searchsorted(self.bos_idx, local_start, side="left")
+        hi = np.searchsorted(self.bos_idx, local_start + total_len, side="left")
+        return (self.bos_idx[lo:hi] - local_start).tolist()
+
+    def _prepare_batch(self, num_tokens_local: int) -> tuple[Tensor, Tensor, Tensor, int]:
+        per_rank_span = num_tokens_local + 1
+        global_span = per_rank_span * self.world_size
+        while self.cursor + global_span > self.shard_size:
+            self._advance_shard()
+        local_start = self.cursor + self.rank * per_rank_span
+        buf = self.tokens[local_start : local_start + per_rank_span]
+        inputs = torch.empty(per_rank_span - 1, dtype=torch.int64, pin_memory=self.pin_memory)
+        targets = torch.empty(per_rank_span - 1, dtype=torch.int64, pin_memory=self.pin_memory)
+        inputs.copy_(buf[:-1])
+        targets.copy_(buf[1:])
+        starts = self._local_doc_starts(local_start, inputs.numel())
+        cu_seqlens, max_seqlen = _build_cu_seqlens(
+            starts,
+            inputs.numel(),
+            inputs.device,
+            self.max_seq_len,
+            self.cu_bucket_size,
+        )
+        self.cursor += global_span
+        if self.pin_memory:
+            cu_seqlens = cu_seqlens.pin_memory()
+        return inputs, targets, cu_seqlens, max_seqlen
+
+    def next_batch(self, global_tokens: int, grad_accum_steps: int) -> tuple[Tensor, Tensor, Tensor, int]:
+        denominator = self.world_size * grad_accum_steps
+        if global_tokens % denominator != 0:
+            raise ValueError(f"global_tokens={global_tokens} must be divisible by world_size * grad_accum_steps={denominator}")
+        num_tokens_local = global_tokens // denominator
+        while len(self._prefetch_queue) < 2:
+            self._prefetch_queue.append(self._batch_pool.submit(self._prepare_batch, num_tokens_local))
+        inputs, targets, cu_seqlens, max_seqlen = self._prefetch_queue.pop(0).result()
+        self._prefetch_queue.append(self._batch_pool.submit(self._prepare_batch, num_tokens_local))
+        return (
+            inputs[None].to(self.device, non_blocking=True),
+            targets[None].to(self.device, non_blocking=True),
+            cu_seqlens.to(self.device, non_blocking=True),
+            max_seqlen,
+        )
+
+
+class ShuffledSequenceLoader:
+    def __init__(self, args: Hyperparameters, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.seq_len = args.train_seq_len
+        self.device = device
+        all_files = [Path(p) for p in sorted(glob.glob(args.train_files))]
+        if not all_files:
+            raise FileNotFoundError(f"No files found for pattern: {args.train_files}")
+        self.files = all_files[rank::world_size]
+        self.rng = np.random.Generator(np.random.PCG64(rank))
+        self.num_tokens = [_read_num_tokens(f) for f in self.files]
+        self.start_inds: list[list[int]] = [[] for _ in self.files]
+        for shard_idx in range(len(self.files)):
+            self._reset_shard(shard_idx)
+
+    def _reset_shard(self, shard_idx: int) -> None:
+        max_phase = min(self.seq_len - 1, max(0, self.num_tokens[shard_idx] - self.seq_len - 1))
+        phase = int(self.rng.integers(max_phase + 1)) if max_phase > 0 else 0
+        num_sequences = (self.num_tokens[shard_idx] - 1 - phase) // self.seq_len
+        sequence_order = self.rng.permutation(num_sequences)
+        self.start_inds[shard_idx] = (phase + sequence_order * self.seq_len).tolist()
+
+    def next_batch(self, global_tokens: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        denominator = self.world_size * grad_accum_steps
+        if denominator <= 0:
+            raise ValueError(
+                f"world_size * grad_accum_steps must be positive, got "
+                f"world_size={self.world_size} grad_accum_steps={grad_accum_steps}"
+            )
+        if global_tokens % denominator != 0:
+            raise ValueError(
+                f"global_tokens={global_tokens} must be divisible by "
+                f"world_size * grad_accum_steps={denominator}"
+            )
+        device_tokens = global_tokens // denominator
+        if device_tokens % self.seq_len != 0:
+            raise ValueError(
+                f"device_tokens={device_tokens} must be divisible by seq_len={self.seq_len}"
+            )
+        device_batch_size = device_tokens // self.seq_len
+        remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
+        x = torch.empty((device_batch_size, self.seq_len), dtype=torch.int64)
+        y = torch.empty((device_batch_size, self.seq_len), dtype=torch.int64)
+        for batch_idx in range(device_batch_size):
+            total = remaining.sum()
+            if total <= 0:
+                for shard_idx in range(len(self.files)):
+                    self._reset_shard(shard_idx)
+                remaining = np.array([len(s) for s in self.start_inds], dtype=np.float64)
+                total = remaining.sum()
+            shard_idx = int(self.rng.choice(len(self.files), p=remaining / total))
+            start_ind = self.start_inds[shard_idx].pop()
+            remaining[shard_idx] -= 1
+            mm = _get_shard_memmap(self.files[shard_idx])
+            window = torch.as_tensor(np.array(mm[start_ind : start_ind + self.seq_len + 1], dtype=np.int64))
+            x[batch_idx] = window[:-1]
+            y[batch_idx] = window[1:]
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
@@ -3995,14 +4612,29 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        try:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        except TypeError as exc:
+            if "enable_gqa" not in str(exc):
+                raise
+            if self.num_kv_heads != self.num_heads:
+                repeats = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeats, dim=1)
+                v = v.repeat_interleave(repeats, dim=1)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -4715,6 +5347,28 @@ class AttentionResidualMixer(nn.Module):
         return mixed.to(dtype=stacked.dtype)
 
 
+class ResidualForgetGate(nn.Module):
+    def __init__(self, dim: int, bias: float, min_rad: float, max_rad: float):
+        super().__init__()
+        self.a_param = nn.Parameter(torch.empty(dim, dtype=torch.float32))
+        self.a_gate = CastedLinear(dim, dim, bias=True)
+        self.bias = bias
+        self.min_rad = min_rad
+        self.max_rad = max_rad
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init_log_radius_param_(self.a_param, self.min_rad, self.max_rad)
+        nn.init.zeros_(self.a_gate.weight)
+        if self.a_gate.bias is not None:
+            nn.init.constant_(self.a_gate.bias, self.bias)
+
+    def forward(self, residual: Tensor, gate_input: Tensor) -> Tensor:
+        gate_a = torch.sigmoid(self.a_gate(gate_input))
+        log_a = -8.0 * gate_a * F.softplus(self.a_param).to(dtype=gate_a.dtype)
+        return residual * torch.exp(log_a).to(dtype=residual.dtype)
+
+
 class AttentionResidualState:
     """Runtime source cache for Full or Block Attention Residuals."""
 
@@ -5092,11 +5746,14 @@ class ParcaeCausalSelfAttention(nn.Module):
         pwa_permute_size: int = 4,
         attn_preconv_kernel: int = 0,
         attn_preconv_scale_init: float = 0.05,
+        attn_out_gate: bool = False,
+        attn_out_gate_src: str = "proj",
+        gated_attn: bool = False,
+        gated_attn_init_std: float = 0.01,
         sparse_attn_gate: bool = False,
         sparse_attn_gate_window: int = 12,
         sparse_attn_gate_init_std: float = 0.0,
         sparse_attn_gate_scale: float = 1.0,
-        mlp_leaky_relu_slope: float = 0.5,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -5140,13 +5797,33 @@ class ParcaeCausalSelfAttention(nn.Module):
         self.ve_gate_channels = min(32, dim)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_id, n_layer) else None
         self.use_xsa = False
+        if int(attn_out_gate) + int(gated_attn) + int(sparse_attn_gate) > 1:
+            raise ValueError("ATTN_OUT_GATE, GATED_ATTN, and SPARSE_ATTN_GATE are mutually exclusive")
+        if attn_out_gate_src not in {"proj", "q"}:
+            raise ValueError(f"ATTN_OUT_GATE_SRC must be 'proj' or 'q', got {attn_out_gate_src!r}")
         if sparse_attn_gate_window <= 0 or sparse_attn_gate_window > dim:
             raise ValueError(f"SPARSE_ATTN_GATE_WINDOW must be in [1, {dim}], got {sparse_attn_gate_window}")
         if sparse_attn_gate_init_std < 0.0:
             raise ValueError(f"SPARSE_ATTN_GATE_INIT_STD must be non-negative, got {sparse_attn_gate_init_std}")
+        if gated_attn_init_std < 0.0:
+            raise ValueError(f"GATED_ATTN_INIT_STD must be non-negative, got {gated_attn_init_std}")
+        self.attn_out_gate = attn_out_gate
+        self.attn_out_gate_src = attn_out_gate_src
+        self.gated_attn = gated_attn
         self.sparse_attn_gate = sparse_attn_gate
         self.sparse_attn_gate_window = sparse_attn_gate_window
         self.sparse_attn_gate_scale = sparse_attn_gate_scale
+        if attn_out_gate:
+            self.attn_gate_proj = CastedLinear(sparse_attn_gate_window, num_heads, bias=False)
+            self.attn_gate_proj._zero_init = True
+            nn.init.zeros_(self.attn_gate_proj.weight)
+        if gated_attn:
+            gate_w = torch.empty(num_heads, dim, dtype=torch.float32)
+            if gated_attn_init_std > 0.0:
+                nn.init.normal_(gate_w, mean=0.0, std=gated_attn_init_std)
+            else:
+                nn.init.zeros_(gate_w)
+            self.attn_gate_w = nn.Parameter(gate_w)
         if sparse_attn_gate:
             gate_w = torch.empty(num_heads, sparse_attn_gate_window, dtype=torch.float32)
             if sparse_attn_gate_init_std > 0.0:
@@ -5178,6 +5855,7 @@ class ParcaeCausalSelfAttention(nn.Module):
     def forward(self, x: Tensor, freqs_cos: Tensor, freqs_sin: Tensor, mask: Tensor | None = None, **kwargs) -> Tensor:
         bsz, seqlen, dim = x.shape
         qkv = self.qkv_proj(x)
+        q_gate_src: Tensor | None = None
         ve = kwargs.get('ve')
         use_fused_qkv_postprocess = (
             self.fused_qkv_postprocess
@@ -5206,11 +5884,15 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = qkv[:, :, : self.n_head]
             k = qkv[:, :, self.n_head : self.n_head + self.n_kv_head]
             v = qkv[:, :, self.n_head + self.n_kv_head :]
+            q_gate_src = q.reshape(bsz, seqlen, self.q_dim)
         else:
             q, k, v = qkv.split((self.q_dim, self.kv_dim, self.kv_dim), dim=-1)
+            q_gate_src = q
             q = q.view(bsz, seqlen, self.n_head, self.head_dim)
             k = k.view(bsz, seqlen, self.n_kv_head, self.head_dim)
             v = v.view(bsz, seqlen, self.n_kv_head, self.head_dim)
+        if q_gate_src is None:
+            q_gate_src = q.reshape(bsz, seqlen, self.q_dim)
 
         if ve is not None and self.ve_gate is not None:
             ve = ve.view(bsz, seqlen, self.n_kv_head, self.head_dim)
@@ -5235,7 +5917,28 @@ class ParcaeCausalSelfAttention(nn.Module):
             q = F.rms_norm(q, (q.size(-1),))
             k = F.rms_norm(k, (k.size(-1),))
 
-        if mask is None:
+        cu_seqlens = kwargs.get("cu_seqlens")
+        if cu_seqlens is not None:
+            if mask is not None:
+                raise ValueError("cu_seqlens varlen attention is not compatible with an explicit attention mask")
+            if bsz != 1:
+                raise ValueError(f"cu_seqlens varlen attention expects batch size 1, got {bsz}")
+            if flash_attn_varlen_func is None:
+                raise RuntimeError("DOCUMENT_PACKING requires flash_attn_interface.flash_attn_varlen_func")
+            max_seqlen = int(kwargs.get("max_seqlen") or seqlen)
+            window_size = (-1, -1) if self.attention_window < 0 else (self.attention_window, 0)
+            y = flash_attn_varlen_func(
+                q.contiguous()[0],
+                k.contiguous()[0],
+                v.contiguous()[0],
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=True,
+                window_size=window_size,
+            )[None]
+        elif mask is None:
             y = flash_attn.flash_attn_func(
                 q.contiguous(),
                 k.contiguous(),
@@ -5247,16 +5950,39 @@ class ParcaeCausalSelfAttention(nn.Module):
             q_sdpa = q.transpose(1, 2)
             k_sdpa = k.transpose(1, 2)
             v_sdpa = v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(
-                q_sdpa,
-                k_sdpa,
-                v_sdpa,
-                attn_mask=mask,
-                is_causal=False,
-                enable_gqa=(self.n_kv_head != self.n_head),
-            ).transpose(1, 2)
+            try:
+                y = F.scaled_dot_product_attention(
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    attn_mask=mask,
+                    is_causal=False,
+                    enable_gqa=(self.n_kv_head != self.n_head),
+                ).transpose(1, 2)
+            except TypeError as exc:
+                if "enable_gqa" not in str(exc):
+                    raise
+                if self.n_kv_head != self.n_head:
+                    repeat = self.n_head // self.n_kv_head
+                    k_sdpa = k_sdpa.repeat_interleave(repeat, dim=1)
+                    v_sdpa = v_sdpa.repeat_interleave(repeat, dim=1)
+                y = F.scaled_dot_product_attention(
+                    q_sdpa,
+                    k_sdpa,
+                    v_sdpa,
+                    attn_mask=mask,
+                    is_causal=False,
+                ).transpose(1, 2)
         if bool(kwargs.get("use_xsa", self.use_xsa)):
             y = self._xsa_efficient(y, v)
+        if self.attn_out_gate:
+            gate_src = q_gate_src if self.attn_out_gate_src == "q" else x
+            gate_in = gate_src[..., : self.sparse_attn_gate_window].contiguous()
+            gate = 2.0 * torch.sigmoid(self.attn_gate_proj(gate_in))
+            y = y * gate[..., None]
+        if self.gated_attn:
+            gate = torch.sigmoid(F.linear(x.contiguous(), self.attn_gate_w.to(dtype=x.dtype)))
+            y = y * gate[..., None]
         if self.sparse_attn_gate:
             gate_in = x[..., : self.sparse_attn_gate_window].contiguous()
             gate = torch.sigmoid(
@@ -5298,11 +6024,19 @@ class TransformerPreNormBlock(nn.Module):
         pwa_permute_size: int = 4,
         attn_preconv_kernel: int = 0,
         attn_preconv_scale_init: float = 0.05,
+        attn_out_gate: bool = False,
+        attn_out_gate_src: str = "proj",
+        gated_attn: bool = False,
+        gated_attn_init_std: float = 0.01,
         sparse_attn_gate: bool = False,
         sparse_attn_gate_window: int = 12,
         sparse_attn_gate_init_std: float = 0.0,
         sparse_attn_gate_scale: float = 1.0,
         mlp_leaky_relu_slope: float = 0.5,
+        residual_forget_gate: bool = False,
+        residual_forget_gate_bias: float = -4.0,
+        residual_forget_min_rad: float = 0.99,
+        residual_forget_max_rad: float = 0.999,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -5333,6 +6067,10 @@ class TransformerPreNormBlock(nn.Module):
             rrhp_reduction_factor=rrhp_reduction_factor,
             pwa_num_bases=pwa_num_bases,
             pwa_permute_size=pwa_permute_size,
+            attn_out_gate=attn_out_gate,
+            attn_out_gate_src=attn_out_gate_src,
+            gated_attn=gated_attn,
+            gated_attn_init_std=gated_attn_init_std,
             sparse_attn_gate=sparse_attn_gate,
             sparse_attn_gate_window=sparse_attn_gate_window,
             sparse_attn_gate_init_std=sparse_attn_gate_init_std,
@@ -5346,6 +6084,11 @@ class TransformerPreNormBlock(nn.Module):
             self.mlp = mlp_cls(dim, hidden_dim)
         self.attn_res_attn = AttentionResidualMixer(dim) if attn_res_enabled else None
         self.attn_res_mlp = AttentionResidualMixer(dim) if attn_res_enabled else None
+        self.residual_forget = (
+            ResidualForgetGate(dim, residual_forget_gate_bias, residual_forget_min_rad, residual_forget_max_rad)
+            if residual_forget_gate
+            else None
+        )
         if record_residual:
             self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
             self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -5371,17 +6114,38 @@ class TransformerPreNormBlock(nn.Module):
             mlp_scale = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :]
             if self.parallel_residual:
                 mlp_out = self.mlp(self.norm_2(x_in) * self.ln_scale_factor)
-                return x_in + attn_scale * attn_out + mlp_scale * mlp_out
-            x_out = x_in + attn_scale * attn_out
-            return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
+                if self.residual_forget is None:
+                    return x_in + attn_scale * attn_out + mlp_scale * mlp_out
+                branch = attn_scale * attn_out + mlp_scale * mlp_out
+                return self._residual_add(x_in, branch, attn_in)
+            if self.residual_forget is None:
+                x_out = x_in + attn_scale * attn_out
+                return x_out + mlp_scale * self.mlp(self.norm_2(x_out) * self.ln_scale_factor)
+            x_out = self._residual_add(x_in, attn_scale * attn_out, attn_in)
+            mlp_in = self.norm_2(x_out) * self.ln_scale_factor
+            return self._residual_add(x_out, mlp_scale * self.mlp(mlp_in), mlp_in)
         if self.parallel_residual:
             x0 = x
-            return x0 + self.attn(self._attn_input(self.norm_1(x0)), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
-        x = self.attn(self._attn_input(self.norm_1(x)), freqs_cos, freqs_sin, mask, **kwargs) + x
-        return self.mlp(self.norm_2(x)) + x
+            if self.residual_forget is None:
+                return x0 + self.attn(self._attn_input(self.norm_1(x0)), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
+            attn_in = self.norm_1(x0)
+            branch = self.attn(self._attn_input(attn_in), freqs_cos, freqs_sin, mask, **kwargs) + self.mlp(self.norm_2(x0))
+            return self._residual_add(x0, branch, attn_in)
+        if self.residual_forget is None:
+            x = self.attn(self._attn_input(self.norm_1(x)), freqs_cos, freqs_sin, mask, **kwargs) + x
+            return self.mlp(self.norm_2(x)) + x
+        attn_in = self.norm_1(x)
+        x = self._residual_add(x, self.attn(self._attn_input(attn_in), freqs_cos, freqs_sin, mask, **kwargs), attn_in)
+        mlp_in = self.norm_2(x)
+        return self._residual_add(x, self.mlp(mlp_in), mlp_in)
 
     def _attn_input(self, x: Tensor) -> Tensor:
         return x if self.attn_preconv is None else self.attn_preconv(x)
+
+    def _residual_add(self, residual: Tensor, branch: Tensor, gate_input: Tensor) -> Tensor:
+        if self.residual_forget is None:
+            return residual + branch
+        return self.residual_forget(residual, gate_input) + branch
 
     def forward_parallel_delayed(
         self,
@@ -5404,6 +6168,8 @@ class TransformerPreNormBlock(nn.Module):
         norm_source = residual.to(dtype=hidden_states1.dtype) if residual_in_fp32 else residual
         normed1 = self.norm_1(norm_source)
         normed2 = normed1 if tied_norm else self.norm_2(norm_source)
+        if self.residual_forget is not None:
+            residual = self.residual_forget(residual, normed1)
         hidden_states1 = self.attn(self._attn_input(normed1), freqs_cos, freqs_sin, mask, **kwargs)
         hidden_states2 = self.mlp(normed2)
         return hidden_states1, hidden_states2, residual
@@ -5517,6 +6283,7 @@ class GPT(nn.Module):
         self.tie_embeddings = h.tie_embeddings
         self.tied_embed_init_std = h.tied_embed_init_std
         self.logit_softcap = h.logit_softcap
+        self.rope_base = h.rope_base
         self.block_size = h.train_seq_len
         self.outer_dim = h.model_dim
         self.recurrent_dim = h.recurrent_dim
@@ -5531,6 +6298,7 @@ class GPT(nn.Module):
         self.sampling_scheme = h.sampling_scheme
         self.curriculum_target = h.curriculum_target
         self.residual_mode = h.residual_mode
+        self.unet_skip_enabled = h.unet_skip_enabled
         self.parallel_residual_scope = h.parallel_residual_scope
         self.parallel_residual_start = h.parallel_residual_start
         self.parallel_residual_impl = h.parallel_residual_impl
@@ -5560,6 +6328,7 @@ class GPT(nn.Module):
         self.logit_scale = h.logit_scale
         self.liger_ce = h.liger_ce
         self.liger_fused_ce = h.liger_fused_ce
+        self.fused_softcapped_ce = h.fused_softcapped_ce
         self.poe_num_experts = h.poe_num_experts
         self.xsa_last_n = h.xsa_last_n
         self.attn_qkv_mode = h.attn_qkv_mode
@@ -5676,13 +6445,25 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                attn_out_gate=h.attn_out_gate,
+                attn_out_gate_src=h.attn_out_gate_src,
+                gated_attn=h.gated_attn,
+                gated_attn_init_std=h.gated_attn_init_std,
                 sparse_attn_gate=h.sparse_attn_gate,
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
                 mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
+                residual_forget_gate=h.residual_forget_gate,
+                residual_forget_gate_bias=h.residual_forget_gate_bias,
+                residual_forget_min_rad=h.residual_forget_min_rad,
+                residual_forget_max_rad=h.residual_forget_max_rad,
             )
             for i in range(self.n_layers_in_prelude)
+        )
+        self.num_unet_skips = min(self.n_layers_in_prelude, self.n_layers_in_coda) if self.unet_skip_enabled else 0
+        self.unet_skip_weights = nn.Parameter(
+            torch.full((self.num_unet_skips, self.outer_dim), float(h.unet_skip_init), dtype=torch.float32),
         )
         self.adapter = _get_injection_method(
             h.injection_type,
@@ -5726,11 +6507,19 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                attn_out_gate=h.attn_out_gate,
+                attn_out_gate_src=h.attn_out_gate_src,
+                gated_attn=h.gated_attn,
+                gated_attn_init_std=h.gated_attn_init_std,
                 sparse_attn_gate=h.sparse_attn_gate,
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
                 mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
+                residual_forget_gate=h.residual_forget_gate,
+                residual_forget_gate_bias=h.residual_forget_gate_bias,
+                residual_forget_min_rad=h.residual_forget_min_rad,
+                residual_forget_max_rad=h.residual_forget_max_rad,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -5776,11 +6565,19 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                attn_out_gate=h.attn_out_gate,
+                attn_out_gate_src=h.attn_out_gate_src,
+                gated_attn=h.gated_attn,
+                gated_attn_init_std=h.gated_attn_init_std,
                 sparse_attn_gate=h.sparse_attn_gate,
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
                 mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
+                residual_forget_gate=h.residual_forget_gate,
+                residual_forget_gate_bias=h.residual_forget_gate_bias,
+                residual_forget_min_rad=h.residual_forget_min_rad,
+                residual_forget_max_rad=h.residual_forget_max_rad,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -5825,6 +6622,12 @@ class GPT(nn.Module):
         self.register_buffer('recurrent_freqs_sin', recurrent_freqs_sin, persistent=False)
         self._init_weights()
         self.refresh_qat_modules()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        skip_key = prefix + "unet_skip_weights"
+        if skip_key in state_dict and state_dict[skip_key].shape != self.unet_skip_weights.shape:
+            state_dict.pop(skip_key)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def set_training_step(self, step: int) -> None:
         self.step = step
@@ -5906,12 +6709,23 @@ class GPT(nn.Module):
         input_ids: Tensor,
         base_layer_id: int = 0,
         total_depth: int | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
     ) -> Tensor:
         state = AttentionResidualState(x, self.attn_res_mode, self.attn_res_block_size)
         for i, block in enumerate(blocks):
             ve = self._embedding(value_embeds[str(i)], input_ids) if str(i) in value_embeds else None
             use_xsa = self._use_xsa_for_effective_layer(base_layer_id + i, total_depth)
-            x = block.forward_attn_res(state, freqs_cos, freqs_sin, mask, ve=ve, use_xsa=use_xsa)
+            x = block.forward_attn_res(
+                state,
+                freqs_cos,
+                freqs_sin,
+                mask,
+                ve=ve,
+                use_xsa=use_xsa,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         return x
 
     def _use_delayed_parallel_stack(self, blocks: nn.ModuleList) -> bool:
@@ -5938,6 +6752,8 @@ class GPT(nn.Module):
         input_ids: Tensor,
         base_layer_id: int = 0,
         total_depth: int | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
     ) -> Tensor:
         output_dtype = x.dtype
         hidden_states1 = x
@@ -5957,6 +6773,8 @@ class GPT(nn.Module):
                 residual_in_fp32=self.parallel_residual_in_fp32,
                 ve=ve,
                 use_xsa=use_xsa,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
         return flush_parallel_residual_stream(hidden_states1, hidden_states2, residual, output_dtype=output_dtype)
 
@@ -5965,6 +6783,11 @@ class GPT(nn.Module):
             return False
         depth = self.expected_depth if total_depth is None else total_depth
         return layer_id >= self._xsa_start_layer(depth)
+
+    def _take_unet_skip(self, skips: list[Tensor], coda_idx: int) -> Tensor | None:
+        if not self.unet_skip_enabled or not skips or coda_idx >= self.num_unet_skips:
+            return None
+        return self.unet_skip_weights[coda_idx].to(dtype=skips[-1].dtype)[None, None, :] * skips.pop()
 
     def xsa_active_layer_ids(self, total_depth: int | None = None) -> list[int]:
         if self.xsa_last_n <= 0:
@@ -6008,13 +6831,33 @@ class GPT(nn.Module):
         labels: Tensor | None = None,
         return_logits: bool = False,
         num_steps_pair: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
     ) -> dict[str, Tensor | None]:
         qat_enabled = self._qat_active()
         seq_len = input_ids.shape[1]
-        outer_freqs_cos = self.outer_freqs_cos[:, :seq_len]
-        outer_freqs_sin = self.outer_freqs_sin[:, :seq_len]
-        recurrent_freqs_cos = self.recurrent_freqs_cos[:, :seq_len]
-        recurrent_freqs_sin = self.recurrent_freqs_sin[:, :seq_len]
+        if seq_len <= self.outer_freqs_cos.size(1):
+            outer_freqs_cos = self.outer_freqs_cos[:, :seq_len]
+            outer_freqs_sin = self.outer_freqs_sin[:, :seq_len]
+        else:
+            outer_freqs_cos, outer_freqs_sin = precompute_freqs_cos_sin(
+                self.outer_rope_dims,
+                seq_len,
+                self.rope_base,
+            )
+            outer_freqs_cos = outer_freqs_cos.to(device=input_ids.device)
+            outer_freqs_sin = outer_freqs_sin.to(device=input_ids.device)
+        if seq_len <= self.recurrent_freqs_cos.size(1):
+            recurrent_freqs_cos = self.recurrent_freqs_cos[:, :seq_len]
+            recurrent_freqs_sin = self.recurrent_freqs_sin[:, :seq_len]
+        else:
+            recurrent_freqs_cos, recurrent_freqs_sin = precompute_freqs_cos_sin(
+                max(self.recurrent_layer_rope_dims),
+                seq_len,
+                self.rope_base,
+            )
+            recurrent_freqs_cos = recurrent_freqs_cos.to(device=input_ids.device)
+            recurrent_freqs_sin = recurrent_freqs_sin.to(device=input_ids.device)
 
         input_embeds = self._embedding(self.tok_emb, input_ids)
         if self.bigram_hash is not None:
@@ -6025,6 +6868,17 @@ class GPT(nn.Module):
         self._current_input_ids = input_ids
 
         x = input_embeds
+        unet_skips: list[Tensor] = []
+        if self.unet_skip_enabled and (
+            self._attn_res_enabled_for("prelude")
+            or self._use_delayed_parallel_stack(self.prelude)
+            or self._attn_res_enabled_for("coda")
+            or self._use_delayed_parallel_stack(self.coda)
+        ):
+            raise RuntimeError(
+                "UNET_SKIP_ENABLED=1 requires per-block prelude/coda execution; "
+                "it is not wired for prelude/coda Attention Residuals or delayed parallel residuals"
+            )
         if self._attn_res_enabled_for("prelude"):
             x = self._forward_attn_res_stack(
                 self.prelude,
@@ -6034,6 +6888,8 @@ class GPT(nn.Module):
                 None,
                 self.prelude_value_embeds,
                 input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
         elif self._use_delayed_parallel_stack(self.prelude):
             x = self._forward_delayed_parallel_stack(
@@ -6044,12 +6900,26 @@ class GPT(nn.Module):
                 None,
                 self.prelude_value_embeds,
                 input_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
         else:
             for i, block in enumerate(self.prelude):
                 ve = self._embedding(self.prelude_value_embeds[str(i)], input_ids) if str(i) in self.prelude_value_embeds else None
                 use_xsa = self._use_xsa_for_effective_layer(i)
-                x = block(x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                x = block(
+                    x,
+                    outer_freqs_cos,
+                    outer_freqs_sin,
+                    None,
+                    x0=input_embeds,
+                    ve=ve,
+                    use_xsa=use_xsa,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                if self.unet_skip_enabled and len(unet_skips) < self.num_unet_skips:
+                    unet_skips.append(x)
 
         if self.prelude_norm_layer is not None:
             x = self.prelude_norm_layer(x)
@@ -6060,6 +6930,8 @@ class GPT(nn.Module):
             recurrent_freqs_sin,
             None,
             num_steps_pair,
+            cu_seqlens,
+            max_seqlen,
         )
         x_rec_output = x
         x = self.project_out(x)
@@ -6077,6 +6949,8 @@ class GPT(nn.Module):
                 input_ids,
                 base_layer_id=coda_layer_offset,
                 total_depth=total_depth_int,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
         elif self._use_delayed_parallel_stack(self.coda):
             x = self._forward_delayed_parallel_stack(
@@ -6089,15 +6963,41 @@ class GPT(nn.Module):
                 input_ids,
                 base_layer_id=coda_layer_offset,
                 total_depth=total_depth_int,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
             )
         else:
             for i, block in enumerate(self.coda):
+                skip = self._take_unet_skip(unet_skips, i)
+                if skip is not None:
+                    x = x + skip
                 ve = self._embedding(self.coda_value_embeds[str(i)], input_ids) if str(i) in self.coda_value_embeds else None
                 use_xsa = self._use_xsa_for_effective_layer(coda_layer_offset + i, total_depth_int)
                 if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(block, x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                    x = self._checkpoint(
+                        block,
+                        x,
+                        outer_freqs_cos,
+                        outer_freqs_sin,
+                        None,
+                        x0=input_embeds,
+                        ve=ve,
+                        use_xsa=use_xsa,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
                 else:
-                    x = block(x, outer_freqs_cos, outer_freqs_sin, None, x0=input_embeds, ve=ve, use_xsa=use_xsa)
+                    x = block(
+                        x,
+                        outer_freqs_cos,
+                        outer_freqs_sin,
+                        None,
+                        x0=input_embeds,
+                        ve=ve,
+                        use_xsa=use_xsa,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
         if self.gradient_checkpointing and 'in-coda' in self.activation_checkpoint_impl:
             x = self._checkpoint(self.final_norm, x)
         else:
@@ -6106,7 +7006,14 @@ class GPT(nn.Module):
         if self.monitoring:
             self.monitor_module(x, x_rec_output, xk, input_embeds, num_steps_no_grad, num_steps_with_grad, x_rec_projected)
 
-        if labels is not None and self.liger_ce and self.liger_fused_ce and not return_logits and len(self.poe_heads) == 0:
+        if (
+            labels is not None
+            and self.liger_ce
+            and self.liger_fused_ce
+            and not self.fused_softcapped_ce
+            and not return_logits
+            and len(self.poe_heads) == 0
+        ):
             if self.tie_embeddings:
                 output_weight = self.tok_emb.weight
                 if (
@@ -6155,6 +7062,16 @@ class GPT(nn.Module):
         for head in self.poe_heads:
             logits_proj = logits_proj + head(x)
         logits_proj = logits_proj.float() * self.logit_scale
+        if labels is not None and self.training and self.fused_softcapped_ce and not return_logits:
+            return {
+                'loss': softcapped_cross_entropy(
+                    logits_proj.reshape(-1, logits_proj.size(-1)),
+                    labels.reshape(-1),
+                    self.logit_softcap,
+                    reduction="mean",
+                ),
+                'logits': None,
+            }
         logits = (
             self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
             if return_logits or labels is None or not self.liger_ce
@@ -6178,15 +7095,40 @@ class GPT(nn.Module):
 
         return {'loss': loss, 'logits': logits if return_logits else None}
 
-    def forward_logits(self, input_ids: Tensor, num_steps_pair: Tensor | None = None) -> Tensor:
-        out = self.forward_model(input_ids, labels=None, return_logits=True, num_steps_pair=num_steps_pair)
+    def forward_logits(
+        self,
+        input_ids: Tensor,
+        num_steps_pair: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
+    ) -> Tensor:
+        out = self.forward_model(
+            input_ids,
+            labels=None,
+            return_logits=True,
+            num_steps_pair=num_steps_pair,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
         logits = out['logits']
         if logits is None:
             raise RuntimeError('forward_logits expected logits')
         return logits
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        out = self.forward_model(input_ids, labels=target_ids, return_logits=False)
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
+    ) -> Tensor:
+        out = self.forward_model(
+            input_ids,
+            labels=target_ids,
+            return_logits=False,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
         loss = out['loss']
         if loss is None:
             raise RuntimeError('forward expected a loss tensor')
@@ -6202,8 +7144,21 @@ class GPT(nn.Module):
         step: Tensor,
         total_steps: Tensor,
         x0: Tensor,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
     ) -> Tensor:
-        return self.core_block_forward(x, input_embeds, freqs_cos, freqs_sin, mask, step, total_steps, x0)
+        return self.core_block_forward(
+            x,
+            input_embeds,
+            freqs_cos,
+            freqs_sin,
+            mask,
+            step,
+            total_steps,
+            x0,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
     def iterate_forward(
@@ -6213,6 +7168,8 @@ class GPT(nn.Module):
         freqs_sin: Tensor,
         mask: Tensor | None,
         num_steps_pair: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int = 0,
     ):
         x = self.initialize_state(input_embeds)
         x0 = x
@@ -6256,21 +7213,21 @@ class GPT(nn.Module):
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
             for step in range(num_steps_with_grad_int):
                 xk = x
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
                 else:
-                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
         else:
             with torch.no_grad():
                 for step in range(num_steps_no_grad_int):
                     xk = x
                     active_mask = step < n_per_sample
                     step_t = torch.tensor(step, device=input_embeds.device)
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
                     mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                     x = torch.where(mask_expanded, x_new, x)
             for step in range(num_steps_with_grad_int):
@@ -6278,9 +7235,9 @@ class GPT(nn.Module):
                 active_mask = step < k_per_sample
                 step_t = torch.tensor(num_steps_no_grad_int + step, device=input_embeds.device)
                 if self.gradient_checkpointing and 'per-iteration' in self.activation_checkpoint_impl:
-                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x_new = self._checkpoint(self.update_recurrent_state, xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
                 else:
-                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0)
+                    x_new = self.update_recurrent_state(xk, input_embeds, freqs_cos, freqs_sin, mask, step_t, total_steps, x0, cu_seqlens, max_seqlen)
                 mask_expanded = active_mask[..., None] if per_token else active_mask[:, None, None]
                 x = torch.where(mask_expanded, x_new, x)
 
@@ -6313,14 +7270,37 @@ class GPT(nn.Module):
                     mask,
                     self.core_value_embeds,
                     input_ids,
+                    cu_seqlens=kwargs.get("cu_seqlens"),
+                    max_seqlen=int(kwargs.get("max_seqlen") or 0),
                 )
             else:
                 for layer_idx, block in enumerate(self.core_block):
                     ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
                     if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                        x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
+                        x = self._checkpoint(
+                            block,
+                            x,
+                            freqs_cos,
+                            freqs_sin,
+                            mask,
+                            x0=x0,
+                            ve=ve,
+                            use_xsa=False,
+                            cu_seqlens=kwargs.get("cu_seqlens"),
+                            max_seqlen=int(kwargs.get("max_seqlen") or 0),
+                        )
                     else:
-                        x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=False)
+                        x = block(
+                            x,
+                            freqs_cos,
+                            freqs_sin,
+                            mask,
+                            x0=x0,
+                            ve=ve,
+                            use_xsa=False,
+                            cu_seqlens=kwargs.get("cu_seqlens"),
+                            max_seqlen=int(kwargs.get("max_seqlen") or 0),
+                        )
             return x
         step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
         total_steps_int = int(total_steps.item()) if isinstance(total_steps, torch.Tensor) else int(total_steps)
@@ -6337,6 +7317,8 @@ class GPT(nn.Module):
                 input_ids,
                 base_layer_id=base_layer_id,
                 total_depth=total_depth_int,
+                cu_seqlens=kwargs.get("cu_seqlens"),
+                max_seqlen=int(kwargs.get("max_seqlen") or 0),
             )
         if self._use_delayed_parallel_stack(self.core_block):
             return self._forward_delayed_parallel_stack(
@@ -6349,14 +7331,37 @@ class GPT(nn.Module):
                 input_ids,
                 base_layer_id=base_layer_id,
                 total_depth=total_depth_int,
+                cu_seqlens=kwargs.get("cu_seqlens"),
+                max_seqlen=int(kwargs.get("max_seqlen") or 0),
             )
         for layer_idx, block in enumerate(self.core_block):
             ve = self._embedding(self.core_value_embeds[str(layer_idx)], input_ids) if str(layer_idx) in self.core_value_embeds else None
             use_xsa = self._use_xsa_for_effective_layer(base_layer_id + layer_idx, total_depth_int)
             if self.gradient_checkpointing and 'per-block' in self.activation_checkpoint_impl:
-                x = self._checkpoint(block, x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=use_xsa)
+                x = self._checkpoint(
+                    block,
+                    x,
+                    freqs_cos,
+                    freqs_sin,
+                    mask,
+                    x0=x0,
+                    ve=ve,
+                    use_xsa=use_xsa,
+                    cu_seqlens=kwargs.get("cu_seqlens"),
+                    max_seqlen=int(kwargs.get("max_seqlen") or 0),
+                )
             else:
-                x = block(x, freqs_cos, freqs_sin, mask, x0=x0, ve=ve, use_xsa=use_xsa)
+                x = block(
+                    x,
+                    freqs_cos,
+                    freqs_sin,
+                    mask,
+                    x0=x0,
+                    ve=ve,
+                    use_xsa=use_xsa,
+                    cu_seqlens=kwargs.get("cu_seqlens"),
+                    max_seqlen=int(kwargs.get("max_seqlen") or 0),
+                )
         return x
 
     @torch._dynamo.disable(recursive=False)  # type: ignore[attr-defined]
@@ -6565,6 +7570,14 @@ def main() -> None:
         raise ValueError(f"RANS_INT6=1 requires QUANT_BITS=6, got {args.quant_bits}")
     if args.rans_int6 and args.mixed_quant_bits:
         raise ValueError("RANS_INT6=1 is not compatible with MIXED_QUANT_BITS=1")
+    if args.lqer_rank < 0:
+        raise ValueError(f"LQER_RANK must be non-negative, got {args.lqer_rank}")
+    if args.lqer_top_k < 0:
+        raise ValueError(f"LQER_TOP_K must be non-negative, got {args.lqer_top_k}")
+    if args.lqer_factor_bits < 2 or args.lqer_factor_bits > 8:
+        raise ValueError(f"LQER_FACTOR_BITS must be in [2, 8], got {args.lqer_factor_bits}")
+    if args.lqer_asym_group <= 0:
+        raise ValueError(f"LQER_ASYM_GROUP must be positive, got {args.lqer_asym_group}")
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
     if args.liger_rope and LigerRopeFunction is None:
@@ -6579,6 +7592,15 @@ def main() -> None:
     if args.fused_qkv_postprocess:
         if _fused_qkv_postprocess_fwd_kernel is None:
             raise RuntimeError("FUSED_QKV_POSTPROCESS=1 requires Triton")
+    if args.fused_softcapped_ce and _softcapped_ce_fwd_kernel is None:
+        raise RuntimeError("FUSED_SOFTCAPPED_CE=1 requires Triton")
+    if args.document_packing:
+        if args.document_packing_cu_bucket_size <= 0:
+            raise ValueError(
+                f"DOCUMENT_PACKING_CU_BUCKET_SIZE must be positive, got {args.document_packing_cu_bucket_size}"
+            )
+        if flash_attn_varlen_func is None:
+            raise RuntimeError("DOCUMENT_PACKING=1 requires flash_attn_interface.flash_attn_varlen_func")
     if "NUM_LAYERS" in os.environ:
         raise ValueError("NUM_LAYERS is ignored by train_gpt_parcae.py; use N_LAYERS_IN_PRELUDE, N_LAYERS_IN_RECURRENT_BLOCK, and N_LAYERS_IN_CODA")
     if "QK_GAIN_INIT" in os.environ:
@@ -6589,6 +7611,12 @@ def main() -> None:
         raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
     if args.poe_head_lr < 0:
         raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
+    if int(args.attn_out_gate) + int(args.gated_attn) + int(args.sparse_attn_gate) > 1:
+        raise ValueError("ATTN_OUT_GATE, GATED_ATTN, and SPARSE_ATTN_GATE are mutually exclusive")
+    if args.attn_out_gate_src not in {"proj", "q"}:
+        raise ValueError(f"ATTN_OUT_GATE_SRC must be 'proj' or 'q', got {args.attn_out_gate_src!r}")
+    if args.gated_attn_init_std < 0.0:
+        raise ValueError(f"GATED_ATTN_INIT_STD must be non-negative, got {args.gated_attn_init_std}")
     if args.sparse_attn_gate_window <= 0:
         raise ValueError(f"SPARSE_ATTN_GATE_WINDOW must be positive, got {args.sparse_attn_gate_window}")
     if args.sparse_attn_gate_init_std < 0.0:
@@ -6611,6 +7639,13 @@ def main() -> None:
         raise ValueError(f"SWA_DYNAMIC_WEIGHT_MAX must be >= 1, got {args.swa_dynamic_weight_max}")
     if args.residual_mode not in {"sequential", "parallel"}:
         raise ValueError(f"RESIDUAL_MODE must be sequential or parallel, got {args.residual_mode!r}")
+    if args.unet_skip_init < 0.0:
+        raise ValueError(f"UNET_SKIP_INIT must be non-negative, got {args.unet_skip_init}")
+    if not (0.0 < args.residual_forget_min_rad <= args.residual_forget_max_rad < 1.0):
+        raise ValueError(
+            "RESIDUAL_FORGET_MIN_RAD/MAX_RAD must satisfy 0 < min <= max < 1; "
+            f"got min={args.residual_forget_min_rad} max={args.residual_forget_max_rad}"
+        )
     if args.parallel_residual_scope not in {"none", "core", "all"}:
         raise ValueError(
             "PARALLEL_RESIDUAL_SCOPE must be none, core, or all; "
@@ -6738,6 +7773,10 @@ def main() -> None:
     if args.gptq_enabled:
         if args.gptq_calibration_batches <= 0:
             raise ValueError("GPTQ_CALIBRATION_BATCHES must be positive when GPTQ_ENABLED=1")
+        if args.gptq_calibration_mode not in {"stream", "shuffled"}:
+            raise ValueError(
+                f"GPTQ_CALIBRATION_MODE must be stream or shuffled, got {args.gptq_calibration_mode!r}"
+            )
         if args.gptq_reserve_seconds < 0.0:
             raise ValueError("GPTQ_RESERVE_SECONDS must be non-negative when GPTQ_ENABLED=1")
         if args.gptq_blocksize <= 0:
@@ -7005,6 +8044,8 @@ def main() -> None:
         f"scale_init:{args.attn_preconv_scale_init:g} lr:{args.attn_preconv_lr:g}"
     )
     log0(
+        f"attn_out_gate:{int(args.attn_out_gate)} src:{args.attn_out_gate_src} "
+        f"gated_attn:{int(args.gated_attn)} gated_init_std:{args.gated_attn_init_std:g} "
         f"sparse_attn_gate:{int(args.sparse_attn_gate)} "
         f"window:{args.sparse_attn_gate_window} "
         f"init_std:{args.sparse_attn_gate_init_std:g} "
@@ -7024,18 +8065,24 @@ def main() -> None:
         f"parcae:prelude:{args.n_layers_in_prelude} core:{args.n_layers_in_recurrent_block} coda:{args.n_layers_in_coda} "
         f"recurrent_dim:{args.recurrent_dim} recurrence:{args.mean_recurrence}/{args.mean_backprop_depth} "
         f"iteration:{args.recurrent_iteration_method} sampling:{args.sampling_scheme} injection:{args.injection_type} "
+        f"unet_skip:{args.unet_skip_enabled} unet_skip_init:{args.unet_skip_init:g} "
         f"residual_mode:{args.residual_mode} "
         f"parallel_residual_scope:{args.parallel_residual_scope} parallel_residual_start:{args.parallel_residual_start} "
         f"parallel_residual_ln_scale:{args.parallel_residual_ln_scale} parallel_residual_impl:{args.parallel_residual_impl} "
         f"parallel_residual_record_controls:{args.parallel_residual_record_controls} "
         f"parallel_residual_tied_norm:{args.parallel_residual_tied_norm} "
         f"parallel_residual_in_fp32:{args.parallel_residual_in_fp32} "
+        f"residual_forget_gate:{args.residual_forget_gate} "
+        f"residual_forget_gate_bias:{args.residual_forget_gate_bias:g} "
+        f"residual_forget_radius:{args.residual_forget_min_rad:g}-{args.residual_forget_max_rad:g} "
         f"attn_res_mode:{args.attn_res_mode} attn_res_scope:{args.attn_res_scope} "
         f"attn_res_block_size:{args.attn_res_block_size}"
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
     log0(
         f"liger_ce:enabled:{args.liger_ce} fused:{args.liger_fused_ce} "
+        f"fused_softcapped_ce:{args.fused_softcapped_ce} "
+        f"triton_softcapped_available:{_softcapped_ce_fwd_kernel is not None} "
         f"real_liger_available:{LigerCrossEntropyLoss is not None} "
         f"real_liger_fused_available:{LigerFusedLinearCrossEntropyLoss is not None}"
     )
@@ -7069,7 +8116,7 @@ def main() -> None:
         f"poe_head_lr:{args.poe_head_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_steps:{args.muon_backend_steps} muon_wd:{args.muon_wd} "
-        f"muon_row_normalize:{args.muon_row_normalize}"
+        f"muon_row_normalize:{args.muon_row_normalize} muon_ns_coeffs:{args.muon_ns_coeffs}"
     )
     log0(
         f"qat:bits:{args.qat_bits} start_step:{args.qat_start_step} "
@@ -7086,9 +8133,14 @@ def main() -> None:
     log0(f"grouped_artifact:{args.grouped_artifact}")
     log0(
         f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
+        f"calibration_mode:{args.gptq_calibration_mode} "
         f"reserve_seconds:{args.gptq_reserve_seconds:g} blocksize:{args.gptq_blocksize} "
         f"dampening:{args.gptq_dampening:g} act_order:{args.gptq_act_order} "
         f"quantize_embeddings:{args.gptq_quantize_embeddings}"
+    )
+    log0(
+        f"lqer:enabled:{args.lqer_enabled} rank:{args.lqer_rank} top_k:{args.lqer_top_k} "
+        f"factor_bits:{args.lqer_factor_bits} asym:{args.lqer_asym_enabled} asym_group:{args.lqer_asym_group}"
     )
     log0(f"save_raw_model:{args.save_raw_model}")
     log0(
@@ -7096,7 +8148,8 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
-        f"eval_max_wallclock_seconds:{args.eval_max_wallclock_seconds:.3f}"
+        f"eval_max_wallclock_seconds:{args.eval_max_wallclock_seconds:.3f} "
+        f"document_packing:{args.document_packing} cu_bucket:{args.document_packing_cu_bucket_size}"
     )
     log0(
         f"weight_average:ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay:g} "
@@ -7139,7 +8192,21 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    if args.document_packing and flash_attn_varlen_func is None:
+        raise RuntimeError("DOCUMENT_PACKING=1 requires flash_attn_interface.flash_attn_varlen_func")
+
+    def make_train_loader():
+        if args.document_packing:
+            return DocumentPackingLoader(args, rank, world_size, device)
+        return DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    train_loader = make_train_loader()
+
+    def next_train_batch() -> tuple[Tensor, Tensor, Tensor | None, int]:
+        if args.document_packing:
+            return train_loader.next_batch(args.train_batch_tokens, grad_accum_steps)
+        x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+        return x, y, None, 0
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -7193,9 +8260,9 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y, cu_seqlens, max_seqlen = next_train_batch()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -7213,7 +8280,7 @@ def main() -> None:
         base_model.set_training_step(0)
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = make_train_loader()
         torch.cuda.synchronize()
         training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
         log0(f"warmup_time:{training_time_ms:.0f}ms counted_in_train_budget:1")
@@ -7272,9 +8339,9 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y, cu_seqlens, max_seqlen = next_train_batch()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
