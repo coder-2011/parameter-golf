@@ -27,7 +27,7 @@ echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
 # ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
-# SP8192 CaseOps 300s — Simple baseline + larger dim
+# SP8192 CaseOps 300s — HEAD architecture but with MEAN_RECURRENCE=1
 export RESIDUAL_MODE=sequential
 export MUON_MOMENTUM=0.85
 export GPTQ_ENABLED=0
@@ -40,27 +40,30 @@ export TOKENIZER_PATH="./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_
 export VOCAB_SIZE=8192
 export MODEL_DIM=384
 export RECURRENT_DIM=384
-export NUM_HEADS=4
-export NUM_KV_HEADS=2
-export RECURRENT_NUM_HEADS=4
+export RECURRENT_INTERMEDIATE_DIM=512
+export NUM_HEADS=8
+export NUM_KV_HEADS=4
+export RECURRENT_NUM_HEADS=8
 export N_LAYERS_IN_PRELUDE=1
 export N_LAYERS_IN_RECURRENT_BLOCK=3
-export N_LAYERS_IN_CODA=2
-export TRAIN_BATCH_TOKENS=131072
+export N_LAYERS_IN_CODA=3
+export MLP_MULT=4
 export GRAD_ACCUM_STEPS=8
 export EVAL_SEQ_LEN=1000
 export EMBED_LR=0.12
 export ROPE_BASE=10000
 export QK_NORM=1
-export LIGER_ROPE=0
+export LIGER_ROPE=1
 export FUSED_QKV_POSTPROCESS=0
 export LIGER_FUSED_CE=1
 export FUSED_SOFTCAPPED_CE=0
 export DOCUMENT_PACKING=0
 export ROPE_DIMS=32
+export BIGRAM_HASH_HEADS=4
 export TIE_EMBEDDINGS=1
-export MLP_CLASS_NAME=BaseMLP
-export RECURRENT_MLP_CLASS_NAME=BaseMLP
+export MLP_CLASS_NAME=FusedLeakyReLUSqMLP
+export RECURRENT_MLP_CLASS_NAME=FusedLeakyReLUSqMLP
+export MLP_LEAKY_RELU_SLOPE=0.5
 export POE_NUM_EXPERTS=1
 export CODA_MOE_NUM_EXPERTS=0
 export MUON_WD=0.105
@@ -70,10 +73,6 @@ export SWA_START_STEP=9999
 export GROUPED_ARTIFACT=1
 export SPARSE_ATTN_GATE=0
 export RESIDUAL_FORGET_GATE=0
-export BIGRAM_HASH_BUCKETS=8192
-export BIGRAM_HASH_DIM=128
-export BIGRAM_HASH_HEADS=4
-export BIGRAM_HASH_GATE=1
 export MEAN_RECURRENCE=1
 # ======================================================
 # ======================================================

@@ -24,7 +24,21 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+except ImportError:
+    def flash_attn_3_func(q: Tensor, k: Tensor, v: Tensor, causal: bool = True) -> Tensor:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=causal,
+            enable_gqa=q.size(1) != k.size(1),
+        )
+        return y.transpose(1, 2)
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -67,6 +81,8 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
     mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
     mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
@@ -1034,7 +1050,11 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = (
+        torch.compile(base_model.forward_logits, dynamic=False, fullgraph=args.compile_fullgraph)
+        if args.compile_model
+        else base_model.forward_logits
+    )
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1659,7 +1679,11 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = (
+        torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
+        if args.compile_model
+        else base_model
+    )
     model = compiled_model
 
     # Optimizer split:
@@ -2082,7 +2106,11 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = (
+        torch.compile(eval_model, dynamic=False, fullgraph=args.compile_fullgraph)
+        if args.compile_model
+        else eval_model
+    )
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(

@@ -200,7 +200,7 @@ defaults.
 | `GATED_ATTN_INIT_STD` | `0.01` | Non-negative init std. |
 | `SPARSE_ATTN_GATE` | `1` | Active attention gate in the checked-in experiment block. |
 | `FUSED_SOFTCAPPED_CE` | `0` | Requires Triton; off until benchmarked against Liger CE here. |
-| `FUSED_QKV_POSTPROCESS` | `1` | Active in the experiment block; verify throughput on the active path. |
+| `FUSED_QKV_POSTPROCESS` | `0` | Disabled in the experiment block; current Liger/SDPA path is faster on this setup. |
 | `DOCUMENT_PACKING` | `0` | Requires `flash_attn_interface.flash_attn_varlen_func`. |
 | `DOCUMENT_PACKING_CU_BUCKET_SIZE` | `64` | Positive bucket size required. |
 | `GPTQ_CALIBRATION_MODE` | `stream` | Alternative `shuffled` is available for GPTQ experiments. |
@@ -422,7 +422,7 @@ Known result:
 | `LIGER_CE` | `1` | Use Liger CE where possible. |
 | `LIGER_FUSED_CE` | `1` | Use fused Liger linear CE when the path supports it. |
 | `FUSED_SOFTCAPPED_CE` | `0` | Custom Triton softcapped CE disabled by default. |
-| `FUSED_QKV_POSTPROCESS` | `1` | Active in the experiment block. |
+| `FUSED_QKV_POSTPROCESS` | `0` | Disabled in the experiment block. |
 | `TRIDAO_PACKED_ROPE` | `0` | Disabled in autoresearch. |
 
 Liger CE may graph-break or fall back around compiled paths. The current CE

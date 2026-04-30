@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export RUN_ID=${RUN_ID:-top_record_adapt_sp1024_11l_xsaall_gptq_ttt_20260430}
+export DATA_PATH=${DATA_PATH:-/workspace/parameter-golf/data/datasets/fineweb10B_sp1024}
+export TOKENIZER_PATH=${TOKENIZER_PATH:-/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model}
+export VOCAB_SIZE=${VOCAB_SIZE:-1024}
+
+# Local adaptation of the 2026-03-25 top record for a single RTX PRO 4500.
+# The original record used 8xH100, FA3, parameter banking, AR self-generated
+# GPTQ calibration, and a 2048-token context. This wrapper keeps the high-value
+# recipe components available in train_gpt_parcae.py while reducing batch/context
+# so the run fits 32GB VRAM.
+export MAX_WALLCLOCK_SECONDS=${MAX_WALLCLOCK_SECONDS:-600}
+export ITERATIONS=${ITERATIONS:-1000000}
+export WARMUP_STEPS=${WARMUP_STEPS:-200}
+export WARMDOWN_ITERS=${WARMDOWN_ITERS:-4000}
+export TRAIN_LOG_EVERY=${TRAIN_LOG_EVERY:-100}
+export VAL_LOSS_EVERY=${VAL_LOSS_EVERY:-0}
+
+export MODEL_DIM=${MODEL_DIM:-512}
+export NUM_HEADS=${NUM_HEADS:-8}
+export NUM_KV_HEADS=${NUM_KV_HEADS:-4}
+export MLP_MULT=${MLP_MULT:-3}
+export N_LAYERS_IN_PRELUDE=${N_LAYERS_IN_PRELUDE:-5}
+export N_LAYERS_IN_RECURRENT_BLOCK=${N_LAYERS_IN_RECURRENT_BLOCK:-1}
+export N_LAYERS_IN_CODA=${N_LAYERS_IN_CODA:-5}
+export RECURRENT_DIM=${RECURRENT_DIM:-512}
+export RECURRENT_INTERMEDIATE_DIM=${RECURRENT_INTERMEDIATE_DIM:-1536}
+export RECURRENT_NUM_HEADS=${RECURRENT_NUM_HEADS:-8}
+export MEAN_RECURRENCE=${MEAN_RECURRENCE:-1}
+export MEAN_BACKPROP_DEPTH=${MEAN_BACKPROP_DEPTH:-1}
+export STATE_INIT=${STATE_INIT:-like-init}
+
+export TRAIN_BATCH_TOKENS=${TRAIN_BATCH_TOKENS:-32768}
+export TRAIN_SEQ_LEN=${TRAIN_SEQ_LEN:-512}
+export EVAL_SEQ_LEN=${EVAL_SEQ_LEN:-512}
+export VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-65536}
+export GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
+
+export COMPILE_MODEL=${COMPILE_MODEL:-1}
+export COMPILE_MUON_BACKEND=${COMPILE_MUON_BACKEND:-1}
+export LIGER_CE=${LIGER_CE:-1}
+export LIGER_FUSED_CE=${LIGER_FUSED_CE:-1}
+export TRIDAO_PACKED_ROPE=${TRIDAO_PACKED_ROPE:-1}
+export ROPE_DIMS=${ROPE_DIMS:-16}
+export QK_NORM=${QK_NORM:-1}
+export LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30.0}
+export MLP_CLASS_NAME=${MLP_CLASS_NAME:-FusedLeakyReLUSqMLP}
+export MLP_LEAKY_RELU_SLOPE=${MLP_LEAKY_RELU_SLOPE:-0.5}
+
+export RESIDUAL_MODE=${RESIDUAL_MODE:-parallel}
+export PARALLEL_RESIDUAL_SCOPE=${PARALLEL_RESIDUAL_SCOPE:-all}
+export PARALLEL_RESIDUAL_IMPL=${PARALLEL_RESIDUAL_IMPL:-delayed}
+export PARALLEL_RESIDUAL_RECORD_CONTROLS=${PARALLEL_RESIDUAL_RECORD_CONTROLS:-0}
+export PARALLEL_RESIDUAL_TIED_NORM=${PARALLEL_RESIDUAL_TIED_NORM:-1}
+export PARALLEL_RESIDUAL_IN_FP32=${PARALLEL_RESIDUAL_IN_FP32:-1}
+export UNET_SKIP_ENABLED=${UNET_SKIP_ENABLED:-0}
+export XSA_LAST_N=${XSA_LAST_N:-11}
+export USE_VALUE_EMBEDDINGS=${USE_VALUE_EMBEDDINGS:-0}
+
+export BIGRAM_HASH_BUCKETS=${BIGRAM_HASH_BUCKETS:-3072}
+export BIGRAM_HASH_DIM=${BIGRAM_HASH_DIM:-112}
+export BIGRAM_HASH_HEADS=${BIGRAM_HASH_HEADS:-1}
+export BIGRAM_HASH_GATE=${BIGRAM_HASH_GATE:-0}
+export BIGRAM_HASH_SCALE_INIT=${BIGRAM_HASH_SCALE_INIT:-0.05}
+
+export EMA_ENABLED=${EMA_ENABLED:-1}
+export EMA_DECAY=${EMA_DECAY:-0.997}
+export EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
+export SWA_ENABLED=${SWA_ENABLED:-0}
+
+export MUON_WD=${MUON_WD:-0.04}
+export MUON_ROW_NORMALIZE=${MUON_ROW_NORMALIZE:-1}
+export MUON_MOMENTUM=${MUON_MOMENTUM:-0.99}
+export MUON_MOMENTUM_WARMUP_START=${MUON_MOMENTUM_WARMUP_START:-0.92}
+export MUON_MOMENTUM_WARMUP_STEPS=${MUON_MOMENTUM_WARMUP_STEPS:-1500}
+export MATRIX_LR=${MATRIX_LR:-0.025}
+export SCALAR_LR=${SCALAR_LR:-0.025}
+export TIED_EMBED_LR=${TIED_EMBED_LR:-0.035}
+export GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-0.3}
+
+# torchao is not installed in this local environment, so QAT stays off. GPTQ
+# is kept, but uses the train-stream calibration available in Parcae rather
+# than the record's AR self-generated calibration path.
+export QAT_BITS=${QAT_BITS:-0}
+export GPTQ_ENABLED=${GPTQ_ENABLED:-1}
+export GPTQ_RESERVE_SECONDS=${GPTQ_RESERVE_SECONDS:-90}
+export GPTQ_CALIBRATION_BATCHES=${GPTQ_CALIBRATION_BATCHES:-16}
+export GPTQ_CALIBRATION_MODE=${GPTQ_CALIBRATION_MODE:-stream}
+export GPTQ_BLOCKSIZE=${GPTQ_BLOCKSIZE:-128}
+export GPTQ_DAMPENING=${GPTQ_DAMPENING:-0.01}
+export GPTQ_ACT_ORDER=${GPTQ_ACT_ORDER:-1}
+export GPTQ_QUANTIZE_EMBEDDINGS=${GPTQ_QUANTIZE_EMBEDDINGS:-1}
+export QUANT_BITS=${QUANT_BITS:-6}
+export RANS_INT6=${RANS_INT6:-1}
+export GROUPED_ARTIFACT=${GROUPED_ARTIFACT:-1}
+export SAVE_RAW_MODEL=${SAVE_RAW_MODEL:-0}
+
+# Long eval budget: run the standard roundtrip, sliding-window eval, byte-context
+# mixing, and score-first TTT after the 10-minute training window.
+export SLIDING_WINDOW_ENABLED=${SLIDING_WINDOW_ENABLED:-1}
+export EVAL_STRIDE=${EVAL_STRIDE:-64}
+export PPM_ENABLED=${PPM_ENABLED:-1}
+export PPM_ORDER=${PPM_ORDER:-5}
+export PPM_SUBSET_TOKENS=${PPM_SUBSET_TOKENS:-5000000}
+export LZP_ENABLED=${LZP_ENABLED:-1}
+export LZP_SUBSET_TOKENS=${LZP_SUBSET_TOKENS:-5000000}
+export TTT_ENABLED=${TTT_ENABLED:-1}
+export TTT_LR=${TTT_LR:-0.002}
+export TTT_MOMENTUM=${TTT_MOMENTUM:-0.9}
+export TTT_EPOCHS=${TTT_EPOCHS:-3}
+export TTT_CHUNK_TOKENS=${TTT_CHUNK_TOKENS:-32768}
+export TTT_BATCH_SEQS=${TTT_BATCH_SEQS:-32}
+export TTT_GRAD_CLIP=${TTT_GRAD_CLIP:-1.0}
+
+cd /workspace/parameter-golf/runs/top_record_adapt_sp1024_11l_xsaall_gptq_ttt_20260430
+exec /workspace/parameter-golf/.venv/bin/python /workspace/parameter-golf/train_gpt_parcae.py
