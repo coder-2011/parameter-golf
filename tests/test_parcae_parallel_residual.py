@@ -105,6 +105,23 @@ def test_smear_gate_matches_shifted_blend():
     assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
 
 
+def test_smear_gate_masks_previous_token_at_bos_positions():
+    smear = pg.SmearGate(2)
+    with torch.no_grad():
+        smear.gate.zero_()
+    x = torch.arange(8, dtype=torch.float32).reshape(1, 4, 2)
+    input_ids = torch.tensor([[1, 7, 1, 9]])
+
+    actual = smear(x, input_ids=input_ids)
+
+    g = torch.sigmoid(smear.gate.to(dtype=x.dtype))[None, None, :]
+    x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+    x_prev[:, 0] = 0
+    x_prev[:, 2] = 0
+    expected = (1 - g) * x + g * x_prev
+    assert torch.allclose(actual, expected, atol=0.0, rtol=0.0)
+
+
 def test_smear_gate_is_wired_into_gpt_backward():
     torch.manual_seed(123)
     h = _tiny_h()
@@ -245,6 +262,79 @@ def test_ttt_lora_adapters_are_transparent_trainable_and_removed():
     assert not any("ttt_lora" in name for name, _ in model.named_parameters())
     model.eval()
     assert torch.allclose(model.forward_logits(input_ids, num_steps_pair=num_steps_pair), before, atol=0.0, rtol=0.0)
+
+
+def test_ttt_no_qv_mask_allows_only_k_rows_in_packed_qkv():
+    h = _tiny_h()
+    model = pg.GPT(h)
+    params = pg.install_ttt_lora_adapters(
+        model,
+        rank=2,
+        alpha=4.0,
+        min_params=0,
+        device=torch.device("cpu"),
+        mask="no_qv",
+    )
+
+    masks = pg._ttt_grad_masks(model, "no_qv")
+    qkv = model.prelude[0].attn.qkv_proj
+    weight_mask = masks[id(qkv.weight)]
+    lora_b_mask = masks[id(qkv.ttt_lora_B)]
+
+    assert params
+    assert torch.count_nonzero(weight_mask[: qkv.out_features // 2]).item() == 0
+    assert torch.count_nonzero(lora_b_mask[: qkv.out_features // 2]).item() == 0
+    assert torch.count_nonzero(weight_mask[-qkv.out_features // 4 :]).item() == 0
+    assert torch.count_nonzero(lora_b_mask[-qkv.out_features // 4 :]).item() == 0
+    assert torch.count_nonzero(weight_mask[qkv.out_features // 2 : -qkv.out_features // 4]).item() > 0
+    assert torch.count_nonzero(lora_b_mask[qkv.out_features // 2 : -qkv.out_features // 4]).item() > 0
+    pg.remove_ttt_lora_adapters(model)
+
+
+def test_eval_val_ttt_lora_branch_removes_adapters_after_smoke():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.eval_stride = 4
+    h.ttt_chunk_tokens = 16
+    h.ttt_batch_seqs = 2
+    h.ttt_epochs = 1
+    h.ttt_lora_rank = 2
+    h.ttt_lora_alpha = 4.0
+    h.ttt_lora_lr = 0.001
+    h.ttt_lora_wd = 0.0
+    h.ttt_lora_min_params = 0
+    model = pg.GPT(h)
+    val_tokens = torch.randint(0, h.vocab_size, (41,), dtype=torch.int64)
+    base_bytes_lut = torch.ones(h.vocab_size, dtype=torch.int16)
+    has_leading_space_lut = torch.zeros(h.vocab_size, dtype=torch.bool)
+    is_boundary_token_lut = torch.zeros(h.vocab_size, dtype=torch.bool)
+    before = {
+        name: module.weight.detach().clone()
+        for name, module in model.named_modules()
+        if isinstance(module, pg.CastedLinear) and (".attn." in name or ".mlp." in name)
+    }
+
+    loss, bpb = pg.eval_val_ttt(
+        h,
+        model,
+        rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+    )
+
+    assert torch.isfinite(torch.tensor(loss))
+    assert torch.isfinite(torch.tensor(bpb))
+    assert not any("ttt_lora" in name for name, _ in model.named_parameters())
+    after = {
+        name: module.weight.detach()
+        for name, module in model.named_modules()
+        if isinstance(module, pg.CastedLinear) and name in before
+    }
+    assert any(not torch.allclose(after[name], weight) for name, weight in before.items())
 
 
 def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():

@@ -191,6 +191,7 @@ class Hyperparameters:
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.001"))
     ttt_lora_wd = float(os.environ.get("TTT_LORA_WD", "1.0"))
     ttt_lora_min_params = int(os.environ.get("TTT_LORA_MIN_PARAMS", "1024"))
+    ttt_mask = os.environ.get("TTT_MASK", "all").strip().lower()
     ppm_enabled = bool(int(os.environ.get("PPM_ENABLED", "0")))
     ppm_order = int(os.environ.get("PPM_ORDER", 5))
     ppm_subset_tokens = int(os.environ.get("PPM_SUBSET_TOKENS", 5_000_000))
@@ -369,6 +370,7 @@ class Hyperparameters:
     tridao_packed_rope = bool(int(os.environ.get("TRIDAO_PACKED_ROPE", "1" if triton is not None else "0")))
     mlp_class_name = os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP")
     recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP"))
+    mlp_leaky_relu_slope = float(os.environ.get("MLP_LEAKY_RELU_SLOPE", "0.5"))
     poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
     poe_head_lr = float(os.environ.get("POE_HEAD_LR", os.environ.get("HEAD_LR", "0.008")))
     emb_scale = float(os.environ.get("EMB_SCALE", "1.0"))
@@ -2309,6 +2311,7 @@ def eval_val_ttt(
             alpha=args.ttt_lora_alpha,
             min_params=args.ttt_lora_min_params,
             device=device,
+            mask=args.ttt_mask,
         )
         if not params:
             raise RuntimeError("TTT_LORA_RANK > 0 but no LoRA target parameters were installed")
@@ -2322,6 +2325,7 @@ def eval_val_ttt(
     else:
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.SGD(params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    grad_masks = _ttt_grad_masks(model, args.ttt_mask)
     logits_fn = model.forward_logits
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -2331,7 +2335,8 @@ def eval_val_ttt(
             f"ttt:start chunks:{len(chunk_windows)} chunk_tokens:{args.ttt_chunk_tokens} epochs:{args.ttt_epochs} "
             f"mode:{'lora' if use_lora else 'full_sgd'} lr:{(args.ttt_lora_lr if use_lora else args.ttt_lr):g} "
             f"stride:{stride} batch_seqs:{args.ttt_batch_seqs} "
-            f"lora_rank:{args.ttt_lora_rank} lora_params:{sum(p.numel() for p in params) if use_lora else 0}"
+            f"lora_rank:{args.ttt_lora_rank} lora_params:{sum(p.numel() for p in params) if use_lora else 0} "
+            f"mask:{args.ttt_mask}"
         )
 
     def sync_grads(local_tokens: float) -> None:
@@ -2399,6 +2404,10 @@ def eval_val_ttt(
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                         train_loss = model(x, y)
                     train_loss.backward()
+                for p in params:
+                    grad_mask = grad_masks.get(id(p))
+                    if grad_mask is not None and p.grad is not None:
+                        p.grad.mul_(grad_mask.to(device=p.grad.device, dtype=p.grad.dtype))
                 sync_grads(float((be - bs) * seq_len) if has_batch else 0.0)
                 if args.ttt_grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(params, args.ttt_grad_clip)
@@ -2407,7 +2416,7 @@ def eval_val_ttt(
             log_fn(f"ttt:chunk:{ci + 1}/{len(chunk_windows)} lr:{lr:.6g} scored_windows:{len(windows)}")
 
     if use_lora:
-        remove_ttt_lora_adapters(model)
+        remove_ttt_lora_adapters(model, merge=True)
         for p in model.parameters():
             p.requires_grad_(original_requires_grad.get(id(p), p.requires_grad))
     model.eval()
@@ -2984,6 +2993,42 @@ def store_quantized_tensor(
     q_shapes[name] = tuple(q.shape)
     return tensor_nbytes(stored)
 
+
+def _is_sparse_attn_gate_quant_tensor(name: str, t: Tensor) -> bool:
+    return name.endswith(".attn_gate_w") and t.is_floating_point() and t.ndim == 2
+
+
+def _quantize_sparse_attn_gate_int8_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    qmax = signed_quant_max(8)
+    w = t.detach().to("cpu").float().contiguous()
+    row_amax = w.abs().amax(dim=1).clamp_min(QUANT_SCALE_EPS)
+    scale = (row_amax / qmax).to(dtype=INT8_PER_ROW_SCALE_DTYPE)
+    q = torch.clamp(torch.round(w / scale.float().view(-1, 1)), -qmax, qmax).to(torch.int8)
+    return q.contiguous(), scale.contiguous()
+
+
+def store_sparse_attn_gate_int8_row(
+    name: str,
+    t: Tensor,
+    quantized: dict[str, Tensor],
+    scales: dict[str, Tensor],
+    dtypes: dict[str, str],
+    stats: dict[str, int],
+    tensor_bits: dict[str, int] | None = None,
+    methods: dict[str, str] | None = None,
+) -> None:
+    q, s = _quantize_sparse_attn_gate_int8_row(t)
+    quantized[name] = q
+    scales[name] = s
+    dtypes[name] = str(t.dtype).removeprefix("torch.")
+    stats["num_float_tensors"] += 1
+    stats["quant_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    if tensor_bits is not None:
+        tensor_bits[name] = 8
+    if methods is not None:
+        methods[name] = "sparse_attn_gate_int8_row"
+
+
 def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8, use_rans_int6: bool = False):
     # Single supported clean-script export format:
     # - per-row signed int payload for 2D float tensors
@@ -3014,6 +3059,10 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8, use_ra
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["quant_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if _is_sparse_attn_gate_quant_tensor(name, t):
+            store_sparse_attn_gate_int8_row(name, t, quantized, scales, dtypes, stats)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -3082,6 +3131,10 @@ def quantize_state_dict_mixed_int(state_dict: dict[str, Tensor], args: "Hyperpar
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["quant_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if _is_sparse_attn_gate_quant_tensor(name, t):
+            store_sparse_attn_gate_int8_row(name, t, quantized, scales, dtypes, stats, tensor_bits=tensor_bits)
             continue
 
         if _is_control_tensor_name(name) and args.quant_control_bits <= 0:
@@ -3410,6 +3463,19 @@ def quantize_state_dict_gptq_int(
             methods[name] = "passthrough_nonfloat"
             continue
 
+        if _is_sparse_attn_gate_quant_tensor(name, t):
+            store_sparse_attn_gate_int8_row(
+                name,
+                t,
+                quantized,
+                scales,
+                dtypes,
+                stats,
+                tensor_bits=tensor_bits,
+                methods=methods,
+            )
+            continue
+
         if args.mixed_quant_bits and _is_control_tensor_name(name) and args.quant_control_bits <= 0:
             kept = keep_float_tensor_fp16(t, passthrough_orig_dtypes, name)
             passthrough[name] = kept
@@ -3592,7 +3658,22 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-def _is_ttt_lora_target(name: str, module: nn.Module, min_params: int) -> bool:
+def _validate_ttt_mask(mask: str) -> None:
+    if mask not in {"all", "no_qv"}:
+        raise ValueError(f"TTT_MASK must be all or no_qv, got {mask!r}")
+
+
+def _ttt_qkv_no_qv_mask(attn: "ParcaeCausalSelfAttention", rows: int, cols: int, device: torch.device) -> Tensor:
+    row_mask = torch.zeros(rows, 1, device=device)
+    q_end = min(attn.q_dim, rows)
+    k_end = min(attn.q_dim + attn.kv_dim, rows)
+    row_mask[q_end:k_end] = 1.0
+    return row_mask.expand(rows, cols)
+
+
+def _is_ttt_lora_target(name: str, module: nn.Module, min_params: int, mask: str = "all") -> bool:
+    if mask == "no_qv" and name.endswith(".attn.qkv_proj.v_proj"):
+        return False
     return (
         isinstance(module, CastedLinear)
         and module.weight.numel() >= min_params
@@ -3600,13 +3681,21 @@ def _is_ttt_lora_target(name: str, module: nn.Module, min_params: int) -> bool:
     )
 
 
-def install_ttt_lora_adapters(model: nn.Module, rank: int, alpha: float, min_params: int, device: torch.device) -> list[Tensor]:
+def install_ttt_lora_adapters(
+    model: nn.Module,
+    rank: int,
+    alpha: float,
+    min_params: int,
+    device: torch.device,
+    mask: str = "all",
+) -> list[Tensor]:
+    _validate_ttt_mask(mask)
     if rank <= 0:
         return []
     adapter_params: list[Tensor] = []
     scale = alpha / rank
     for name, module in model.named_modules():
-        if not _is_ttt_lora_target(name, module, min_params):
+        if not _is_ttt_lora_target(name, module, min_params, mask):
             continue
         if not isinstance(module, CastedLinear):
             continue
@@ -3633,8 +3722,44 @@ def install_ttt_lora_adapters(model: nn.Module, rank: int, alpha: float, min_par
     return adapter_params
 
 
-def remove_ttt_lora_adapters(model: nn.Module) -> None:
+def _ttt_grad_masks(model: nn.Module, mask: str) -> dict[int, Tensor]:
+    _validate_ttt_mask(mask)
+    if mask == "all":
+        return {}
+    module_map = dict(model.named_modules())
+    grad_masks: dict[int, Tensor] = {}
+    for name, module in module_map.items():
+        if not isinstance(module, CastedLinear):
+            continue
+        if name.endswith(".attn.qkv_proj"):
+            attn_name = name[: -len(".qkv_proj")]
+            attn = module_map.get(attn_name)
+            if isinstance(attn, ParcaeCausalSelfAttention):
+                grad_masks[id(module.weight)] = _ttt_qkv_no_qv_mask(
+                    attn,
+                    module.weight.size(0),
+                    module.weight.size(1),
+                    module.weight.device,
+                )
+                if hasattr(module, "ttt_lora_B"):
+                    grad_masks[id(module.ttt_lora_B)] = _ttt_qkv_no_qv_mask(
+                        attn,
+                        module.ttt_lora_B.size(0),
+                        module.ttt_lora_B.size(1),
+                        module.ttt_lora_B.device,
+                    )
+        elif name.endswith(".attn.qkv_proj.v_proj"):
+            grad_masks[id(module.weight)] = torch.zeros_like(module.weight)
+            if hasattr(module, "ttt_lora_B"):
+                grad_masks[id(module.ttt_lora_B)] = torch.zeros_like(module.ttt_lora_B)
+    return grad_masks
+
+
+def remove_ttt_lora_adapters(model: nn.Module, merge: bool = False) -> None:
     for module in model.modules():
+        if merge and hasattr(module, "ttt_lora_A") and hasattr(module, "ttt_lora_B"):
+            delta = module.ttt_lora_scale * (module.ttt_lora_B.float() @ module.ttt_lora_A.float())
+            module.weight.data.add_(delta.to(device=module.weight.device, dtype=module.weight.dtype))
         if hasattr(module, "_ttt_lora_orig_forward"):
             module.forward = module._ttt_lora_orig_forward
             delattr(module, "_ttt_lora_orig_forward")
@@ -3815,9 +3940,13 @@ class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-    def forward(self, x: Tensor) -> Tensor:
+
+    def forward(self, x: Tensor, input_ids: Tensor | None = None, bos_id: int = 1) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        if input_ids is not None:
+            not_bos = (input_ids != bos_id).to(dtype=x.dtype).unsqueeze(-1)
+            x_prev = x_prev * not_bos
         return (1 - g) * x + g * x_prev
 
 
@@ -4331,6 +4460,7 @@ if triton is not None:
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
         FORWARD: tl.constexpr,
+        NEGATIVE_SLOPE: tl.constexpr,
     ):
         pid = tl.program_id(0)
         num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -4366,28 +4496,39 @@ if triton is not None:
         aux_ptrs = AUX + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
         if FORWARD:
             pre = acc.to(tl.bfloat16)
-            post = tl.where(pre > 0.0, pre, 0.5 * pre)
+            post = tl.where(pre > 0.0, pre, NEGATIVE_SLOPE * pre)
             post = post * post
             tl.store(c_ptrs, pre, mask=mask)
             tl.store(aux_ptrs, post, mask=mask)
         else:
             pre = tl.load(aux_ptrs, mask=mask, other=0.0).to(tl.float32)
-            grad = acc * tl.where(pre > 0.0, 2.0 * pre, 0.5 * pre)
+            grad = acc * tl.where(pre > 0.0, 2.0 * pre, 2.0 * NEGATIVE_SLOPE * NEGATIVE_SLOPE * pre)
             tl.store(c_ptrs, grad, mask=mask)
 
 
-def _torch_leaky_relu_sq_matmul(a: Tensor, b: Tensor, aux: Tensor | None = None):
+def _torch_leaky_relu_sq_matmul(
+    a: Tensor,
+    b: Tensor,
+    aux: Tensor | None = None,
+    negative_slope: float = 0.5,
+):
     c = F.linear(a, b)
     if aux is None:
-        return c, F.leaky_relu(c, negative_slope=0.5).square()
-    return c * torch.where(aux > 0, 2.0 * aux, 0.5 * aux)
+        return c, F.leaky_relu(c, negative_slope=negative_slope).square()
+    neg_grad = 2.0 * negative_slope * negative_slope * aux
+    return c * torch.where(aux > 0, 2.0 * aux, neg_grad)
 
 
-def _fused_leaky_relu_sq(a: Tensor, b: Tensor, aux: Tensor | None = None):
+def _fused_leaky_relu_sq(
+    a: Tensor,
+    b: Tensor,
+    aux: Tensor | None = None,
+    negative_slope: float = 0.5,
+):
     if triton is None or not a.is_cuda:
-        return _torch_leaky_relu_sq_matmul(a, b, aux)
+        return _torch_leaky_relu_sq_matmul(a, b, aux, negative_slope)
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
-        return _torch_leaky_relu_sq_matmul(a, b, aux)
+        return _torch_leaky_relu_sq_matmul(a, b, aux, negative_slope)
     a = a.contiguous()
     b = b.contiguous()
     m, k = a.shape
@@ -4395,7 +4536,7 @@ def _fused_leaky_relu_sq(a: Tensor, b: Tensor, aux: Tensor | None = None):
     if k != k2:
         raise ValueError(f"shape mismatch: {a.shape=} {b.shape=}")
     if m < 4096:
-        return _torch_leaky_relu_sq_matmul(a, b, aux)
+        return _torch_leaky_relu_sq_matmul(a, b, aux, negative_slope)
     c = torch.empty((m, n), device=a.device, dtype=a.dtype)
     forward = aux is None
     if forward:
@@ -4424,6 +4565,7 @@ def _fused_leaky_relu_sq(a: Tensor, b: Tensor, aux: Tensor | None = None):
         BLOCK_K=block_k,
         GROUP_M=group_m,
         FORWARD=forward,
+        NEGATIVE_SLOPE=float(negative_slope),
         num_warps=4,
         num_stages=4 if forward else 3,
     )
@@ -4432,10 +4574,11 @@ def _fused_leaky_relu_sq(a: Tensor, b: Tensor, aux: Tensor | None = None):
 
 class _FusedLeakyReLUSqMLPFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
+    def forward(ctx, x: Tensor, up_w: Tensor, down_w: Tensor, negative_slope: float) -> Tensor:
         x_flat = x.reshape(-1, x.shape[-1]).contiguous()
-        pre, post = _fused_leaky_relu_sq(x_flat, up_w)
+        pre, post = _fused_leaky_relu_sq(x_flat, up_w, negative_slope=negative_slope)
         out = F.linear(post, down_w)
+        ctx.negative_slope = float(negative_slope)
         ctx.save_for_backward(x_flat, up_w, down_w, pre, post)
         return out.reshape(*x.shape[:-1], down_w.shape[0])
 
@@ -4444,25 +4587,27 @@ class _FusedLeakyReLUSqMLPFunction(torch.autograd.Function):
         x_flat, up_w, down_w, pre, post = ctx.saved_tensors
         go = grad_output.reshape(-1, grad_output.shape[-1]).to(dtype=post.dtype).contiguous()
         d_down_w = go.T @ post
-        dpre = _fused_leaky_relu_sq(go, down_w.T.contiguous(), aux=pre)
+        dpre = _fused_leaky_relu_sq(go, down_w.T.contiguous(), aux=pre, negative_slope=ctx.negative_slope)
         d_up_w = dpre.T @ x_flat
         dx = dpre @ up_w
-        return dx.reshape_as(grad_output), d_up_w, d_down_w
+        return dx.reshape_as(grad_output), d_up_w, d_down_w, None
 
 
 class FusedLeakyReLUSqMLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(self, dim: int, hidden_dim: int, negative_slope: float = 0.5):
         super().__init__()
         self.fc = CastedLinear(dim, hidden_dim, bias=False)
         self.proj = CastedLinear(hidden_dim, dim, bias=False)
+        self.negative_slope = float(negative_slope)
 
     def forward(self, x: Tensor) -> Tensor:
         if triton is None or not x.is_cuda or x.dtype != torch.bfloat16 or x.reshape(-1, x.shape[-1]).shape[0] < 4096:
-            return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+            return self.proj(F.leaky_relu(self.fc(x), negative_slope=self.negative_slope).square())
         return _FusedLeakyReLUSqMLPFunction.apply(
             x,
             self.fc.weight.to(dtype=x.dtype),
             self.proj.weight.to(dtype=x.dtype),
+            self.negative_slope,
         )
 
 
@@ -4598,6 +4743,7 @@ class ParcaeCausalSelfAttention(nn.Module):
         sparse_attn_gate_window: int = 12,
         sparse_attn_gate_init_std: float = 0.0,
         sparse_attn_gate_scale: float = 1.0,
+        mlp_leaky_relu_slope: float = 0.5,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -4779,6 +4925,7 @@ class TransformerPreNormBlock(nn.Module):
         sparse_attn_gate_window: int = 12,
         sparse_attn_gate_init_std: float = 0.0,
         sparse_attn_gate_scale: float = 1.0,
+        mlp_leaky_relu_slope: float = 0.5,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -4815,7 +4962,10 @@ class TransformerPreNormBlock(nn.Module):
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = get_mlp_class(mlp_class_name)
-        self.mlp = mlp_cls(dim, hidden_dim)
+        if mlp_cls is FusedLeakyReLUSqMLP:
+            self.mlp = mlp_cls(dim, hidden_dim, negative_slope=mlp_leaky_relu_slope)
+        else:
+            self.mlp = mlp_cls(dim, hidden_dim)
         self.attn_res_attn = AttentionResidualMixer(dim) if attn_res_enabled else None
         self.attn_res_mlp = AttentionResidualMixer(dim) if attn_res_enabled else None
         if record_residual:
@@ -5151,6 +5301,7 @@ class GPT(nn.Module):
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -5199,6 +5350,7 @@ class GPT(nn.Module):
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -5247,6 +5399,7 @@ class GPT(nn.Module):
                 sparse_attn_gate_window=h.sparse_attn_gate_window,
                 sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
                 sparse_attn_gate_scale=h.sparse_attn_gate_scale,
+                mlp_leaky_relu_slope=h.mlp_leaky_relu_slope,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -5485,7 +5638,7 @@ class GPT(nn.Module):
         input_embeds = self._embedding(self.tok_emb, input_ids)
         if self.bigram_hash is not None:
             input_embeds = input_embeds + self.bigram_hash(input_ids, input_embeds)
-        input_embeds = self.smear(input_embeds)
+        input_embeds = self.smear(input_embeds, input_ids=input_ids)
         if self.emb_scale != 1.0:
             input_embeds = input_embeds * self.emb_scale
         self._current_input_ids = input_ids
@@ -6193,6 +6346,7 @@ def main() -> None:
         raise ValueError("TTT_LORA_ALPHA, TTT_LORA_LR, and TTT_LORA_WD must be non-negative")
     if args.ttt_lora_min_params < 0:
         raise ValueError(f"TTT_LORA_MIN_PARAMS must be non-negative, got {args.ttt_lora_min_params}")
+    _validate_ttt_mask(args.ttt_mask)
     if args.gptq_enabled:
         if args.gptq_calibration_batches <= 0:
             raise ValueError("GPTQ_CALIBRATION_BATCHES must be positive when GPTQ_ENABLED=1")
@@ -6468,6 +6622,7 @@ def main() -> None:
     )
     log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
+        f"leaky_relu_slope:{args.mlp_leaky_relu_slope:g} "
         f"liger_geglu_available:{LigerGELUMulFunction is not None}"
     )
     log0(
@@ -6562,7 +6717,8 @@ def main() -> None:
         f"epochs:{args.ttt_epochs} lr:{args.ttt_lr:g} momentum:{args.ttt_momentum:g} "
         f"grad_clip:{args.ttt_grad_clip:g} lora_rank:{args.ttt_lora_rank} "
         f"lora_alpha:{args.ttt_lora_alpha:g} lora_lr:{args.ttt_lora_lr:g} "
-        f"lora_wd:{args.ttt_lora_wd:g} lora_min_params:{args.ttt_lora_min_params}"
+        f"lora_wd:{args.ttt_lora_wd:g} lora_min_params:{args.ttt_lora_min_params} "
+        f"mask:{args.ttt_mask}"
     )
     log0(
         f"sliding:enabled:{args.sliding_window_enabled} stride:{args.eval_stride} "
@@ -6797,6 +6953,28 @@ def main() -> None:
         log0("qat:converting TorchAO fake-quant modules before artifact export")
         convert_torchao_qat(base_model, args)
 
+    if args.ttt_enabled:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_prequant_ttt val_loss:{ttt_val_loss:.4f} "
+            f"val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_prequant_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -7014,28 +7192,6 @@ def main() -> None:
                 f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
                 f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f} coverage:{ng_coverage:.8f}"
             )
-
-    if args.ttt_enabled:
-        torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            log0,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_{quant_format}_{artifact_label}_roundtrip_ttt val_loss:{ttt_val_loss:.4f} "
-            f"val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
-        )
-        log0(f"final_{quant_format}_{artifact_label}_roundtrip_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
