@@ -496,8 +496,14 @@ def test_fused_qkv_postprocess_matches_reference_forward_backward(qk_norm: bool)
     dq = torch.randn_like(q)
     dk = torch.randn_like(k)
     dv = torch.randn_like(v)
-    (q.float() * dq.float()).sum().add_((k.float() * dk.float()).sum()).add_((v.float() * dv.float()).sum()).backward()
-    (q_ref.float() * dq.float()).sum().add_((k_ref.float() * dk.float()).sum()).add_((v_ref.float() * dv.float()).sum()).backward()
+    loss = (q.float() * dq.float()).sum() + (k.float() * dk.float()).sum() + (v.float() * dv.float()).sum()
+    ref_loss = (
+        (q_ref.float() * dq.float()).sum()
+        + (k_ref.float() * dk.float()).sum()
+        + (v_ref.float() * dv.float()).sum()
+    )
+    loss.backward()
+    ref_loss.backward()
 
     assert qkv.grad is not None
     assert qkv_ref.grad is not None

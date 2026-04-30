@@ -4335,7 +4335,6 @@ if triton is not None:
         QKV,
         Q,
         K,
-        V,
         COS,
         SIN,
         TOTAL_ROWS: tl.constexpr,
@@ -4350,16 +4349,20 @@ if triton is not None:
     ):
         pid = tl.program_id(0)
         h_total: tl.constexpr = H_Q + 2 * H_KV
-        row = pid // h_total
-        head = pid - row * h_total
+        h_qk: tl.constexpr = H_Q + H_KV
+        row = pid // h_qk
+        head = pid - row * h_qk
         offs = tl.arange(0, BLOCK_D)
         mask = offs < HEAD_DIM
-        qkv_base = (row * h_total + head) * HEAD_DIM
-        x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
 
         is_q = head < H_Q
-        is_k = (head >= H_Q) & (head < H_Q + H_KV)
-        is_v = head >= H_Q + H_KV
+        k_head = head - H_Q
+        q_head_safe = tl.minimum(head, H_Q - 1)
+        k_head_safe = tl.maximum(k_head, 0)
+        qkv_head = tl.where(is_q, q_head_safe, H_Q + k_head_safe)
+        qkv_base = (row * h_total + qkv_head) * HEAD_DIM
+        x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
+
         y = x
         rope_mask = offs < ROPE_DIMS
         pair = offs // 2
@@ -4376,21 +4379,16 @@ if triton is not None:
             inv_rms = tl.rsqrt(ss / HEAD_DIM + RMS_EPS)
             y = y * inv_rms
 
-        q_base = (row * H_Q + head) * HEAD_DIM
-        k_head = head - H_Q
-        v_head = head - H_Q - H_KV
-        k_base = (row * H_KV + k_head) * HEAD_DIM
-        v_base = (row * H_KV + v_head) * HEAD_DIM
+        q_base = (row * H_Q + q_head_safe) * HEAD_DIM
+        k_base = (row * H_KV + k_head_safe) * HEAD_DIM
         tl.store(Q + q_base + offs, y, mask=mask & is_q)
-        tl.store(K + k_base + offs, y, mask=mask & is_k)
-        tl.store(V + v_base + offs, x, mask=mask & is_v)
+        tl.store(K + k_base + offs, y, mask=mask & ~is_q)
 
 
     @triton.jit
     def _fused_qkv_postprocess_bwd_kernel(
         DQ,
         DK,
-        DV,
         QKV,
         DQKV,
         COS,
@@ -4407,23 +4405,22 @@ if triton is not None:
     ):
         pid = tl.program_id(0)
         h_total: tl.constexpr = H_Q + 2 * H_KV
-        row = pid // h_total
-        head = pid - row * h_total
+        h_qk: tl.constexpr = H_Q + H_KV
+        row = pid // h_qk
+        head = pid - row * h_qk
         offs = tl.arange(0, BLOCK_D)
         mask = offs < HEAD_DIM
-        qkv_base = (row * h_total + head) * HEAD_DIM
 
         is_q = head < H_Q
-        is_k = (head >= H_Q) & (head < H_Q + H_KV)
-        is_v = head >= H_Q + H_KV
-        q_base = (row * H_Q + head) * HEAD_DIM
         k_head = head - H_Q
-        v_head = head - H_Q - H_KV
-        k_base = (row * H_KV + k_head) * HEAD_DIM
-        v_base = (row * H_KV + v_head) * HEAD_DIM
+        q_head_safe = tl.minimum(head, H_Q - 1)
+        k_head_safe = tl.maximum(k_head, 0)
+        qkv_head = tl.where(is_q, q_head_safe, H_Q + k_head_safe)
+        qkv_base = (row * h_total + qkv_head) * HEAD_DIM
+        q_base = (row * H_Q + q_head_safe) * HEAD_DIM
+        k_base = (row * H_KV + k_head_safe) * HEAD_DIM
         gq = tl.load(DQ + q_base + offs, mask=mask & is_q, other=0.0).to(tl.float32)
-        gk = tl.load(DK + k_base + offs, mask=mask & is_k, other=0.0).to(tl.float32)
-        gv = tl.load(DV + v_base + offs, mask=mask & is_v, other=0.0)
+        gk = tl.load(DK + k_base + offs, mask=mask & ~is_q, other=0.0).to(tl.float32)
         g = gq + gk
 
         x = tl.load(QKV + qkv_base + offs, mask=mask, other=0.0).to(tl.float32)
@@ -4445,7 +4442,7 @@ if triton is not None:
             g = inv_rms * (g - y * mean_gy)
 
         mate_gq = tl.load(DQ + q_base + mate_offs, mask=mask & rope_mask & is_q, other=0.0).to(tl.float32)
-        mate_gk = tl.load(DK + k_base + mate_offs, mask=mask & rope_mask & is_k, other=0.0).to(tl.float32)
+        mate_gk = tl.load(DK + k_base + mate_offs, mask=mask & rope_mask & ~is_q, other=0.0).to(tl.float32)
         mate_g = mate_gq + mate_gk
         if DO_QK_NORM:
             mate_x = mate
@@ -4456,8 +4453,7 @@ if triton is not None:
             mate_g = inv_rms * (mate_g - mate_y * mean_gy)
         dx_rot = tl.where(is_even, g * cos + mate_g * sin, -mate_g * sin + g * cos)
         dx = tl.where(rope_mask, dx_rot, g)
-        out = tl.where(is_v, gv, dx)
-        tl.store(DQKV + qkv_base + offs, out, mask=mask)
+        tl.store(DQKV + qkv_base + offs, dx, mask=mask)
 else:
     _fused_qkv_postprocess_fwd_kernel = None
     _fused_qkv_postprocess_bwd_kernel = None
@@ -4493,18 +4489,17 @@ class _FusedQKVPostprocess(torch.autograd.Function):
             )
         q = torch.empty((batch, seqlen, num_heads_q, head_dim), device=qkv.device, dtype=qkv.dtype)
         k = torch.empty((batch, seqlen, num_heads_kv, head_dim), device=qkv.device, dtype=qkv.dtype)
-        v = torch.empty((batch, seqlen, num_heads_kv, head_dim), device=qkv.device, dtype=qkv.dtype)
+        v = qkv[:, :, num_heads_q + num_heads_kv :].contiguous()
         cos = freqs_cos[0, :seqlen, 0, : rope_dims // 2].contiguous()
         sin = freqs_sin[0, :seqlen, 0, : rope_dims // 2].contiguous()
         block_d = triton.next_power_of_2(head_dim)
         rms_eps = 1.0e-6
-        grid = (batch * seqlen * total_heads,)
+        grid = (batch * seqlen * (num_heads_q + num_heads_kv),)
         with torch.cuda.device(qkv.device.index):
             torch.library.wrap_triton(_fused_qkv_postprocess_fwd_kernel)[grid](
                 qkv,
                 q,
                 k,
-                v,
                 cos,
                 sin,
                 batch * seqlen,
@@ -4516,7 +4511,7 @@ class _FusedQKVPostprocess(torch.autograd.Function):
                 bool(qk_norm),
                 rms_eps,
                 BLOCK_D=block_d,
-                num_warps=1,
+                num_warps=2,
             )
         ctx.save_for_backward(qkv, cos, sin)
         ctx.num_heads_q = num_heads_q
@@ -4533,14 +4528,14 @@ class _FusedQKVPostprocess(torch.autograd.Function):
         qkv, cos, sin = ctx.saved_tensors
         batch, seqlen, total_heads, head_dim = qkv.shape
         dqkv = torch.empty_like(qkv)
+        dqkv[:, :, ctx.num_heads_q + ctx.num_heads_kv :].copy_(dv)
         block_d = triton.next_power_of_2(head_dim)
         rms_eps = 1.0e-6
-        grid = (batch * seqlen * total_heads,)
+        grid = (batch * seqlen * (ctx.num_heads_q + ctx.num_heads_kv),)
         with torch.cuda.device(qkv.device.index):
             torch.library.wrap_triton(_fused_qkv_postprocess_bwd_kernel)[grid](
                 dq.contiguous(),
                 dk.contiguous(),
-                dv.contiguous(),
                 qkv,
                 dqkv,
                 cos,
@@ -4554,7 +4549,7 @@ class _FusedQKVPostprocess(torch.autograd.Function):
                 ctx.qk_norm,
                 rms_eps,
                 BLOCK_D=block_d,
-                num_warps=1,
+                num_warps=2,
             )
         return dqkv, None, None, None, None, None, None, None
 
