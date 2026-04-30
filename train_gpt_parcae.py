@@ -176,6 +176,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    eval_max_wallclock_seconds = float(os.environ.get("EVAL_MAX_WALLCLOCK_SECONDS", 600.0))
     sliding_window_enabled = bool(int(os.environ.get("SLIDING_WINDOW_ENABLED", "0")))
     sliding_compile_logits = bool(int(os.environ.get("SLIDING_COMPILE_LOGITS", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
@@ -6650,6 +6651,8 @@ def main() -> None:
             raise ValueError("Attention Residuals are not wired for gradient checkpointing yet")
     if args.eval_stride <= 0:
         raise ValueError(f"EVAL_STRIDE must be positive, got {args.eval_stride}")
+    if args.eval_max_wallclock_seconds < 0.0:
+        raise ValueError(f"EVAL_MAX_WALLCLOCK_SECONDS must be non-negative, got {args.eval_max_wallclock_seconds}")
     if args.ppm_enabled and not args.sliding_window_enabled:
         raise ValueError("PPM_ENABLED=1 requires SLIDING_WINDOW_ENABLED=1")
     if args.ppm_order < 0 or args.ppm_token_order < 0:
@@ -6700,6 +6703,8 @@ def main() -> None:
         raise ValueError("NGRAM_EVAL_BUCKETS must be a positive power of two")
     if args.ngram_eval_max_seconds < 0.0:
         raise ValueError("NGRAM_EVAL_MAX_SECONDS must be non-negative")
+    if args.eval_max_wallclock_seconds < 0.0:
+        raise ValueError("EVAL_MAX_WALLCLOCK_SECONDS must be non-negative")
     if args.ngram_chunk_tokens <= 0 or args.ngram_batch_seqs <= 0:
         raise ValueError("NGRAM_CHUNK_TOKENS and NGRAM_BATCH_SEQS must be positive")
     if args.ngram_cubric_cadence != 0:
@@ -7090,7 +7095,8 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
-        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
+        f"eval_max_wallclock_seconds:{args.eval_max_wallclock_seconds:.3f}"
     )
     log0(
         f"weight_average:ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay:g} "
@@ -7156,8 +7162,20 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def max_rank_ms(elapsed_ms: float) -> float:
+        if not distributed:
+            return float(elapsed_ms)
+        elapsed = torch.tensor(float(elapsed_ms), device=device, dtype=torch.float64)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        return float(elapsed.item())
+
+    torch.cuda.synchronize()
+    training_phase_t0 = time.perf_counter()
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
-    # initial weights/optimizer state so measured training starts from the true init.
+    # initial weights/optimizer state. This is still training-phase compute, so strict
+    # wall-clock accounting charges it against MAX_WALLCLOCK_SECONDS.
+    training_time_ms = 0.0
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -7196,6 +7214,9 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        torch.cuda.synchronize()
+        training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
+        log0(f"warmup_time:{training_time_ms:.0f}ms counted_in_train_budget:1")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -7205,17 +7226,7 @@ def main() -> None:
     ema_last_step = 0
     swa_state: ParameterAverager | None = None
     swa_last_step = 0
-    training_time_ms = 0.0
-    stop_after_step: int | None = None
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    def max_rank_ms(elapsed_ms: float) -> float:
-        if not distributed:
-            return float(elapsed_ms)
-        elapsed = torch.tensor(float(elapsed_ms), device=device, dtype=torch.float64)
-        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-        return float(elapsed.item())
+    stop_after_step: int | None = 0 if max_wallclock_ms is not None and training_time_ms >= max_wallclock_ms else None
 
     step = 0
     while True:
@@ -7224,7 +7235,7 @@ def main() -> None:
         should_validate = last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -7243,7 +7254,6 @@ def main() -> None:
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
 
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -7254,7 +7264,7 @@ def main() -> None:
             break
 
         torch.cuda.synchronize()
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        elapsed_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
         scale = lr_mul(step, elapsed_ms)
         base_model.set_training_step(step)
         zero_grad_all()
@@ -7319,7 +7329,7 @@ def main() -> None:
 
         torch.cuda.synchronize()
         step = next_step
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        approx_training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
@@ -7371,6 +7381,8 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    torch.cuda.synchronize()
+    training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
     if args.gptq_enabled:
         t_gptq = time.perf_counter()
         log0("gptq:collecting Hessians from calibration batches")
@@ -7445,12 +7457,37 @@ def main() -> None:
             )
         log0(f"Total submission size {quant_format}+{'grouped' if args.grouped_artifact else 'zlib'}: {quant_file_bytes + code_bytes} bytes")
 
+    torch.cuda.synchronize()
+    training_time_ms = max_rank_ms(1000.0 * (time.perf_counter() - training_phase_t0))
+    log0(f"training_phase_wallclock:{training_time_ms:.0f}ms cap:{official_max_wallclock_ms or 0:.0f}ms")
+    if official_max_wallclock_ms is not None and training_time_ms > official_max_wallclock_ms:
+        raise RuntimeError(
+            "Training phase exceeded wall-clock budget before evaluation: "
+            f"{training_time_ms:.0f}ms > cap {official_max_wallclock_ms:.0f}ms"
+        )
+
     if distributed:
         dist.barrier()
+    torch.cuda.synchronize()
+    eval_phase_t0 = time.perf_counter()
+    eval_max_wallclock_ms = 1000.0 * args.eval_max_wallclock_seconds if args.eval_max_wallclock_seconds > 0 else None
+
+    def check_eval_budget(label: str) -> float:
+        torch.cuda.synchronize()
+        elapsed_ms = max_rank_ms(1000.0 * (time.perf_counter() - eval_phase_t0))
+        log0(f"eval_phase_wallclock:{elapsed_ms:.0f}ms cap:{eval_max_wallclock_ms or 0:.0f}ms label:{label}")
+        if eval_max_wallclock_ms is not None and elapsed_ms > eval_max_wallclock_ms:
+            raise RuntimeError(
+                f"Evaluation phase exceeded wall-clock budget after {label}: "
+                f"{elapsed_ms:.0f}ms > cap {eval_max_wallclock_ms:.0f}ms"
+            )
+        return elapsed_ms
+
     with open(quant_path, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = load_quant_artifact(quant_blob_disk)
     base_model.load_state_dict(dequantize_state_dict_int(quant_state), strict=True)
+    check_eval_budget("artifact_load")
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     artifact_label = "grouped" if args.grouped_artifact else "zlib"
@@ -7473,6 +7510,7 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_{quant_format}_{artifact_label}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    check_eval_budget("roundtrip_eval")
 
     if args.sliding_window_enabled:
         torch.cuda.synchronize()
@@ -7501,6 +7539,7 @@ def main() -> None:
             f"final_{quant_format}_{artifact_label}_roundtrip_sliding_window_exact "
             f"val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}"
         )
+        check_eval_budget("sliding_eval")
         if context_result is not None and args.ppm_enabled:
             ppm_tag = "partial" if context_result.get("cutoff", 0.0) else "exact"
             log0(
@@ -7590,7 +7629,8 @@ def main() -> None:
             log0(
                 f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
                 f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f} coverage:{ng_coverage:.8f}"
-            )
+        )
+        check_eval_budget("ngram_eval")
 
     if args.ttt_enabled:
         torch.cuda.synchronize()
@@ -7618,6 +7658,7 @@ def main() -> None:
             f"final_{quant_format}_{artifact_label}_roundtrip_ttt_exact "
             f"val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}"
         )
+        check_eval_budget("ttt_eval")
 
     if distributed:
         dist.destroy_process_group()
