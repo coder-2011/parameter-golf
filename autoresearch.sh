@@ -27,7 +27,7 @@ echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
 # ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
-# Simple baseline: SP8192 CaseOps, minimal features, 300s wall-clock
+# SP8192 CaseOps 300s baseline — sequential residual, BaseMLP, minimal features
 export RESIDUAL_MODE=sequential
 export MUON_MOMENTUM=0.85
 export GPTQ_ENABLED=0
