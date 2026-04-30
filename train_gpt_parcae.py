@@ -7035,7 +7035,8 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    official_max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    max_wallclock_ms = official_max_wallclock_ms
     if max_wallclock_ms is not None and args.gptq_enabled and args.gptq_reserve_seconds > 0.0:
         max_wallclock_ms = max(max_wallclock_ms - 1000.0 * args.gptq_reserve_seconds, 0.0)
         log0(f"gptq:reserved_wallclock:{args.gptq_reserve_seconds:.3f}s train_cap:{max_wallclock_ms:.0f}ms")
@@ -7104,6 +7105,13 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+
+    def max_rank_ms(elapsed_ms: float) -> float:
+        if not distributed:
+            return float(elapsed_ms)
+        elapsed = torch.tensor(float(elapsed_ms), device=device, dtype=torch.float64)
+        dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+        return float(elapsed.item())
 
     step = 0
     while True:
@@ -7244,28 +7252,6 @@ def main() -> None:
         log0("qat:converting TorchAO fake-quant modules before artifact export")
         convert_torchao_qat(base_model, args)
 
-    if args.ttt_enabled:
-        torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            log0,
-        )
-        torch.cuda.synchronize()
-        log0(
-            f"final_prequant_ttt val_loss:{ttt_val_loss:.4f} "
-            f"val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
-        )
-        log0(f"final_prequant_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
-
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -7296,6 +7282,20 @@ def main() -> None:
             f"in {1000.0 * (time.perf_counter() - t_gptq):.0f}ms"
         )
         quant_obj, quant_stats = quantize_state_dict_gptq_int(base_model.state_dict(), hessians, args)
+        torch.cuda.synchronize()
+        gptq_elapsed_ms = max_rank_ms(1000.0 * (time.perf_counter() - t_gptq))
+        train_plus_gptq_ms = training_time_ms + gptq_elapsed_ms
+        log0(
+            f"gptq:training_budget train_loop:{training_time_ms:.0f}ms "
+            f"gptq_actual:{gptq_elapsed_ms:.0f}ms total:{train_plus_gptq_ms:.0f}ms"
+        )
+        if official_max_wallclock_ms is not None and train_plus_gptq_ms > official_max_wallclock_ms:
+            raise RuntimeError(
+                "GPTQ exceeded training budget: "
+                f"train_loop {training_time_ms:.0f}ms + gptq {gptq_elapsed_ms:.0f}ms "
+                f"> cap {official_max_wallclock_ms:.0f}ms. Increase GPTQ_RESERVE_SECONDS "
+                "or reduce training time."
+            )
         quant_format = "gptq_mixed_int" if args.mixed_quant_bits else f"gptq_int{args.quant_bits}{'_rans' if args.rans_int6 else ''}"
     elif args.mixed_quant_bits:
         quant_obj, quant_stats = quantize_state_dict_mixed_int(base_model.state_dict(), args)
@@ -7483,6 +7483,32 @@ def main() -> None:
                 f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
                 f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f} coverage:{ng_coverage:.8f}"
             )
+
+    if args.ttt_enabled:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_val_loss, ttt_val_bpb = eval_val_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log0,
+        )
+        torch.cuda.synchronize()
+        ttt_elapsed_ms = max_rank_ms(1000.0 * (time.perf_counter() - t_ttt))
+        log0(
+            f"final_{quant_format}_{artifact_label}_roundtrip_ttt val_loss:{ttt_val_loss:.4f} "
+            f"val_bpb:{ttt_val_bpb:.4f} eval_time:{ttt_elapsed_ms:.0f}ms"
+        )
+        log0(
+            f"final_{quant_format}_{artifact_label}_roundtrip_ttt_exact "
+            f"val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}"
+        )
 
     if distributed:
         dist.destroy_process_group()
