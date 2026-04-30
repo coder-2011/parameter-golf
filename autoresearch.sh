@@ -46,7 +46,7 @@ export RECURRENT_NUM_HEADS=4
 export N_LAYERS_IN_PRELUDE=1
 export N_LAYERS_IN_RECURRENT_BLOCK=3
 export N_LAYERS_IN_CODA=2
-export MLP_MULT=4
+export TRAIN_BATCH_TOKENS=131072
 export GRAD_ACCUM_STEPS=8
 export EVAL_SEQ_LEN=1000
 export EMBED_LR=0.12
@@ -74,7 +74,7 @@ export BIGRAM_HASH_BUCKETS=8192
 export BIGRAM_HASH_DIM=128
 export BIGRAM_HASH_HEADS=4
 export BIGRAM_HASH_GATE=1
-export TTT_ENABLED=0
+export MEAN_RECURRENCE=1
 # ======================================================
 # ======================================================
 
