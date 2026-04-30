@@ -6560,7 +6560,9 @@ def main() -> None:
     log0(
         f"ttt:enabled:{args.ttt_enabled} stride:{args.eval_stride} chunk_tokens:{args.ttt_chunk_tokens} "
         f"epochs:{args.ttt_epochs} lr:{args.ttt_lr:g} momentum:{args.ttt_momentum:g} "
-        f"grad_clip:{args.ttt_grad_clip:g}"
+        f"grad_clip:{args.ttt_grad_clip:g} lora_rank:{args.ttt_lora_rank} "
+        f"lora_alpha:{args.ttt_lora_alpha:g} lora_lr:{args.ttt_lora_lr:g} "
+        f"lora_wd:{args.ttt_lora_wd:g} lora_min_params:{args.ttt_lora_min_params}"
     )
     log0(
         f"sliding:enabled:{args.sliding_window_enabled} stride:{args.eval_stride} "
