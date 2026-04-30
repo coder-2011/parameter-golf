@@ -27,7 +27,7 @@ echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
 # ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
-# SP8192 CaseOps 300s baseline — sequential residual, BaseMLP, minimal features
+# SP8192 CaseOps 300s — Simple baseline + larger dim
 export RESIDUAL_MODE=sequential
 export MUON_MOMENTUM=0.85
 export GPTQ_ENABLED=0
@@ -49,7 +49,7 @@ export N_LAYERS_IN_CODA=2
 export MLP_MULT=4
 export GRAD_ACCUM_STEPS=8
 export EVAL_SEQ_LEN=1000
-export EMBED_LR=0.6
+export EMBED_LR=0.12
 export ROPE_BASE=10000
 export QK_NORM=1
 export LIGER_ROPE=0
@@ -63,13 +63,17 @@ export MLP_CLASS_NAME=BaseMLP
 export RECURRENT_MLP_CLASS_NAME=BaseMLP
 export POE_NUM_EXPERTS=1
 export CODA_MOE_NUM_EXPERTS=0
-export MUON_WD=0.095
-export BETA2=0.95
-export TIED_EMBED_LR=0.05
-export SWA_START_STEP=800
+export MUON_WD=0.105
+export BETA2=0.99
+export TIED_EMBED_LR=0.03
+export SWA_START_STEP=9999
 export GROUPED_ARTIFACT=1
 export SPARSE_ATTN_GATE=0
 export RESIDUAL_FORGET_GATE=0
+export BIGRAM_HASH_BUCKETS=8192
+export BIGRAM_HASH_DIM=128
+export BIGRAM_HASH_HEADS=4
+export BIGRAM_HASH_GATE=1
 export TTT_ENABLED=0
 # ======================================================
 # ======================================================
