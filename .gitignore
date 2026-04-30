@@ -1,4 +1,3 @@
-data/tokenizers
 __pycache__/
 .DS_Store
 modded-nanogpt/
@@ -6,7 +5,8 @@ modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
-data_sp1892/
+data_sp1892/.cache/
+data_sp1892/datasets/
 .mypy_cache/
 .venv
 logs/
