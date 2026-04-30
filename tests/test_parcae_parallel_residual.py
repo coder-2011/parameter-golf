@@ -109,6 +109,7 @@ def test_smear_gate_is_wired_into_gpt_backward():
     torch.manual_seed(123)
     h = _tiny_h()
     model = pg.GPT(h)
+    model.eval()
     input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
     target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
 
@@ -213,6 +214,37 @@ def test_fused_leaky_relu_sq_mlp_is_wired_into_gpt():
     loss.backward()
     assert model.core_block[0].mlp.fc.weight.grad is not None
     assert torch.isfinite(model.core_block[0].mlp.fc.weight.grad).all()
+
+
+def test_ttt_lora_adapters_are_transparent_trainable_and_removed():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    model = pg.GPT(h)
+    model.eval()
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    num_steps_pair = torch.tensor([0, 1])
+    before = model.forward_logits(input_ids, num_steps_pair=num_steps_pair)
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    params = pg.install_ttt_lora_adapters(model, rank=2, alpha=4.0, min_params=0, device=torch.device("cpu"))
+
+    assert params
+    assert all(p.requires_grad for p in params)
+    assert torch.allclose(model.forward_logits(input_ids, num_steps_pair=num_steps_pair), before, atol=0.0, rtol=0.0)
+    model.train()
+    loss = model.forward_model(input_ids, labels=target_ids, num_steps_pair=num_steps_pair)["loss"]
+    assert loss is not None
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in params)
+    assert any(torch.count_nonzero(p.grad).item() > 0 for p in params)
+
+    pg.remove_ttt_lora_adapters(model)
+
+    assert not any("ttt_lora" in name for name, _ in model.named_parameters())
+    model.eval()
+    assert torch.allclose(model.forward_logits(input_ids, num_steps_pair=num_steps_pair), before, atol=0.0, rtol=0.0)
 
 
 def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():
