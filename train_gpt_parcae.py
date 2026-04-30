@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import json
+import lzma
 import math
 import os
 import random
@@ -43,9 +45,10 @@ except Exception:
     LigerGELUMulFunction = None
 
 try:
-    from liger_kernel.transformers import LigerCrossEntropyLoss
+    from liger_kernel.transformers import LigerCrossEntropyLoss, LigerFusedLinearCrossEntropyLoss
 except Exception:
     LigerCrossEntropyLoss = None
+    LigerFusedLinearCrossEntropyLoss = None
 
 try:
     from liger_kernel.ops.rope import LigerRopeFunction
@@ -107,6 +110,46 @@ def liger_cross_entropy(
         ce_input = flat_logits.clone() if preserve_input else flat_logits
     return LigerCrossEntropyLoss(ignore_index=ignore_index, reduction="mean", softcap=None)(ce_input, flat_target)
 
+
+def liger_fused_linear_cross_entropy(
+    hidden: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    bias: Tensor | None = None,
+    ignore_index: int = -100,
+    assume_no_ignore: bool = False,
+    softcap: float | None = None,
+    logit_scale: float = 1.0,
+) -> Tensor:
+    flat_hidden = hidden.reshape(-1, hidden.size(-1))
+    flat_target = target.reshape(-1)
+    scaled_weight = weight.to(flat_hidden.dtype) * logit_scale
+    scaled_bias = bias.to(flat_hidden.dtype) * logit_scale if bias is not None else None
+
+    def torch_linear_ce() -> Tensor:
+        logits = F.linear(flat_hidden, scaled_weight, scaled_bias).float()
+        if softcap is not None:
+            logits = softcap * torch.tanh(logits / softcap)
+        return F.cross_entropy(logits, flat_target, ignore_index=ignore_index)
+
+    is_compiling = getattr(torch.compiler, "is_compiling", torch._dynamo.is_compiling)()
+    if (
+        is_compiling
+        or LigerFusedLinearCrossEntropyLoss is None
+        or flat_hidden.device.type != "cuda"
+        or not torch.is_floating_point(flat_hidden)
+    ):
+        return torch_linear_ce()
+    n_non_ignore = flat_target.numel() if assume_no_ignore else int((flat_target != ignore_index).sum().item())
+    if n_non_ignore == 0:
+        return torch_linear_ce()
+    return LigerFusedLinearCrossEntropyLoss(
+        ignore_index=ignore_index,
+        reduction="mean",
+        softcap=softcap,
+        accum_dtype=torch.float32,
+    )(scaled_weight, flat_hidden, flat_target, scaled_bias)
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -143,6 +186,11 @@ class Hyperparameters:
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32_768))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", "0"))
+    ttt_lora_alpha = float(os.environ.get("TTT_LORA_ALPHA", "32.0"))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.001"))
+    ttt_lora_wd = float(os.environ.get("TTT_LORA_WD", "1.0"))
+    ttt_lora_min_params = int(os.environ.get("TTT_LORA_MIN_PARAMS", "1024"))
     ppm_enabled = bool(int(os.environ.get("PPM_ENABLED", "0")))
     ppm_order = int(os.environ.get("PPM_ORDER", 5))
     ppm_subset_tokens = int(os.environ.get("PPM_SUBSET_TOKENS", 5_000_000))
@@ -192,6 +240,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 500))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", os.environ.get("EMA", "0"))))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
@@ -212,6 +261,19 @@ class Hyperparameters:
     qat_embeddings = bool(int(os.environ.get("QAT_EMBEDDINGS", "1")))
     qat_tied_output = bool(int(os.environ.get("QAT_TIED_OUTPUT", "1")))
     quant_bits = int(os.environ.get("QUANT_BITS", qat_bits if qat_bits > 0 else 8))
+    mixed_quant_bits = bool(int(os.environ.get("MIXED_QUANT_BITS", "0")))
+    quant_embed_bits = int(os.environ.get("QUANT_EMBED_BITS", "7"))
+    quant_attn_bits = int(os.environ.get("QUANT_ATTN_BITS", "6"))
+    quant_mlp_bits = int(os.environ.get("QUANT_MLP_BITS", "6"))
+    quant_low_bits = int(os.environ.get("QUANT_LOW_BITS", "4"))
+    # 0 means fp16 passthrough for control tensors; 2-8 means integer quantize.
+    quant_control_bits = int(os.environ.get("QUANT_CONTROL_BITS", "0"))
+    quant_low_bit_patterns = tuple(
+        pattern.strip()
+        for pattern in os.environ.get("QUANT_LOW_BIT_PATTERNS", "project_out,poe_heads").split(",")
+        if pattern.strip()
+    )
+    grouped_artifact = bool(int(os.environ.get("GROUPED_ARTIFACT", "1")))
     rans_int6 = bool(int(os.environ.get("RANS_INT6", "0")))
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "0")))
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 32))
@@ -287,6 +349,10 @@ class Hyperparameters:
     attn_preconv_kernel = int(os.environ.get("ATTN_PRECONV_KERNEL", "0"))
     attn_preconv_scale_init = float(os.environ.get("ATTN_PRECONV_SCALE_INIT", "0.005"))
     attn_preconv_lr = float(os.environ.get("ATTN_PRECONV_LR", "0.001"))
+    sparse_attn_gate = bool(int(os.environ.get("SPARSE_ATTN_GATE", "0")))
+    sparse_attn_gate_window = int(os.environ.get("SPARSE_ATTN_GATE_WINDOW", "12"))
+    sparse_attn_gate_init_std = float(os.environ.get("SPARSE_ATTN_GATE_INIT_STD", "0.0"))
+    sparse_attn_gate_scale = float(os.environ.get("SPARSE_ATTN_GATE_SCALE", "1.0"))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
     attention_window = int(os.environ.get("ATTENTION_WINDOW", os.environ.get("SLIDING_ATTN_WINDOW", "-1")))
     use_value_embeddings = bool(int(os.environ.get("USE_VALUE_EMBEDDINGS", "0")))
@@ -298,10 +364,11 @@ class Hyperparameters:
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "0")))
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     liger_ce = bool(int(os.environ.get("LIGER_CE", "1")))
+    liger_fused_ce = bool(int(os.environ.get("LIGER_FUSED_CE", "1")))
     liger_rope = bool(int(os.environ.get("LIGER_ROPE", "0")))
     tridao_packed_rope = bool(int(os.environ.get("TRIDAO_PACKED_ROPE", "1" if triton is not None else "0")))
-    mlp_class_name = os.environ.get("MLP_CLASS_NAME", "BaseMLP")
-    recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "BaseMLP"))
+    mlp_class_name = os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP")
+    recurrent_mlp_class_name = os.environ.get("RECURRENT_MLP_CLASS_NAME", os.environ.get("MLP_CLASS_NAME", "FusedLeakyReLUSqMLP"))
     poe_num_experts = int(os.environ.get("POE_NUM_EXPERTS", 1))
     poe_head_lr = float(os.environ.get("POE_HEAD_LR", os.environ.get("HEAD_LR", "0.008")))
     emb_scale = float(os.environ.get("EMB_SCALE", "1.0"))
@@ -648,7 +715,7 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
-        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+        raise ValueError(f"Validation split is too short for seq_len={seq_len}")
     return tokens[: usable + 1]
 
 
@@ -1793,15 +1860,16 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    seq_len = args.eval_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1812,11 +1880,11 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -2328,7 +2396,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res,attn_gate",
     ).split(",")
     if pattern
 )
@@ -2351,6 +2419,7 @@ RANS_INT6_PREC = 15
 RANS_INT6_TOTAL = 1 << RANS_INT6_PREC
 RANS_INT6_LOWER = 1 << 23
 RANS_INT6_ALPHABET = 64
+GROUPED_ARTIFACT_MAGIC = b"PGQG1\0\0\0"
 
 def signed_quant_max(bits: int) -> int:
     if bits < 2 or bits > 8:
@@ -2360,6 +2429,264 @@ def signed_quant_max(bits: int) -> int:
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+
+def _torch_dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _numpy_dtype_for_torch(dtype_name: str) -> np.dtype:
+    mapping = {
+        "bool": np.bool_,
+        "uint8": np.uint8,
+        "int8": np.int8,
+        "int16": np.int16,
+        "int32": np.int32,
+        "int64": np.int64,
+        "float16": np.float16,
+        "float32": np.float32,
+        "float64": np.float64,
+        "bfloat16": np.uint16,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"unsupported tensor dtype in grouped artifact: {dtype_name}")
+    return np.dtype(mapping[dtype_name])
+
+
+def _byte_shuffle(data: bytes, element_size: int) -> bytes:
+    if element_size <= 1 or not data:
+        return data
+    arr = np.frombuffer(data, dtype=np.uint8).reshape(-1, element_size)
+    return np.ascontiguousarray(arr.T).tobytes()
+
+
+def _byte_unshuffle(data: bytes, element_size: int) -> bytes:
+    if element_size <= 1 or not data:
+        return data
+    arr = np.frombuffer(data, dtype=np.uint8).reshape(element_size, -1)
+    return np.ascontiguousarray(arr.T).tobytes()
+
+
+def _tensor_to_raw_bytes(t: Tensor) -> bytes:
+    cpu = t.detach().to("cpu").contiguous()
+    if cpu.dtype == torch.bfloat16:
+        return cpu.view(torch.uint16).numpy().tobytes()
+    return cpu.numpy().tobytes()
+
+
+def _tensor_from_raw_bytes(data: bytes, dtype_name: str, shape: list[int]) -> Tensor:
+    arr = np.frombuffer(data, dtype=_numpy_dtype_for_torch(dtype_name)).copy()
+    tensor = torch.from_numpy(arr).reshape(tuple(shape)).contiguous()
+    if dtype_name == "bfloat16":
+        return tensor.view(torch.bfloat16)
+    return tensor.to(dtype=getattr(torch, dtype_name)).contiguous()
+
+
+def _should_shuffle_tensor_bytes(t: Tensor) -> bool:
+    return t.element_size() > 1 and t.numel() > 1
+
+
+def _should_lane_group_tensor(t: Tensor) -> bool:
+    return t.is_floating_point() and t.element_size() > 1 and t.numel() > 1
+
+
+def _artifact_group_for_tensor(section: str, name: str, t: Tensor, quant_format: str) -> str:
+    if section == "scales":
+        return "scale"
+    if section == "passthrough":
+        return "passthrough_float" if t.is_floating_point() else "passthrough_other"
+    if section == "quantized":
+        if "rans" in quant_format:
+            return "quant_rans"
+        if _is_embedding_tensor_name(name):
+            return "quant_embed"
+        if ".mlp." in name:
+            return "quant_mlp"
+        if ".attn." in name:
+            return "quant_attn"
+        if _is_control_tensor_name(name):
+            return "quant_control"
+        return "quant_other"
+    return section
+
+
+def _compress_group_payload(raw: bytes) -> tuple[str, bytes]:
+    candidates: list[tuple[str, bytes]] = [
+        ("store", raw),
+        ("zlib", zlib.compress(raw, level=9)),
+        ("lzma", lzma.compress(raw, preset=9)),
+    ]
+    try:
+        import brotli  # type: ignore
+
+        candidates.append(("brotli", brotli.compress(raw, quality=11)))
+    except Exception:
+        pass
+    try:
+        import zstandard as zstd  # type: ignore
+
+        candidates.append(("zstd", zstd.ZstdCompressor(level=22).compress(raw)))
+    except Exception:
+        pass
+    return min(candidates, key=lambda item: len(item[1]))
+
+
+def _decompress_group_payload(kind: str, payload: bytes) -> bytes:
+    if kind == "store":
+        return payload
+    if kind == "zlib":
+        return zlib.decompress(payload)
+    if kind == "lzma":
+        return lzma.decompress(payload)
+    if kind == "brotli":
+        import brotli  # type: ignore
+
+        return brotli.decompress(payload)
+    if kind == "zstd":
+        import zstandard as zstd  # type: ignore
+
+        return zstd.ZstdDecompressor().decompress(payload)
+    raise ValueError(f"unknown grouped artifact compressor {kind!r}")
+
+
+def serialize_quant_artifact_grouped(obj: dict[str, object]) -> tuple[bytes, dict[str, object]]:
+    quant_format = str(obj.get("__quant_format__", ""))
+    tensor_sections = ("quantized", "scales", "passthrough")
+    manifest: dict[str, object] = {
+        "version": 1,
+        "metadata": {
+            key: value
+            for key, value in obj.items()
+            if key not in tensor_sections
+        },
+        "tensors": [],
+        "groups": [],
+    }
+    group_raw: dict[str, bytearray] = {}
+    for section in tensor_sections:
+        tensors = obj.get(section, {})
+        if not isinstance(tensors, dict):
+            continue
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"grouped artifact expected tensor at {section}.{name}, got {type(tensor)!r}")
+            raw = _tensor_to_raw_bytes(tensor)
+            group = _artifact_group_for_tensor(section, name, tensor, quant_format)
+            if _should_lane_group_tensor(tensor):
+                element_size = tensor.element_size()
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, element_size)
+                lanes = []
+                for lane_idx in range(element_size):
+                    lane_raw = arr[:, lane_idx].tobytes()
+                    lane_group = f"{group}.b{lane_idx}"
+                    lane_offset = len(group_raw.setdefault(lane_group, bytearray()))
+                    group_raw[lane_group].extend(lane_raw)
+                    lanes.append(
+                        {
+                            "group": lane_group,
+                            "offset": lane_offset,
+                            "nbytes": len(lane_raw),
+                        }
+                    )
+                manifest["tensors"].append(
+                    {
+                        "section": section,
+                        "name": name,
+                        "shape": list(tensor.shape),
+                        "dtype": _torch_dtype_name(tensor.dtype),
+                        "lanes": lanes,
+                    }
+                )
+                continue
+            shuffle = _should_shuffle_tensor_bytes(tensor)
+            if shuffle:
+                raw = _byte_shuffle(raw, tensor.element_size())
+            offset = len(group_raw.setdefault(group, bytearray()))
+            group_raw[group].extend(raw)
+            manifest["tensors"].append(
+                {
+                    "section": section,
+                    "name": name,
+                    "group": group,
+                    "offset": offset,
+                    "nbytes": len(raw),
+                    "shape": list(tensor.shape),
+                    "dtype": _torch_dtype_name(tensor.dtype),
+                    "shuffle": int(shuffle),
+                }
+            )
+    group_blobs = bytearray()
+    group_stats = {}
+    for group in sorted(group_raw):
+        raw = bytes(group_raw[group])
+        compressor, compressed = _compress_group_payload(raw)
+        offset = len(group_blobs)
+        group_blobs.extend(compressed)
+        manifest["groups"].append(
+            {
+                "name": group,
+                "compressor": compressor,
+                "offset": offset,
+                "nbytes": len(compressed),
+                "raw_nbytes": len(raw),
+            }
+        )
+        group_stats[group] = {
+            "compressor": compressor,
+            "raw_nbytes": len(raw),
+            "nbytes": len(compressed),
+        }
+    manifest_bytes = zlib.compress(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"), level=9)
+    blob = bytearray(GROUPED_ARTIFACT_MAGIC)
+    blob.extend(len(manifest_bytes).to_bytes(8, "little"))
+    blob.extend(manifest_bytes)
+    blob.extend(group_blobs)
+    return bytes(blob), group_stats
+
+
+def load_quant_artifact(blob: bytes) -> dict[str, object]:
+    if not blob.startswith(GROUPED_ARTIFACT_MAGIC):
+        return torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu")
+    offset = len(GROUPED_ARTIFACT_MAGIC)
+    manifest_len = int.from_bytes(blob[offset:offset + 8], "little")
+    offset += 8
+    manifest_payload = blob[offset:offset + manifest_len]
+    try:
+        manifest_json = zlib.decompress(manifest_payload)
+    except zlib.error:
+        manifest_json = manifest_payload
+    manifest = json.loads(manifest_json.decode("utf-8"))
+    payload_base = offset + manifest_len
+    group_data: dict[str, bytes] = {}
+    for group in manifest["groups"]:
+        start = payload_base + int(group["offset"])
+        end = start + int(group["nbytes"])
+        group_data[str(group["name"])] = _decompress_group_payload(str(group["compressor"]), blob[start:end])
+    obj: dict[str, object] = dict(manifest["metadata"])
+    obj["quantized"] = {}
+    obj["scales"] = {}
+    obj["passthrough"] = {}
+    for spec in manifest["tensors"]:
+        dtype_name = str(spec["dtype"])
+        lanes = spec.get("lanes")
+        if isinstance(lanes, list):
+            lane_bytes = []
+            for lane in lanes:
+                data = group_data[str(lane["group"])]
+                start = int(lane["offset"])
+                end = start + int(lane["nbytes"])
+                lane_bytes.append(data[start:end])
+            tensor_bytes = _byte_unshuffle(b"".join(lane_bytes), len(lane_bytes))
+        else:
+            data = group_data[str(spec["group"])]
+            start = int(spec["offset"])
+            end = start + int(spec["nbytes"])
+            tensor_bytes = data[start:end]
+            if int(spec.get("shuffle", 0)):
+                tensor_bytes = _byte_unshuffle(tensor_bytes, _numpy_dtype_for_torch(dtype_name).itemsize)
+        tensor = _tensor_from_raw_bytes(tensor_bytes, dtype_name, list(spec["shape"]))
+        obj[str(spec["section"])][str(spec["name"])] = tensor
+    return obj
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
@@ -2367,6 +2694,12 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
+
+
+def keep_float_tensor_fp16(t: Tensor, passthrough_orig_dtypes: dict[str, str], name: str) -> Tensor:
+    if t.dtype in {torch.float32, torch.bfloat16}:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+    return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
 
 def should_keep_float_tensor(name: str, t: Tensor, keep_float_patterns: tuple[str, ...] = ()) -> bool:
     return (
@@ -2692,10 +3025,76 @@ def quantize_state_dict_int(state_dict: dict[str, Tensor], bits: int = 8, use_ra
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
+
+def quantize_state_dict_mixed_int(state_dict: dict[str, Tensor], args: "Hyperparameters"):
+    # Same storage contract as uniform integer export, but each quantized tensor
+    # records its own bit width in tensor_bits.
+    if args.rans_int6:
+        raise ValueError("MIXED_QUANT_BITS=1 is not compatible with RANS_INT6=1")
+    quantized: dict[str, Tensor] = {}
+    q_shapes: dict[str, tuple[int, ...]] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    tensor_bits: dict[str, int] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "quant_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["quant_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if _is_control_tensor_name(name) and args.quant_control_bits <= 0:
+            kept = keep_float_tensor_fp16(t, passthrough_orig_dtypes, name)
+            passthrough[name] = kept
+            stats["quant_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        if not _is_control_tensor_name(name) and should_keep_float_tensor(name, t, args.quant_keep_float_patterns):
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["quant_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        tensor_bits[name] = quant_bits_for_tensor(name, t, args)
+        signed_quant_max(tensor_bits[name])
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor(t, tensor_bits[name])
+        stats["quant_payload_bytes"] += store_quantized_tensor(name, q, tensor_bits[name], quantized, q_shapes)
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["quant_payload_bytes"] += tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "mixed_int_clean_per_row_packed_v1",
+        "bits": args.quant_bits,
+        "tensor_bits": tensor_bits,
+        "quantized": quantized,
+        "q_shapes": q_shapes,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
 def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     bits = int(obj.get("bits", 8))
+    tensor_bits = obj.get("tensor_bits", {})
     q_shapes = obj.get("q_shapes", {})
     quant_format = str(obj.get("__quant_format__", ""))
     use_rans_int6 = "int6_rans" in quant_format
@@ -2704,7 +3103,7 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
             if use_rans_int6:
                 q = rans_int6_decode_tensor(q, tuple(q_shapes[name]))
             else:
-                q = unpack_quantized_tensor(q, tuple(q_shapes[name]), bits)
+                q = unpack_quantized_tensor(q, tuple(q_shapes[name]), int(tensor_bits.get(name, bits)))
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         if s.ndim > 0:
@@ -2726,6 +3125,33 @@ def dequantize_state_dict_int(obj: dict[str, object]) -> dict[str, Tensor]:
 
 def _is_control_tensor_name(name: str) -> bool:
     return any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+
+
+def _is_embedding_tensor_name(name: str) -> bool:
+    return (
+        name == "tok_emb.weight"
+        or name == "bigram_hash.embed.weight"
+        or "_value_embeds." in name
+        or name.endswith(".embed.weight")
+    )
+
+
+def quant_bits_for_tensor(name: str, t: Tensor, args: "Hyperparameters") -> int:
+    if not args.mixed_quant_bits:
+        return args.quant_bits
+    if _is_control_tensor_name(name):
+        return args.quant_control_bits
+    if t.ndim < 2:
+        return args.quant_bits
+    if _is_embedding_tensor_name(name):
+        return args.quant_embed_bits
+    if any(pattern in name for pattern in args.quant_low_bit_patterns):
+        return args.quant_low_bits
+    if ".mlp." in name:
+        return args.quant_mlp_bits
+    if ".attn." in name:
+        return args.quant_attn_bits
+    return args.quant_bits
 
 
 def _is_gptq_candidate_name(name: str, quantize_embeddings: bool) -> bool:
@@ -2918,6 +3344,8 @@ def quantize_state_dict_gptq_int(
     signed_quant_max(args.quant_bits)
     if args.rans_int6 and args.quant_bits != 6:
         raise ValueError(f"RANS_INT6 requires QUANT_BITS=6, got {args.quant_bits}")
+    if args.rans_int6 and args.mixed_quant_bits:
+        raise ValueError("MIXED_QUANT_BITS=1 is not compatible with RANS_INT6=1")
     quantized: dict[str, Tensor] = {}
     q_shapes: dict[str, tuple[int, ...]] = {}
     scales: dict[str, Tensor] = {}
@@ -2925,6 +3353,7 @@ def quantize_state_dict_gptq_int(
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     methods: dict[str, str] = {}
+    tensor_bits: dict[str, int] = {}
     stats = dict.fromkeys(
         (
             "param_count",
@@ -2952,7 +3381,14 @@ def quantize_state_dict_gptq_int(
             methods[name] = "passthrough_nonfloat"
             continue
 
-        if should_keep_float_tensor(name, t, args.quant_keep_float_patterns):
+        if args.mixed_quant_bits and _is_control_tensor_name(name) and args.quant_control_bits <= 0:
+            kept = keep_float_tensor_fp16(t, passthrough_orig_dtypes, name)
+            passthrough[name] = kept
+            stats["quant_payload_bytes"] += tensor_nbytes(kept)
+            methods[name] = "passthrough_control_fp16"
+            continue
+
+        if not (args.mixed_quant_bits and _is_control_tensor_name(name)) and should_keep_float_tensor(name, t, args.quant_keep_float_patterns):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["quant_payload_bytes"] += tensor_nbytes(kept)
@@ -2967,29 +3403,33 @@ def quantize_state_dict_gptq_int(
             and _is_gptq_candidate_name(name, args.gptq_quantize_embeddings)
         )
         if use_gptq:
+            tensor_bits[name] = quant_bits_for_tensor(name, t, args)
+            signed_quant_max(tensor_bits[name])
             clip_sigmas = args.gptq_embed_clip_sigmas if name == "tok_emb.weight" else args.gptq_matrix_clip_sigmas
             q, s = gptq_quantize_weight(
                 t,
                 hessians[name],
-                bits=args.quant_bits,
+                bits=tensor_bits[name],
                 block_size=args.gptq_blocksize,
                 dampening=args.gptq_dampening,
                 clip_sigmas=clip_sigmas,
                 act_order=args.gptq_act_order,
             )
             stats["num_gptq_tensors"] += 1
-            methods[name] = f"gptq_int{args.quant_bits}"
+            methods[name] = f"gptq_int{tensor_bits[name]}"
         else:
-            q, s = quantize_float_tensor(t, bits=args.quant_bits)
+            tensor_bits[name] = quant_bits_for_tensor(name, t, args)
+            signed_quant_max(tensor_bits[name])
+            q, s = quantize_float_tensor(t, bits=tensor_bits[name])
             stats["num_fallback_tensors"] += 1
-            methods[name] = f"per_row_int{args.quant_bits}"
+            methods[name] = f"per_row_int{tensor_bits[name]}"
         if args.rans_int6:
             stored = rans_int6_encode_tensor(q)
             quantized[name] = stored
             q_shapes[name] = tuple(q.shape)
             stats["quant_payload_bytes"] += tensor_nbytes(stored)
         else:
-            stats["quant_payload_bytes"] += store_quantized_tensor(name, q, args.quant_bits, quantized, q_shapes)
+            stats["quant_payload_bytes"] += store_quantized_tensor(name, q, tensor_bits[name], quantized, q_shapes)
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["quant_payload_bytes"] += tensor_nbytes(s)
@@ -2998,11 +3438,14 @@ def quantize_state_dict_gptq_int(
         "__quant_format__": (
             "gptq_int6_rans_per_row_fallback_v1"
             if args.rans_int6
+            else "gptq_mixed_int_per_row_fallback_packed_v1"
+            if args.mixed_quant_bits
             else f"gptq_int{args.quant_bits}_per_row_fallback_packed_v2"
             if args.quant_bits < 8
             else "gptq_int8_per_row_fallback_v2"
         ),
         "bits": args.quant_bits,
+        "tensor_bits": tensor_bits,
         "quantized": quantized,
         "q_shapes": q_shapes,
         "scales": scales,
@@ -3787,6 +4230,162 @@ class GatedMLP(nn.Module):
         return self.proj(self.nonlin(gate) * value)
 
 
+if triton is not None:
+    @triton.jit
+    def _leaky_relu_sq_matmul_kernel(
+        A,
+        B,
+        C,
+        AUX,
+        M: tl.constexpr,
+        N: tl.constexpr,
+        K: tl.constexpr,
+        stride_am: tl.constexpr,
+        stride_ak: tl.constexpr,
+        stride_bn: tl.constexpr,
+        stride_bk: tl.constexpr,
+        stride_cm: tl.constexpr,
+        stride_cn: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
+        FORWARD: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_in_group = pid % num_pid_in_group
+        pid_m = first_pid_m + (pid_in_group % group_size_m)
+        pid_n = pid_in_group // group_size_m
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k0 in range(0, K, BLOCK_K):
+            k_idxs = k0 + offs_k
+            a = tl.load(
+                A + offs_m[:, None] * stride_am + k_idxs[None, :] * stride_ak,
+                mask=(offs_m[:, None] < M) & (k_idxs[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                B + offs_n[:, None] * stride_bn + k_idxs[None, :] * stride_bk,
+                mask=(offs_n[:, None] < N) & (k_idxs[None, :] < K),
+                other=0.0,
+            )
+            acc += tl.dot(a, tl.trans(b))
+
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        aux_ptrs = AUX + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        if FORWARD:
+            pre = acc.to(tl.bfloat16)
+            post = tl.where(pre > 0.0, pre, 0.5 * pre)
+            post = post * post
+            tl.store(c_ptrs, pre, mask=mask)
+            tl.store(aux_ptrs, post, mask=mask)
+        else:
+            pre = tl.load(aux_ptrs, mask=mask, other=0.0).to(tl.float32)
+            grad = acc * tl.where(pre > 0.0, 2.0 * pre, 0.5 * pre)
+            tl.store(c_ptrs, grad, mask=mask)
+
+
+def _torch_leaky_relu_sq_matmul(a: Tensor, b: Tensor, aux: Tensor | None = None):
+    c = F.linear(a, b)
+    if aux is None:
+        return c, F.leaky_relu(c, negative_slope=0.5).square()
+    return c * torch.where(aux > 0, 2.0 * aux, 0.5 * aux)
+
+
+def _fused_leaky_relu_sq(a: Tensor, b: Tensor, aux: Tensor | None = None):
+    if triton is None or not a.is_cuda:
+        return _torch_leaky_relu_sq_matmul(a, b, aux)
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        return _torch_leaky_relu_sq_matmul(a, b, aux)
+    a = a.contiguous()
+    b = b.contiguous()
+    m, k = a.shape
+    n, k2 = b.shape
+    if k != k2:
+        raise ValueError(f"shape mismatch: {a.shape=} {b.shape=}")
+    if m < 4096:
+        return _torch_leaky_relu_sq_matmul(a, b, aux)
+    c = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    forward = aux is None
+    if forward:
+        aux = torch.empty_like(c)
+    else:
+        aux = aux.contiguous()
+
+    block_m, block_n, block_k, group_m = 64, 128, 64, 8
+    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
+    _leaky_relu_sq_matmul_kernel[grid](
+        a,
+        b,
+        c,
+        aux,
+        m,
+        n,
+        k,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_M=group_m,
+        FORWARD=forward,
+        num_warps=4,
+        num_stages=4 if forward else 3,
+    )
+    return (c, aux) if forward else c
+
+
+class _FusedLeakyReLUSqMLPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
+        x_flat = x.reshape(-1, x.shape[-1]).contiguous()
+        pre, post = _fused_leaky_relu_sq(x_flat, up_w)
+        out = F.linear(post, down_w)
+        ctx.save_for_backward(x_flat, up_w, down_w, pre, post)
+        return out.reshape(*x.shape[:-1], down_w.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x_flat, up_w, down_w, pre, post = ctx.saved_tensors
+        go = grad_output.reshape(-1, grad_output.shape[-1]).to(dtype=post.dtype).contiguous()
+        d_down_w = go.T @ post
+        dpre = _fused_leaky_relu_sq(go, down_w.T.contiguous(), aux=pre)
+        d_up_w = dpre.T @ x_flat
+        dx = dpre @ up_w
+        return dx.reshape_as(grad_output), d_up_w, d_down_w
+
+
+class FusedLeakyReLUSqMLP(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.fc = CastedLinear(dim, hidden_dim, bias=False)
+        self.proj = CastedLinear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if triton is None or not x.is_cuda or x.dtype != torch.bfloat16 or x.reshape(-1, x.shape[-1]).shape[0] < 4096:
+            return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+        return _FusedLeakyReLUSqMLPFunction.apply(
+            x,
+            self.fc.weight.to(dtype=x.dtype),
+            self.proj.weight.to(dtype=x.dtype),
+        )
+
+
 def _gelu_mul(gate: Tensor, value: Tensor) -> Tensor:
     if LigerGELUMulFunction is not None and gate.is_cuda:
         return LigerGELUMulFunction.apply(gate, value)
@@ -3811,9 +4410,11 @@ def get_mlp_class(mlp_class_name: str) -> type[nn.Module]:
         return GatedMLP
     if mlp_class_name in {"LigerStyleGatedMLP", "LigerGEGLUMLP"}:
         return LigerStyleGatedMLP
+    if mlp_class_name in {"FusedLeakyReLUSqMLP", "LeakyReLUSqMLP"}:
+        return FusedLeakyReLUSqMLP
     raise ValueError(
         "MLP class must be BaseMLP, GatedMLP, LigerStyleGatedMLP, "
-        f"or LigerGEGLUMLP; got {mlp_class_name!r}"
+        f"LigerGEGLUMLP, or FusedLeakyReLUSqMLP; got {mlp_class_name!r}"
     )
 
 
@@ -3913,6 +4514,10 @@ class ParcaeCausalSelfAttention(nn.Module):
         pwa_permute_size: int = 4,
         attn_preconv_kernel: int = 0,
         attn_preconv_scale_init: float = 0.05,
+        sparse_attn_gate: bool = False,
+        sparse_attn_gate_window: int = 12,
+        sparse_attn_gate_init_std: float = 0.0,
+        sparse_attn_gate_scale: float = 1.0,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -3953,6 +4558,20 @@ class ParcaeCausalSelfAttention(nn.Module):
         self.ve_gate_channels = min(32, dim)
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_id, n_layer) else None
         self.use_xsa = False
+        if sparse_attn_gate_window <= 0 or sparse_attn_gate_window > dim:
+            raise ValueError(f"SPARSE_ATTN_GATE_WINDOW must be in [1, {dim}], got {sparse_attn_gate_window}")
+        if sparse_attn_gate_init_std < 0.0:
+            raise ValueError(f"SPARSE_ATTN_GATE_INIT_STD must be non-negative, got {sparse_attn_gate_init_std}")
+        self.sparse_attn_gate = sparse_attn_gate
+        self.sparse_attn_gate_window = sparse_attn_gate_window
+        self.sparse_attn_gate_scale = sparse_attn_gate_scale
+        if sparse_attn_gate:
+            gate_w = torch.empty(num_heads, sparse_attn_gate_window, dtype=torch.float32)
+            if sparse_attn_gate_init_std > 0.0:
+                nn.init.normal_(gate_w, mean=0.0, std=sparse_attn_gate_init_std)
+            else:
+                nn.init.zeros_(gate_w)
+            self.attn_gate_w = nn.Parameter(gate_w)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         qkv_key = prefix + "c_qkv.weight"
@@ -4036,6 +4655,13 @@ class ParcaeCausalSelfAttention(nn.Module):
             ).transpose(1, 2)
         if bool(kwargs.get("use_xsa", self.use_xsa)):
             y = self._xsa_efficient(y, v)
+        if self.sparse_attn_gate:
+            gate_in = x[..., : self.sparse_attn_gate_window].contiguous()
+            gate = torch.sigmoid(
+                self.sparse_attn_gate_scale
+                * F.linear(gate_in, self.attn_gate_w.to(dtype=x.dtype))
+            )
+            y = y * gate[..., None]
         y = y.contiguous().reshape(bsz, seqlen, dim)
         return self.c_proj(y)
 
@@ -4069,6 +4695,10 @@ class TransformerPreNormBlock(nn.Module):
         pwa_permute_size: int = 4,
         attn_preconv_kernel: int = 0,
         attn_preconv_scale_init: float = 0.05,
+        sparse_attn_gate: bool = False,
+        sparse_attn_gate_window: int = 12,
+        sparse_attn_gate_init_std: float = 0.0,
+        sparse_attn_gate_scale: float = 1.0,
     ):
         super().__init__()
         self.parallel_residual = parallel_residual
@@ -4098,6 +4728,10 @@ class TransformerPreNormBlock(nn.Module):
             rrhp_reduction_factor=rrhp_reduction_factor,
             pwa_num_bases=pwa_num_bases,
             pwa_permute_size=pwa_permute_size,
+            sparse_attn_gate=sparse_attn_gate,
+            sparse_attn_gate_window=sparse_attn_gate_window,
+            sparse_attn_gate_init_std=sparse_attn_gate_init_std,
+            sparse_attn_gate_scale=sparse_attn_gate_scale,
         )
         self.norm_2 = ParcaeRMSNorm(dim)
         mlp_cls = get_mlp_class(mlp_class_name)
@@ -4317,6 +4951,7 @@ class GPT(nn.Module):
         self.emb_scale = h.emb_scale
         self.logit_scale = h.logit_scale
         self.liger_ce = h.liger_ce
+        self.liger_fused_ce = h.liger_fused_ce
         self.poe_num_experts = h.poe_num_experts
         self.xsa_last_n = h.xsa_last_n
         self.attn_qkv_mode = h.attn_qkv_mode
@@ -4432,6 +5067,10 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                sparse_attn_gate=h.sparse_attn_gate,
+                sparse_attn_gate_window=h.sparse_attn_gate_window,
+                sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
+                sparse_attn_gate_scale=h.sparse_attn_gate_scale,
             )
             for i in range(self.n_layers_in_prelude)
         )
@@ -4476,6 +5115,10 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                sparse_attn_gate=h.sparse_attn_gate,
+                sparse_attn_gate_window=h.sparse_attn_gate_window,
+                sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
+                sparse_attn_gate_scale=h.sparse_attn_gate_scale,
             )
             for i in range(self.n_layers_in_recurrent_block)
         )
@@ -4520,6 +5163,10 @@ class GPT(nn.Module):
                 pwa_permute_size=h.pwa_permute_size,
                 attn_preconv_kernel=h.attn_preconv_kernel,
                 attn_preconv_scale_init=h.attn_preconv_scale_init,
+                sparse_attn_gate=h.sparse_attn_gate,
+                sparse_attn_gate_window=h.sparse_attn_gate_window,
+                sparse_attn_gate_init_std=h.sparse_attn_gate_init_std,
+                sparse_attn_gate_scale=h.sparse_attn_gate_scale,
             )
             for i in range(self.n_layers_in_coda)
         )
@@ -4845,6 +5492,38 @@ class GPT(nn.Module):
         if self.monitoring:
             self.monitor_module(x, x_rec_output, xk, input_embeds, num_steps_no_grad, num_steps_with_grad, x_rec_projected)
 
+        if labels is not None and self.liger_ce and self.liger_fused_ce and not return_logits and len(self.poe_heads) == 0:
+            if self.tie_embeddings:
+                output_weight = self.tok_emb.weight
+                if (
+                    self.training
+                    and qat_enabled
+                    and self.qat_tied_output
+                    and hasattr(self.tok_emb, "weight_fake_quantizer")
+                ):
+                    output_weight = self.tok_emb.weight_fake_quantizer(output_weight)
+                loss = liger_fused_linear_cross_entropy(
+                    x,
+                    output_weight,
+                    labels,
+                    assume_no_ignore=True,
+                    softcap=self.logit_softcap,
+                    logit_scale=self.logit_scale,
+                )
+            else:
+                if self.lm_head is None:
+                    raise RuntimeError('lm_head is required when tie_embeddings=False')
+                loss = liger_fused_linear_cross_entropy(
+                    x,
+                    self.lm_head.weight,
+                    labels,
+                    bias=self.lm_head.bias,
+                    assume_no_ignore=True,
+                    softcap=self.logit_softcap,
+                    logit_scale=self.logit_scale,
+                )
+            return {'loss': loss, 'logits': None}
+
         if self.tie_embeddings:
             output_weight = self.tok_emb.weight
             if (
@@ -4874,7 +5553,6 @@ class GPT(nn.Module):
                     logits_proj,
                     labels,
                     assume_no_ignore=True,
-                    preserve_input=return_logits,
                     softcap=self.logit_softcap,
                 )
             else:
@@ -5265,8 +5943,14 @@ def main() -> None:
     if args.qat_bits != 0 and not (1 <= args.qat_bits <= 8):
         raise ValueError(f"TorchAO QAT supports QAT_BITS in [1, 8], got {args.qat_bits}")
     signed_quant_max(args.quant_bits)
+    for bit_name in ("quant_embed_bits", "quant_attn_bits", "quant_mlp_bits", "quant_low_bits"):
+        signed_quant_max(getattr(args, bit_name))
+    if args.quant_control_bits != 0:
+        signed_quant_max(args.quant_control_bits)
     if args.rans_int6 and args.quant_bits != 6:
         raise ValueError(f"RANS_INT6=1 requires QUANT_BITS=6, got {args.quant_bits}")
+    if args.rans_int6 and args.mixed_quant_bits:
+        raise ValueError("RANS_INT6=1 is not compatible with MIXED_QUANT_BITS=1")
     if args.qat_start_step < 0:
         raise ValueError(f"QAT_START_STEP must be non-negative, got {args.qat_start_step}")
     if args.liger_rope and LigerRopeFunction is None:
@@ -5288,6 +5972,10 @@ def main() -> None:
         raise ValueError(f"POE_NUM_EXPERTS must be at least 1, got {args.poe_num_experts}")
     if args.poe_head_lr < 0:
         raise ValueError(f"POE_HEAD_LR must be non-negative, got {args.poe_head_lr}")
+    if args.sparse_attn_gate_window <= 0:
+        raise ValueError(f"SPARSE_ATTN_GATE_WINDOW must be positive, got {args.sparse_attn_gate_window}")
+    if args.sparse_attn_gate_init_std < 0.0:
+        raise ValueError(f"SPARSE_ATTN_GATE_INIT_STD must be non-negative, got {args.sparse_attn_gate_init_std}")
     if not (0.0 <= args.ema_decay < 1.0):
         raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
     if args.ema_update_every <= 0:
@@ -5526,7 +6214,7 @@ def main() -> None:
             )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.eval_seq_len)
     log0(
         f"val_bpb:enabled tokenizer_kind={tokenizer_metadata.get('tokenizer_kind', 'unknown')} "
         f"tokenizer_path={args.tokenizer_path} meta_path={tokenizer_metadata.get('meta_path')} "
@@ -5687,6 +6375,12 @@ def main() -> None:
         f"scale_init:{args.attn_preconv_scale_init:g} lr:{args.attn_preconv_lr:g}"
     )
     log0(
+        f"sparse_attn_gate:{int(args.sparse_attn_gate)} "
+        f"window:{args.sparse_attn_gate_window} "
+        f"init_std:{args.sparse_attn_gate_init_std:g} "
+        f"scale:{args.sparse_attn_gate_scale:g}"
+    )
+    log0(
         f"mlp:outer:{args.mlp_class_name} recurrent:{args.recurrent_mlp_class_name} "
         f"liger_geglu_available:{LigerGELUMulFunction is not None}"
     )
@@ -5709,7 +6403,11 @@ def main() -> None:
         f"attn_res_block_size:{args.attn_res_block_size}"
     )
     log0(f"xsa:last_{args.xsa_last_n} active_effective_layers:{base_model.xsa_active_layer_ids()}")
-    log0(f"liger_ce:enabled:{args.liger_ce} real_liger_available:{LigerCrossEntropyLoss is not None}")
+    log0(
+        f"liger_ce:enabled:{args.liger_ce} fused:{args.liger_fused_ce} "
+        f"real_liger_available:{LigerCrossEntropyLoss is not None} "
+        f"real_liger_fused_available:{LigerFusedLinearCrossEntropyLoss is not None}"
+    )
     log0(
         f"liger_rope:enabled:{args.liger_rope} real_liger_available:{LigerRopeFunction is not None} "
         "convention:llama_split_half"
@@ -5745,6 +6443,12 @@ def main() -> None:
         f"rans_int6:{args.rans_int6}"
     )
     log0(
+        f"mixed_quant_bits:{args.mixed_quant_bits} embed:{args.quant_embed_bits} "
+        f"attn:{args.quant_attn_bits} mlp:{args.quant_mlp_bits} low:{args.quant_low_bits} "
+        f"control:{args.quant_control_bits} low_patterns:{','.join(args.quant_low_bit_patterns)}"
+    )
+    log0(f"grouped_artifact:{args.grouped_artifact}")
+    log0(
         f"gptq:enabled:{args.gptq_enabled} calibration_batches:{args.gptq_calibration_batches} "
         f"reserve_seconds:{args.gptq_reserve_seconds:g} blocksize:{args.gptq_blocksize} "
         f"dampening:{args.gptq_dampening:g} act_order:{args.gptq_act_order} "
@@ -5753,6 +6457,7 @@ def main() -> None:
     log0(f"save_raw_model:{args.save_raw_model}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
@@ -6034,7 +6739,10 @@ def main() -> None:
             f"in {1000.0 * (time.perf_counter() - t_gptq):.0f}ms"
         )
         quant_obj, quant_stats = quantize_state_dict_gptq_int(base_model.state_dict(), hessians, args)
-        quant_format = f"gptq_int{args.quant_bits}{'_rans' if args.rans_int6 else ''}"
+        quant_format = "gptq_mixed_int" if args.mixed_quant_bits else f"gptq_int{args.quant_bits}{'_rans' if args.rans_int6 else ''}"
+    elif args.mixed_quant_bits:
+        quant_obj, quant_stats = quantize_state_dict_mixed_int(base_model.state_dict(), args)
+        quant_format = "mixed_int"
     else:
         quant_obj, quant_stats = quantize_state_dict_int(
             base_model.state_dict(),
@@ -6045,9 +6753,13 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    grouped_stats = None
+    if args.grouped_artifact:
+        quant_blob, grouped_stats = serialize_quant_artifact_grouped(quant_obj)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
-    quant_path = f"final_model.int{args.quant_bits}.ptz"
+    quant_path = "final_model.mixed_int.ptz" if args.mixed_quant_bits else f"final_model.int{args.quant_bits}.ptz"
     if master_process:
         with open(quant_path, "wb") as f:
             f.write(quant_blob)
@@ -6055,24 +6767,31 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["quant_payload_bytes"], 1)
         log0(
-            f"Serialized model {quant_format}+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {quant_format}+{'grouped' if args.grouped_artifact else 'zlib'}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['quant_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
+        if grouped_stats is not None:
+            group_desc = " ".join(
+                f"{name}:{info['compressor']}:{info['nbytes']}/{info['raw_nbytes']}"
+                for name, info in sorted(grouped_stats.items())
+            )
+            log0(f"grouped_artifact_groups {group_desc}")
         if args.gptq_enabled:
             log0(
                 f"gptq:quantized_tensors:{quant_stats['num_gptq_tensors']} "
                 f"fallback_tensors:{quant_stats['num_fallback_tensors']}"
             )
-        log0(f"Total submission size {quant_format}+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {quant_format}+{'grouped' if args.grouped_artifact else 'zlib'}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open(quant_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = load_quant_artifact(quant_blob_disk)
     base_model.load_state_dict(dequantize_state_dict_int(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
+    artifact_label = "grouped" if args.grouped_artifact else "zlib"
     q_val_loss, q_val_bpb = eval_val(
         args,
         model,
@@ -6087,10 +6806,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_{quant_format}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{quant_format}_{artifact_label}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_{quant_format}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{quant_format}_{artifact_label}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if args.sliding_window_enabled:
         torch.cuda.synchronize()
@@ -6110,18 +6829,18 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_{quant_format}_zlib_roundtrip_sliding_window val_loss:{sw_val_loss:.4f} "
+            f"final_{quant_format}_{artifact_label}_roundtrip_sliding_window val_loss:{sw_val_loss:.4f} "
             f"val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
         log0(
-            f"final_{quant_format}_zlib_roundtrip_sliding_window_exact "
+            f"final_{quant_format}_{artifact_label}_roundtrip_sliding_window_exact "
             f"val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}"
         )
         if context_result is not None and args.ppm_enabled:
             ppm_tag = "partial" if context_result.get("cutoff", 0.0) else "exact"
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ppm_{ppm_tag} "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ppm_{ppm_tag} "
                 f"mix_bpb:{context_result['ppm_mix_bpb']:.8f} "
                 f"ppm_only_bpb:{context_result['ppm_only_bpb']:.8f} "
                 f"nn_only_bpb:{context_result['nn_only_bpb']:.8f} "
@@ -6131,7 +6850,7 @@ def main() -> None:
             )
         if context_result is not None and args.lzp_enabled:
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_lzp_exact "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_lzp_exact "
                 f"mix_bpb:{context_result['mix_bpb']:.8f} "
                 f"lzp_only_bpb:{context_result['lzp_only_bpb']:.8f} "
                 f"nn_only_bpb:{context_result['nn_only_bpb']:.8f} "
@@ -6143,26 +6862,26 @@ def main() -> None:
         if fused_ngram_result is not None:
             if fused_ngram_result["coverage"] >= 0.999999:
                 log0(
-                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order} "
+                    f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order} "
                     f"val_loss:{fused_ngram_result['val_loss']:.4f} "
                     f"val_bpb:{fused_ngram_result['val_bpb']:.4f} stride:{args.eval_stride} "
                     f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms fused:1"
                 )
                 log0(
-                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
+                    f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
                     f"val_loss:{fused_ngram_result['val_loss']:.8f} "
                     f"val_bpb:{fused_ngram_result['val_bpb']:.8f}"
                 )
             else:
                 log0(
-                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
+                    f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
                     f"val_loss:{fused_ngram_result['val_loss']:.4f} "
                     f"val_bpb:{fused_ngram_result['val_bpb']:.4f} "
                     f"coverage:{fused_ngram_result['coverage']:.4f} stride:{args.eval_stride} "
                     f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms fused:1"
                 )
                 log0(
-                    f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
+                    f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
                     f"val_loss:{fused_ngram_result['val_loss']:.8f} "
                     f"val_bpb:{fused_ngram_result['val_bpb']:.8f} "
                     f"coverage:{fused_ngram_result['coverage']:.8f}"
@@ -6189,22 +6908,22 @@ def main() -> None:
         ng_elapsed_ms = 1000.0 * (time.perf_counter() - t_ngram)
         if ng_coverage >= 0.999999:
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order} "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order} "
                 f"val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
                 f"stride:{args.eval_stride} eval_time:{ng_elapsed_ms:.0f}ms"
             )
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_exact "
                 f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}"
             )
         else:
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial "
                 f"val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
                 f"coverage:{ng_coverage:.4f} stride:{args.eval_stride} eval_time:{ng_elapsed_ms:.0f}ms"
             )
             log0(
-                f"final_{quant_format}_zlib_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
+                f"final_{quant_format}_{artifact_label}_roundtrip_sliding_ngram{args.ngram_eval_order}_partial_exact "
                 f"val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f} coverage:{ng_coverage:.8f}"
             )
 
@@ -6225,10 +6944,10 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_{quant_format}_zlib_roundtrip_ttt val_loss:{ttt_val_loss:.4f} "
+            f"final_{quant_format}_{artifact_label}_roundtrip_ttt val_loss:{ttt_val_loss:.4f} "
             f"val_bpb:{ttt_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
         )
-        log0(f"final_{quant_format}_zlib_roundtrip_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+        log0(f"final_{quant_format}_{artifact_label}_roundtrip_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

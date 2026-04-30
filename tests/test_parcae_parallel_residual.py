@@ -53,6 +53,10 @@ def _tiny_h() -> pg.Hyperparameters:
     h.monitoring = False
     h.tie_embeddings = True
     h.poe_num_experts = 1
+    h.sparse_attn_gate = False
+    h.sparse_attn_gate_window = 4
+    h.sparse_attn_gate_init_std = 0.0
+    h.sparse_attn_gate_scale = 1.0
     h.qat_bits = 0
     h.qat_linear = True
     h.qat_embeddings = True
@@ -162,6 +166,55 @@ def test_liger_style_gated_mlp_is_wired_into_gpt():
     assert torch.isfinite(model.core_block[0].mlp.gate_proj.weight.grad).all()
 
 
+def test_fused_leaky_relu_sq_mlp_matches_naive_forward_backward():
+    torch.manual_seed(123)
+    fused = pg.FusedLeakyReLUSqMLP(dim=5, hidden_dim=7)
+    naive_fc = torch.nn.Linear(5, 7, bias=False)
+    naive_proj = torch.nn.Linear(7, 5, bias=False)
+    with torch.no_grad():
+        naive_fc.weight.copy_(fused.fc.weight)
+        naive_proj.weight.copy_(fused.proj.weight)
+    x = torch.randn(3, 4, 5, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_()
+
+    actual = fused(x)
+    hidden = F.leaky_relu(naive_fc(x_ref), negative_slope=0.5).square()
+    expected = naive_proj(hidden)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    actual.square().mean().backward()
+    expected.square().mean().backward()
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fused.fc.weight.grad, naive_fc.weight.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fused.proj.weight.grad, naive_proj.weight.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_fused_leaky_relu_sq_mlp_is_wired_into_gpt():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.mlp_class_name = "FusedLeakyReLUSqMLP"
+    h.recurrent_mlp_class_name = "LeakyReLUSqMLP"
+    model = pg.GPT(h)
+
+    assert isinstance(model.prelude[0].mlp, pg.FusedLeakyReLUSqMLP)
+    assert all(isinstance(block.mlp, pg.FusedLeakyReLUSqMLP) for block in model.core_block)
+    assert isinstance(model.coda[0].mlp, pg.FusedLeakyReLUSqMLP)
+
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.core_block[0].mlp.fc.weight.grad is not None
+    assert torch.isfinite(model.core_block[0].mlp.fc.weight.grad).all()
+
+
 def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():
     torch.manual_seed(123)
     original = pg.ParcaeCausalSelfAttention(
@@ -177,7 +230,7 @@ def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():
         rope_dims=4,
     )
     legacy_state = original.state_dict()
-    qkv = legacy_state.pop("c_qkv.weight")
+    qkv = legacy_state.pop("qkv_proj.weight")
     q_w, k_w, v_w = qkv.split((original.q_dim, original.kv_dim, original.kv_dim), dim=0)
     legacy_state["c_q.weight"] = q_w
     legacy_state["c_k.weight"] = k_w
@@ -203,7 +256,7 @@ def test_packed_qkv_attention_loads_legacy_separate_qkv_weights_strictly():
     expected = original(x, freqs_cos, freqs_sin, mask=mask)
     actual = restored(x, freqs_cos, freqs_sin, mask=mask)
 
-    assert "c_qkv.weight" in restored.state_dict()
+    assert "qkv_proj.weight" in restored.state_dict()
     assert "c_q.weight" not in restored.state_dict()
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
 
@@ -212,8 +265,8 @@ def test_packed_qkv_is_wired_into_gpt_forward():
     h = _tiny_h()
     model = pg.GPT(h)
 
-    assert model.prelude[0].attn.c_qkv is not None
-    assert model.core_block[0].attn.c_qkv is not None
+    assert isinstance(model.prelude[0].attn.qkv_proj, pg.CastedLinear)
+    assert isinstance(model.core_block[0].attn.qkv_proj, pg.CastedLinear)
 
     input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
     target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
@@ -272,6 +325,72 @@ def test_xsa_zero_values_are_finite_and_leave_attention_output_unchanged():
 
     assert torch.isfinite(actual).all()
     assert torch.allclose(actual, y, atol=0.0, rtol=0.0)
+
+
+def test_sparse_attn_gate_zero_init_halves_attention_output_and_gets_gradient():
+    torch.manual_seed(123)
+    base = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+    )
+    gated = pg.ParcaeCausalSelfAttention(
+        dim=16,
+        num_heads=4,
+        num_kv_heads=2,
+        rope_base=10000.0,
+        layer_id=0,
+        n_layer=4,
+        qk_norm=False,
+        qk_bias=False,
+        clip_qkv=None,
+        rope_dims=4,
+        sparse_attn_gate=True,
+        sparse_attn_gate_window=4,
+        sparse_attn_gate_init_std=0.0,
+    )
+    gated.load_state_dict(base.state_dict(), strict=False)
+    x = torch.randn(2, 5, 16)
+    freqs_cos, freqs_sin = pg.precompute_freqs_cos_sin(4, 5, 10000.0)
+    mask = torch.zeros(1, 1, 5, 5)
+
+    expected = base(x, freqs_cos, freqs_sin, mask=mask) * 0.5
+    actual = gated(x, freqs_cos, freqs_sin, mask=mask)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    actual.square().mean().backward()
+    assert gated.attn_gate_w.grad is not None
+    assert torch.isfinite(gated.attn_gate_w.grad).all()
+
+
+def test_sparse_attn_gate_is_wired_into_gpt_and_control_tensor_patterns():
+    torch.manual_seed(123)
+    h = _tiny_h()
+    h.sparse_attn_gate = True
+    model = pg.GPT(h)
+    input_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+    target_ids = torch.randint(0, h.vocab_size, (2, h.train_seq_len))
+
+    loss = model.forward_model(
+        input_ids,
+        labels=target_ids,
+        num_steps_pair=torch.tensor([0, 1]),
+    )["loss"]
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    gate_params = [(name, p) for name, p in model.named_parameters() if name.endswith("attn_gate_w")]
+    assert gate_params
+    assert all(any(pattern in name for pattern in pg.CONTROL_TENSOR_NAME_PATTERNS) for name, _ in gate_params)
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for _, p in gate_params)
 
 
 def test_xsa_routes_last_effective_layers_with_recurrence_depth():
@@ -499,7 +618,7 @@ def test_control_tensors_restore_to_fp32_after_bfloat16_cast():
     params = dict(model.named_parameters())
     for name in control_names:
         assert params[name].dtype == torch.float32
-    assert params["core_block.0.attn.c_qkv.weight"].dtype == torch.bfloat16
+    assert params["core_block.0.attn.qkv_proj.weight"].dtype == torch.bfloat16
 
 
 def test_parallel_residual_tiny_forward_backward_has_finite_control_grads():

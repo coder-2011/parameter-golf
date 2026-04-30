@@ -41,6 +41,34 @@ def test_liger_ce_cpu_fallback_applies_softcap_before_cross_entropy():
     assert torch.allclose(logits.grad, ref_logits.grad)
 
 
+def test_liger_fused_linear_ce_cpu_fallback_matches_scaled_linear_softcap_ce():
+    torch.manual_seed(123)
+    hidden = torch.randn(11, 7, requires_grad=True)
+    weight = torch.randn(23, 7, requires_grad=True)
+    target = torch.randint(0, 23, (11,))
+    ref_hidden = hidden.detach().clone().requires_grad_(True)
+    ref_weight = weight.detach().clone().requires_grad_(True)
+    softcap = 7.0
+    logit_scale = 1.5
+
+    loss = pg.liger_fused_linear_cross_entropy(
+        hidden,
+        weight,
+        target,
+        assume_no_ignore=True,
+        softcap=softcap,
+        logit_scale=logit_scale,
+    )
+    ref_logits = F.linear(ref_hidden, ref_weight * logit_scale).float()
+    ref = F.cross_entropy(softcap * torch.tanh(ref_logits / softcap), target)
+    loss.backward()
+    ref.backward()
+
+    assert torch.allclose(loss, ref)
+    assert torch.allclose(hidden.grad, ref_hidden.grad)
+    assert torch.allclose(weight.grad, ref_weight.grad)
+
+
 def test_liger_ce_compile_path_uses_torch_cross_entropy(monkeypatch):
     torch.manual_seed(123)
     logits = (torch.randn(11, 23) * 2.0).requires_grad_(True)

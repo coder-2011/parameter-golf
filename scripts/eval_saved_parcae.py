@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import io
 import os
 import sys
 import time
-import zlib
 from pathlib import Path
 
 import torch
@@ -15,7 +13,12 @@ import train_gpt_parcae as pg
 
 def main() -> None:
     run_id = os.environ.get("RUN_ID", f"eval_saved_{int(time.time())}")
-    model_path = Path(os.environ.get("MODEL_PATH", f"final_model.int{os.environ.get('QUANT_BITS', '8')}.ptz"))
+    default_model = (
+        "final_model.mixed_int.ptz"
+        if os.environ.get("MIXED_QUANT_BITS", "0") == "1"
+        else f"final_model.int{os.environ.get('QUANT_BITS', '8')}.ptz"
+    )
+    model_path = Path(os.environ.get("MODEL_PATH", default_model))
     log_path = Path("logs") / f"{run_id}.txt"
     log_path.parent.mkdir(exist_ok=True)
 
@@ -59,7 +62,7 @@ def main() -> None:
     model = pg.GPT(args).to(device).bfloat16()
     pg.restore_low_dim_params_to_fp32(model)
     with model_path.open("rb") as f:
-        quant_state = torch.load(io.BytesIO(zlib.decompress(f.read())), map_location="cpu")
+        quant_state = pg.load_quant_artifact(f.read())
     model.load_state_dict(pg.dequantize_state_dict_int(quant_state), strict=True)
     model.eval()
 
