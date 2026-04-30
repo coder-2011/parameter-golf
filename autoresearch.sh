@@ -76,7 +76,9 @@ export SPARSE_ATTN_GATE=1
 export SPARSE_ATTN_GATE_WINDOW=12
 export SPARSE_ATTN_GATE_INIT_STD=0.0
 export SPARSE_ATTN_GATE_SCALE=1.0
-export TTT_ENABLED=0
+export TTT_ENABLED=1
+export TTT_LR=0.75
+export TTT_MASK=no_qv
 # ======================================================
 
 # --- defaults below pick up EXPT overrides via ${VAR:-default} ---
