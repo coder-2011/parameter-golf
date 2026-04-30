@@ -38,7 +38,7 @@ RUN_TAG="${RUN_TAG:-caseops_sp8192_8h100_sxm}"
 REQUIRE_H100_SXM="${REQUIRE_H100_SXM:-1}"
 MIN_FREE_GIB="${MIN_FREE_GIB:-80}"
 DRY_RUN="${DRY_RUN:-0}"
-DATA_PATH_DEFAULT="/workspace/caseops_sp8192/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved"
+DATA_PATH_DEFAULT="$(pwd)/caseops_sp8192/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved"
 
 [[ -x "${PYTHON_BIN}" ]] || die "python not executable: ${PYTHON_BIN}"
 [[ -x "${TORCHRUN_BIN}" ]] || die "torchrun not executable: ${TORCHRUN_BIN}"
