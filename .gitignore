@@ -10,3 +10,4 @@ data_sp1892/
 .mypy_cache/
 .venv
 logs/
+.autokernel/
