@@ -1,4 +1,5 @@
 #!/bin/bash
+# ATTENTION AI AGENTS: EVERY FEW RUNS, READ autoresearch.md FOR UP-TO-DATE INFORMATRION ON HYPERPARAMTERS
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,7 +26,7 @@ unset CONTROL_TENSOR_NAME_PATTERNS INT8_KEEP_FLOAT_FP32_NAME_PATTERNS
 echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
-# ========= EXPERIMENT BLOCK (edit per run) =========
+# ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
 export RESIDUAL_MODE=parallel
 export PARALLEL_RESIDUAL_SCOPE=core
 export MUON_MOMENTUM=0.85
@@ -36,17 +37,45 @@ export SWA_DYNAMIC=1
 export DATA_PATH="./data_sp1892/datasets/fineweb10B_sp1892"
 export TOKENIZER_PATH="./data_sp1892/tokenizers/fineweb_1892_bpe.model"
 export VOCAB_SIZE=1892
-export N_LAYERS_IN_CODA=3
+export MODEL_DIM=384
+export RECURRENT_DIM=384
+export RECURRENT_INTERMEDIATE_DIM=512
+export NUM_HEADS=8
+export NUM_KV_HEADS=4
+export RECURRENT_NUM_HEADS=8
 export N_LAYERS_IN_PRELUDE=1
+export N_LAYERS_IN_RECURRENT_BLOCK=3
+export N_LAYERS_IN_CODA=3
 export MLP_MULT=3
+export GRAD_ACCUM_STEPS=8
+export EVAL_SEQ_LEN=1000
 export EMBED_LR=0.3
 export ROPE_BASE=10000
 export QK_NORM=1
 export LIGER_ROPE=1
-export ROPE_DIMS=64
-# ======================================================
+export LIGER_FUSED_CE=1
+export ROPE_DIMS=32
 export BIGRAM_HASH_HEADS=4
+export TIE_EMBEDDINGS=1
+export MLP_CLASS_NAME=FusedLeakyReLUSqMLP
+export RECURRENT_MLP_CLASS_NAME=FusedLeakyReLUSqMLP
+export CODA_MOE_NUM_EXPERTS=4
+export CODA_MOE_TOP_K=1
+export MUON_WD=0.095
+export GROUPED_ARTIFACT=1
+export MIXED_QUANT_BITS=0
+export ATTN_PRECONV_KERNEL=0
+export ATTN_PRECONV_SCALE_INIT=0.005
+export ATTN_PRECONV_LR=0.001
+export ATTN_QKV_MODE=packed
+export SPARSE_ATTN_GATE=1
+export SPARSE_ATTN_GATE_WINDOW=12
+export SPARSE_ATTN_GATE_INIT_STD=0.0
+export SPARSE_ATTN_GATE_SCALE=1.0
+export TTT_ENABLED=0
 # ======================================================
+
+# --- defaults below pick up EXPT overrides via ${VAR:-default} ---
 export RUN_ID
 export DATA_PATH=${DATA_PATH:-"./data/datasets/fineweb10B_sp1024"}
 export TOKENIZER_PATH=${TOKENIZER_PATH:-"./data/tokenizers/fineweb_1024_bpe.model"}
@@ -56,15 +85,16 @@ export VAL_BYTE_COUNT_OVERRIDE=${VAL_BYTE_COUNT_OVERRIDE:-0}
 export VOCAB_SIZE=${VOCAB_SIZE:-1024}
 export MODEL_DIM=${MODEL_DIM:-384}
 export RECURRENT_DIM=${RECURRENT_DIM:-384}
-export RECURRENT_INTERMEDIATE_DIM=512
-export NUM_HEADS=4
-export NUM_KV_HEADS=2
-export RECURRENT_NUM_HEADS=4
+export RECURRENT_INTERMEDIATE_DIM=${RECURRENT_INTERMEDIATE_DIM:-0}
+export NUM_HEADS=${NUM_HEADS:-4}
+export NUM_KV_HEADS=${NUM_KV_HEADS:-2}
+export RECURRENT_NUM_HEADS=${RECURRENT_NUM_HEADS:-4}
 export N_LAYERS_IN_PRELUDE=${N_LAYERS_IN_PRELUDE:-1}
 export N_LAYERS_IN_RECURRENT_BLOCK=${N_LAYERS_IN_RECURRENT_BLOCK:-3}
 export N_LAYERS_IN_CODA=${N_LAYERS_IN_CODA:-2}
 export MLP_MULT=${MLP_MULT:-4}
 export TRAIN_SEQ_LEN=${TRAIN_SEQ_LEN:-1024}
+export EVAL_SEQ_LEN=${EVAL_SEQ_LEN:-${TRAIN_SEQ_LEN}}
 export TRAIN_BATCH_TOKENS=${TRAIN_BATCH_TOKENS:-131072}
 export ITERATIONS=1000000
 export MAX_WALLCLOCK_SECONDS=${MAX_WALLCLOCK_SECONDS:-300}
@@ -79,7 +109,7 @@ export RECURRENT_ITERATION_METHOD=per-batch
 export SAMPLING_SCHEME=fixed
 export CURRICULUM_TARGET=forward
 export ROPE_DIMS=${ROPE_DIMS:-32}
-export ROPE_BASE=10000.0
+export ROPE_BASE=${ROPE_BASE:-10000.0}
 export OUTER_ROPE_DIMS=0
 export RECURRENT_ROPE_DIMS=0
 export RECURRENT_LAYER_ROPE_DIMS=""
@@ -104,9 +134,9 @@ export TRIDAO_PACKED_ROPE=${TRIDAO_PACKED_ROPE:-0}
 export MONITORING=0
 export LOCKSTEP_N=0
 export LOCKSTEP_K=0
-export MLP_CLASS_NAME=BaseMLP
-export RECURRENT_MLP_CLASS_NAME=BaseMLP
-export TIE_EMBEDDINGS=1
+export MLP_CLASS_NAME=${MLP_CLASS_NAME:-BaseMLP}
+export RECURRENT_MLP_CLASS_NAME=${RECURRENT_MLP_CLASS_NAME:-BaseMLP}
+export TIE_EMBEDDINGS=${TIE_EMBEDDINGS:-1}
 export EMB_SCALE=1.0
 export LOGIT_SCALE=1.0
 export LOGIT_SOFTCAP=30.0
@@ -158,6 +188,7 @@ export GPTQ_ACT_ORDER=${GPTQ_ACT_ORDER:-1}
 export GPTQ_QUANTIZE_EMBEDDINGS=${GPTQ_QUANTIZE_EMBEDDINGS:-1}
 export GPTQ_MATRIX_CLIP_SIGMAS=${GPTQ_MATRIX_CLIP_SIGMAS:-12.85}
 export GPTQ_EMBED_CLIP_SIGMAS=${GPTQ_EMBED_CLIP_SIGMAS:-20.0}
+export GROUPED_ARTIFACT=${GROUPED_ARTIFACT:-1}
 export SAVE_RAW_MODEL=${SAVE_RAW_MODEL:-0}
 export RANS_INT6=${RANS_INT6:-0}
 export XSA_LAST_N=${XSA_LAST_N:-0}
@@ -249,17 +280,17 @@ if [[ ! -f "${LOGFILE}" ]]; then
     exit 1
 fi
 
-ROUNDTRIP_LINE=$(grep -E 'final_(gptq_)?int[0-9]+(_rans)?_zlib_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 || true)
+ROUNDTRIP_LINE=$(grep -E 'final_(gptq_)?int[0-9]+(_rans)?_(zlib|grouped)_roundtrip_exact val_loss:' "${LOGFILE}" | tail -n1 || true)
 FINAL_STEP_LINE=$(grep -E 'step:[0-9]+/[0-9]+ val_loss:' "${LOGFILE}" | tail -n1 || true)
 STOP_LINE=$(grep 'stopping_early: wallclock_cap' "${LOGFILE}" | tail -n1 || true)
-SUBMISSION_LINE=$(grep -E 'Total submission size (gptq_)?int[0-9]+(_rans)?\+zlib:' "${LOGFILE}" | tail -n1 || true)
+SUBMISSION_LINE=$(grep -E 'Total submission size (gptq_)?int[0-9]+(_rans)?\+(zlib|grouped):' "${LOGFILE}" | tail -n1 || true)
 
 VAL_BPB=$(sed -E 's/.*val_bpb:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
 VAL_LOSS=$(sed -E 's/.*val_loss:([0-9.]+).*/\1/' <<<"${ROUNDTRIP_LINE}")
 TRAIN_TIME=$(sed -E 's/.*train_time:([0-9.]+)ms.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
 STEPS=$(sed -E 's/.*step:([0-9]+)\/.*/\1/' <<<"${STOP_LINE:-${FINAL_STEP_LINE}}")
 STEP_AVG=$(sed -E 's/.*step_avg:([0-9.]+)ms.*/\1/' <<<"${FINAL_STEP_LINE}")
-SUBMISSION_BYTES=$(sed -E 's/.*Total submission size (gptq_)?int[0-9]+(_rans)?\+zlib: ([0-9]+) bytes.*/\3/' <<<"${SUBMISSION_LINE}")
+SUBMISSION_BYTES=$(sed -E 's/.*Total submission size (gptq_)?int[0-9]+(_rans)?\+(zlib|grouped): ([0-9]+) bytes.*/\4/' <<<"${SUBMISSION_LINE}")
 PEAK_MEM=$(grep 'peak memory allocated:' "${LOGFILE}" | tail -n1 | sed -E 's/.*allocated: ([0-9]+) MiB.*/\1/' || echo "")
 TRAIN_LOSS=$(grep -E 'step:[0-9]+/[0-9]+ train_loss:' "${LOGFILE}" | tail -n1 | sed -E 's/.*train_loss:([0-9.]+).*/\1/' || echo "")
 
