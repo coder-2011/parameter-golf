@@ -1,0 +1,178 @@
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2202: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at 'interface.py:404'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/flash_attn/cute/interface.py", line 404, in torch_dynamo_resume_in__flash_attn_fwd_at_389
+    arch = _get_device_arch() if _arch is None else _arch
+
+  torch._dynamo.utils.warn_once(msg)
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `<unknown module>.DLTensorWrapper.__new__.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `sys._getframe.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `<unknown module>.BF16Type.__new__.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `<unknown module>.IntegerType.__new__.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+/workspace/parameter-golf/.venv/lib/python3.11/site-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `<unknown module>.OpView.__new__.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8] torch._dynamo hit config.recompile_limit (8)
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8]    function: 'const' (/workspace/parameter-golf/.venv/lib/python3.11/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/_mlir_helpers/arith.py:291)
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8]    last reason: 22/7: value == 0                                               # if isinstance(value, Numeric):  # nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/_mlir_helpers/arith.py:300 in const
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8] User stack trace:
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8]   File "/workspace/parameter-golf/.venv/lib/python3.11/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/base_dsl/_mlir_helpers/arith.py", line 300, in const
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8]     if isinstance(value, Numeric):
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0501 00:32:46.290000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/convert_frame.py:1743] [22/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+loc("tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()"("/workspace/parameter-golf/.venv/lib/python3.11/site-packages/flash_attn/cute/pack_gqa.py":139:20)): error: unable to compute crd2idx with '!cute.layout<"(?):(1)">' and '!cute.coord<"((?,?))">'
+/workspace/parameter-golf/utils/flash_attention.py:192: RuntimeWarning: Flash attention backend disabled after runtime failure; falling back to SDPA. ValueError: Operation creation failed
+  _disable_flash_runtime(exc)
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] Graph break from `Tensor.item()`, consider setting:
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]     torch._dynamo.config.capture_scalar_outputs = True
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] or:
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]     env TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] to include these operations in the captured graph.
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] 
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] Graph break: from user code at:
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 7149, in update_recurrent_state
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]     return self.core_block_forward(
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]   File "/workspace/parameter-golf/train_gpt_parcae.py", line 7304, in core_block_forward
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0]     step_int = int(step.item()) if isinstance(step, torch.Tensor) else int(step)
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] 
+W0501 00:33:32.572000 14817 .venv/lib/python3.11/site-packages/torch/_dynamo/variables/tensor.py:1379] [33/0] 
+logs/sp1892_9l512_mlp3_bh4096_swa_dyn_fullattn_b32k_int6rans_xsa3_20260501_003054.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model meta_path=None source_model_name=/workspace/parameter-golf/data_sp1892/tokenizers/fineweb_1892_bpe.model vocab_size=1892 byte_count_override:0 byte_sidecar:disabled
+train_loader:dataset:fineweb10B_sp1892 train_shards:5
+val_loader:shards pattern=/workspace/parameter-golf/data_sp1892/datasets/fineweb10B_sp1892/fineweb_val_[0-9]*.bin tokens:53271040
+model_params:25959169
+world_size:1 grad_accum_steps:1
+attention_backend:flash_attn4_wrapper has_flash_attn:True
+sdp_backends:cudnn=False flash=True mem_efficient=True math=True
+attention_mode:gqa num_heads:8 num_kv_heads:4 qkv_projection:packed rrhp_reduction_factor:4 pwa_num_bases:6 pwa_permute_size:4 pwa_init_scale:0.707107 pwa_lr:0.02 window:-1
+attn_preconv:kernel:0 scale_init:0.005 lr:0.001
+attn_out_gate:0 src:proj gated_attn:0 gated_init_std:0.01 sparse_attn_gate:0 window:12 init_std:0 scale:1
+mlp:outer:FusedLeakyReLUSqMLP recurrent:FusedLeakyReLUSqMLP leaky_relu_slope:0.5 liger_geglu_available:False
+bigram_hash:buckets:4096 dim:128 heads:1 gate:False scale_init:0.05
+parcae:prelude:4 core:1 coda:4 recurrent_dim:512 recurrence:1/1 iteration:per-batch sampling:fixed injection:diagonal unet_skip:False unet_skip_init:1 residual_mode:parallel parallel_residual_scope:all parallel_residual_start:-1 parallel_residual_ln_scale:True parallel_residual_impl:delayed parallel_residual_record_controls:False parallel_residual_tied_norm:True parallel_residual_in_fp32:True residual_forget_gate:True residual_forget_gate_bias:-4 residual_forget_radius:0.99-0.999 attn_res_mode:none attn_res_scope:all attn_res_block_size:2
+xsa:last_3 active_effective_layers:[6, 7, 8]
+liger_ce:enabled:True fused:True fused_softcapped_ce:False triton_softcapped_available:True real_liger_available:False real_liger_fused_available:False
+liger_rope:enabled:False real_liger_available:False convention:llama_split_half
+tridao_packed_rope:enabled:True triton_available:True convention:adjacent_pair_interleaved layout:packed_qkv_inplace
+fused_qkv_postprocess:enabled:False triton_available:True supports:no_qkv_bias,no_clip,no_value_gate fuses:rope,qk_rmsnorm,contiguous_qkv
+attn_res:mode:none scope:all block_size:2 params:0
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 poe_experts:1 poe_extra_heads:0 poe_head_lr:0.008 matrix_lr:0.02 scalar_lr:0.02 muon_steps:5 muon_wd:0.04 muon_row_normalize:True muon_ns_coeffs:classic
+qat:bits:0 start_step:500 backend:torchao group_size:32 activation_bits:0 linear:True embeddings:True tied_output:True export_bits:6 rans_int6:True
+mixed_quant_bits:False embed:7 attn:6 mlp:6 low:4 control:0 low_patterns:project_out,poe_heads
+grouped_artifact:True
+gptq:enabled:False calibration_batches:32 calibration_mode:stream reserve_seconds:12 blocksize:128 dampening:0.01 act_order:True quantize_embeddings:True
+lqer:enabled:False rank:4 top_k:3 factor_bits:4 asym:True asym_group:64
+save_raw_model:False
+train_batch_tokens:32768 train_seq_len:512 eval_seq_len:512 iterations:1000000 warmup_steps:200 max_wallclock_seconds:600.000 document_packing:False cu_bucket:64
+weight_average:ema_enabled:False ema_decay:0.997 ema_update_every:1 swa_enabled:True swa_start_step:1500 swa_every:50 swa_dynamic:True swa_dynamic_min_every:10 swa_dynamic_power:1.5 swa_dynamic_weight_max:2 priority:swa
+ttt:enabled:False stride:64 chunk_tokens:32768 epochs:3 lr:0.005 momentum:0.9 grad_clip:1 lora_rank:0 lora_alpha:32 lora_lr:0.001 lora_wd:1 lora_min_params:1024 mask:all
+sliding:enabled:False stride:64 compile_logits:False ppm_enabled:False ppm_order:5 ppm_subset_tokens:5000000 ppm_escape:d ppm_meta_mix:False context_mix_max_seconds:0 lzp_enabled:False lzp_orders:4,5,6,8 lzp_subset_tokens:5000000 lzp_table_bits:20 lzp_alpha:0-0.2
+seed:1337
+warmup_step:10/200 train_step:9
+warmup_step:20/200 train_step:19
+warmup_step:30/200 train_step:29
+warmup_step:40/200 train_step:39
+warmup_step:50/200 train_step:49
+warmup_step:60/200 train_step:59
+warmup_step:70/200 train_step:69
+warmup_step:80/200 train_step:79
+warmup_step:90/200 train_step:89
+warmup_step:100/200 train_step:99
+warmup_step:110/200 train_step:109
+warmup_step:120/200 train_step:119
+warmup_step:130/200 train_step:129
+warmup_step:140/200 train_step:139
+warmup_step:150/200 train_step:149
+warmup_step:160/200 train_step:159
+warmup_step:170/200 train_step:169
+warmup_step:180/200 train_step:179
+warmup_step:190/200 train_step:189
+warmup_step:200/200 train_step:199
+step:1/1000000 train_loss:7.5560 train_time:109ms step_avg:108.96ms
+step:2/1000000 train_loss:8.1692 train_time:220ms step_avg:110.19ms
+step:3/1000000 train_loss:12.6551 train_time:331ms step_avg:110.34ms
+step:4/1000000 train_loss:10.2952 train_time:444ms step_avg:111.07ms
+step:5/1000000 train_loss:9.6633 train_time:557ms step_avg:111.38ms
+step:6/1000000 train_loss:10.5107 train_time:669ms step_avg:111.54ms
+step:7/1000000 train_loss:9.2876 train_time:781ms step_avg:111.50ms
+step:8/1000000 train_loss:8.4141 train_time:902ms step_avg:112.76ms
+step:9/1000000 train_loss:7.8244 train_time:1015ms step_avg:112.75ms
+step:10/1000000 train_loss:9.8619 train_time:1126ms step_avg:112.62ms
+step:100/1000000 train_loss:4.2728 train_time:10607ms step_avg:106.07ms
+step:200/1000000 train_loss:4.0666 train_time:21163ms step_avg:105.81ms
+step:300/1000000 train_loss:3.8132 train_time:31755ms step_avg:105.85ms
+step:400/1000000 train_loss:3.7732 train_time:42354ms step_avg:105.88ms
+step:500/1000000 train_loss:3.4681 train_time:52947ms step_avg:105.89ms
+step:600/1000000 train_loss:3.4030 train_time:63553ms step_avg:105.92ms
+step:700/1000000 train_loss:3.3525 train_time:74356ms step_avg:106.22ms
+step:800/1000000 train_loss:3.2512 train_time:84977ms step_avg:106.22ms
+step:900/1000000 train_loss:3.2640 train_time:95607ms step_avg:106.23ms
+step:1000/1000000 train_loss:3.2389 train_time:106240ms step_avg:106.24ms
+step:1100/1000000 train_loss:3.2270 train_time:116876ms step_avg:106.25ms
+step:1200/1000000 train_loss:3.1161 train_time:127513ms step_avg:106.26ms
+step:1300/1000000 train_loss:3.1185 train_time:138318ms step_avg:106.40ms
+step:1400/1000000 train_loss:3.2044 train_time:148990ms step_avg:106.42ms
+swa:start step:1500 dynamic:True interval:50 weight:1.0000 progress:0.0000
+step:1500/1000000 train_loss:3.1790 train_time:159807ms step_avg:106.54ms
+step:1600/1000000 train_loss:3.0374 train_time:170553ms step_avg:106.60ms
+step:1700/1000000 train_loss:3.0224 train_time:181297ms step_avg:106.65ms
+step:1800/1000000 train_loss:3.0430 train_time:192009ms step_avg:106.67ms
+step:1900/1000000 train_loss:2.9383 train_time:202883ms step_avg:106.78ms
+step:2000/1000000 train_loss:3.1556 train_time:213620ms step_avg:106.81ms
+step:2100/1000000 train_loss:3.0369 train_time:224330ms step_avg:106.82ms
+step:2200/1000000 train_loss:2.9923 train_time:235065ms step_avg:106.85ms
+step:2300/1000000 train_loss:2.9801 train_time:245792ms step_avg:106.87ms
+step:2400/1000000 train_loss:2.9877 train_time:256519ms step_avg:106.88ms
+step:2500/1000000 train_loss:2.9686 train_time:267451ms step_avg:106.98ms
+step:2600/1000000 train_loss:3.0327 train_time:278207ms step_avg:107.00ms
+step:2700/1000000 train_loss:2.9323 train_time:289008ms step_avg:107.04ms
+step:2800/1000000 train_loss:2.9065 train_time:299841ms step_avg:107.09ms
+step:2900/1000000 train_loss:2.9724 train_time:310678ms step_avg:107.13ms
+step:3000/1000000 train_loss:2.9785 train_time:321534ms step_avg:107.18ms
+step:3100/1000000 train_loss:2.9240 train_time:332539ms step_avg:107.27ms
+step:3200/1000000 train_loss:2.9574 train_time:343395ms step_avg:107.31ms
+step:3300/1000000 train_loss:2.8237 train_time:354218ms step_avg:107.34ms
+step:3400/1000000 train_loss:3.0581 train_time:365055ms step_avg:107.37ms
+step:3500/1000000 train_loss:2.9111 train_time:375874ms step_avg:107.39ms
+step:3600/1000000 train_loss:2.8217 train_time:386693ms step_avg:107.41ms
+step:3700/1000000 train_loss:2.6772 train_time:397526ms step_avg:107.44ms
+step:3800/1000000 train_loss:2.9273 train_time:408354ms step_avg:107.46ms
+step:3900/1000000 train_loss:2.8641 train_time:419201ms step_avg:107.49ms
+step:4000/1000000 train_loss:3.0245 train_time:430024ms step_avg:107.51ms
+step:4100/1000000 train_loss:3.1687 train_time:440846ms step_avg:107.52ms
+step:4200/1000000 train_loss:2.9005 train_time:451668ms step_avg:107.54ms
+step:4300/1000000 train_loss:2.7671 train_time:462503ms step_avg:107.56ms
+step:4400/1000000 train_loss:2.8824 train_time:473327ms step_avg:107.57ms
+step:4500/1000000 train_loss:2.8922 train_time:484151ms step_avg:107.59ms
+step:4600/1000000 train_loss:2.8762 train_time:494972ms step_avg:107.60ms
+step:4700/1000000 train_loss:2.8981 train_time:505823ms step_avg:107.62ms
+step:4800/1000000 train_loss:2.9603 train_time:516649ms step_avg:107.64ms
+step:4900/1000000 train_loss:2.7760 train_time:527616ms step_avg:107.68ms
+step:5000/1000000 train_loss:2.8047 train_time:538515ms step_avg:107.70ms
+step:5100/1000000 train_loss:2.8043 train_time:549374ms step_avg:107.72ms
+step:5200/1000000 train_loss:2.7218 train_time:560237ms step_avg:107.74ms
+step:5300/1000000 train_loss:2.6438 train_time:571048ms step_avg:107.74ms
+step:5400/1000000 train_loss:2.7663 train_time:581884ms step_avg:107.76ms
+step:5500/1000000 train_loss:2.8805 train_time:592942ms step_avg:107.81ms
+step:5566/1000000 val_loss:2.7475 val_bpb:1.3976 train_time:600089ms step_avg:107.81ms
+stopping_early: wallclock_cap train_time:600089ms step:5566/1000000
+peak memory allocated: 5168 MiB reserved: 6742 MiB
+swa:applying averaged 330 checkpoints weight_sum:639.7415
+Serialized model int6_rans+grouped: 17884604 bytes (payload:17991859 raw_torch:18036635 payload_ratio:2.89x)
+grouped_artifact_groups passthrough_float:store:2/2 passthrough_float.b0:zlib:60636/86784 passthrough_float.b1:lzma:52424/86784 quant_rans:store:17729513/17729513 scale.b0:zlib:30642/44388 scale.b1:lzma:8164/44388
+Total submission size int6_rans+grouped: 18271548 bytes
+final_int6_rans_grouped_roundtrip val_loss:2.7834 val_bpb:1.4159 eval_time:42074ms
+final_int6_rans_grouped_roundtrip_exact val_loss:2.78339816 val_bpb:1.41590935
