@@ -30,7 +30,7 @@ echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 
 # ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
 export MAX_WALLCLOCK_SECONDS=600
-export EXPORT_RESERVE_SECONDS=40
+export EXPORT_RESERVE_SECONDS=45
 export EVAL_MAX_WALLCLOCK_SECONDS=120
 export WARMUP_STEPS=400
 export TRAIN_LOG_EVERY=50
@@ -54,7 +54,7 @@ export TOKENIZER_PATH="./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_
 export VOCAB_SIZE=8192
 export MODEL_DIM=384
 export RECURRENT_DIM=384
-export RECURRENT_INTERMEDIATE_DIM=1536
+export RECURRENT_INTERMEDIATE_DIM=1024
 export NUM_HEADS=8
 export NUM_KV_HEADS=4
 export RECURRENT_NUM_HEADS=8
