@@ -21,6 +21,12 @@
         "base mm time: ((torch.Size([349000, 12]), (12, 1), torch.bfloat16), (torch.Size([12, 8]), (1, 12), torch.bfloat16), None, None, <OpOverloadPacket(op='aten.mm')>, None, None)": 0.03545600175857544,
         "((torch.Size([349000, 12]), (12, 1), torch.bfloat16), (torch.Size([12, 8]), (1, 12), torch.bfloat16), 'exclude_pad:True', 'exclude_pad:False', <OpOverloadPacket(op='aten.mm')>, None, None)": false,
         "base mm time: ((torch.Size([350000, 12]), (12, 1), torch.bfloat16), (torch.Size([12, 8]), (1, 12), torch.bfloat16), None, None, <OpOverloadPacket(op='aten.mm')>, None, None)": 0.03577600046992302,
-        "((torch.Size([350000, 12]), (12, 1), torch.bfloat16), (torch.Size([12, 8]), (1, 12), torch.bfloat16), 'exclude_pad:True', 'exclude_pad:False', <OpOverloadPacket(op='aten.mm')>, None, None)": false
+        "((torch.Size([350000, 12]), (12, 1), torch.bfloat16), (torch.Size([12, 8]), (1, 12), torch.bfloat16), 'exclude_pad:True', 'exclude_pad:False', <OpOverloadPacket(op='aten.mm')>, None, None)": false,
+        "base mm time: ((torch.Size([131072, 384]), (384, 1), torch.bfloat16), (torch.Size([384, 116]), (116, 1), torch.bfloat16), None, None, <OpOverloadPacket(op='aten.mm')>, None, None)": 0.07929600030183792,
+        "((torch.Size([131072, 384]), (384, 1), torch.bfloat16), (torch.Size([384, 116]), (116, 1), torch.bfloat16), 'exclude_pad:True', 'exclude_pad:True', <OpOverloadPacket(op='aten.mm')>, None, None)": true,
+        "base mm time: ((torch.Size([384, 131072]), (1, 384), torch.bfloat16), (torch.Size([131072, 116]), (116, 1), torch.bfloat16), None, None, <OpOverloadPacket(op='aten.mm')>, None, None)": 0.07737600058317184,
+        "((torch.Size([384, 131072]), (1, 384), torch.bfloat16), (torch.Size([131072, 116]), (116, 1), torch.bfloat16), 'exclude_pad:False', 'exclude_pad:True', <OpOverloadPacket(op='aten.mm')>, None, None)": false,
+        "base mm time: ((torch.Size([131072, 116]), (116, 1), torch.bfloat16), (torch.Size([116, 384]), (1, 116), torch.bfloat16), None, None, <OpOverloadPacket(op='aten.mm')>, None, None)": 0.11270400136709213,
+        "((torch.Size([131072, 116]), (116, 1), torch.bfloat16), (torch.Size([116, 384]), (1, 116), torch.bfloat16), 'exclude_pad:True', 'exclude_pad:False', <OpOverloadPacket(op='aten.mm')>, None, None)": true
     }
 }
