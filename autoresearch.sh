@@ -29,7 +29,7 @@ echo "=== Autoresearch run: ${RUN_ID} ===" >&2
 "${PYTHON_BIN}" -m py_compile train_gpt_parcae.py 2>&1 | tail -5
 
 # ========= EXPERIMENT BLOCK — ONLY EDIT THIS BLOCK =========
-export MAX_WALLCLOCK_SECONDS=600
+export MAX_WALLCLOCK_SECONDS=560
 export WARMUP_STEPS=400
 export TRAIN_LOG_EVERY=50
 export TRAIN_BATCH_TOKENS=1048576
