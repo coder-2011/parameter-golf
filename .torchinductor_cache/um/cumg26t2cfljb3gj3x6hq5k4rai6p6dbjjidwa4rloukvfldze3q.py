@@ -1,0 +1,85 @@
+
+import triton
+import triton.language as tl
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.pointwise(
+    size_hints={'x': 16777216}, 
+    filename=__file__,
+    triton_meta={'signature': {'in_ptr0': '*i64', 'in_ptr1': '*bf16', 'out_ptr1': '*bf16', 'xnumel': 'i32', 'XBLOCK': 'constexpr'}, 'device': DeviceProperties(type='cuda', index=7, multi_processor_count=132, cc=90, major=9, regs_per_multiprocessor=65536, max_threads_per_multi_processor=2048, max_threads_per_block=1024, warp_size=32), 'constants': {}, 'native_matmul': False, 'enable_fp_fusion': True, 'launch_pdl': False, 'disable_ftz': False, 'configs': [{(0,): [['tt.divisibility', 16]], (1,): [['tt.divisibility', 16]], (2,): [['tt.divisibility', 16]], (3,): [['tt.divisibility', 16]]}]},
+    inductor_meta={'grid_type': 'Grid1D', 'autotune_hints': set(), 'kernel_name': 'triton_poi_fused__to_copy_embedding_mul_sum_3', 'mutated_arg_names': [], 'optimize_mem': False, 'no_x_dim': False, 'atomic_add_found': False, 'num_load': 7, 'num_store': 1, 'num_reduction': 0, 'backend_hash': '24393E16EE255EA1526A6E7CA61516A01815456CCC5BB7B8EE244A91B17851CD', 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'deterministic': False, 'force_filter_reduction_configs': False, 'mix_order_reduction_allow_multi_stages': False, 'are_deterministic_algorithms_enabled': False, 'tiling_scores': {'x': 67108864}},
+    min_elem_per_thread=0
+)
+@triton.jit
+def triton_poi_fused__to_copy_embedding_mul_sum_3(in_ptr0, in_ptr1, out_ptr1, xnumel, XBLOCK : tl.constexpr):
+    xnumel = 16777216
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:]
+    xmask = tl.full([XBLOCK], True, tl.int1)[:]
+    x1 = xindex // 128
+    x0 = (xindex % 128)
+    x2 = xindex
+    tmp0 = tl.load(in_ptr0 + (7*x1), None, eviction_policy='evict_last')
+    tmp8 = tl.load(in_ptr0 + (1 + 7*x1), None, eviction_policy='evict_last')
+    tmp16 = tl.load(in_ptr0 + (2 + 7*x1), None, eviction_policy='evict_last')
+    tmp24 = tl.load(in_ptr0 + (3 + 7*x1), None, eviction_policy='evict_last')
+    tmp32 = tl.load(in_ptr0 + (4 + 7*x1), None, eviction_policy='evict_last')
+    tmp40 = tl.load(in_ptr0 + (5 + 7*x1), None, eviction_policy='evict_last')
+    tmp48 = tl.load(in_ptr0 + (6 + 7*x1), None, eviction_policy='evict_last')
+    tmp1 = tl.full([XBLOCK], 57344, tl.int32)
+    tmp2 = tmp0 + tmp1
+    tmp3 = tmp0 < 0
+    tmp4 = tl.where(tmp3, tmp2, tmp0)
+    tl.device_assert((0 <= tmp4) & (tmp4 < 57344), "index out of bounds: 0 <= tmp4 < 57344")
+    tmp6 = tl.load(in_ptr1 + (x0 + 128*tmp4), None).to(tl.float32)
+    tmp7 = tmp6.to(tl.float32)
+    tmp9 = tmp8 + tmp1
+    tmp10 = tmp8 < 0
+    tmp11 = tl.where(tmp10, tmp9, tmp8)
+    tl.device_assert((0 <= tmp11) & (tmp11 < 57344), "index out of bounds: 0 <= tmp11 < 57344")
+    tmp13 = tl.load(in_ptr1 + (x0 + 128*tmp11), None).to(tl.float32)
+    tmp14 = tmp13.to(tl.float32)
+    tmp15 = tmp7 + tmp14
+    tmp17 = tmp16 + tmp1
+    tmp18 = tmp16 < 0
+    tmp19 = tl.where(tmp18, tmp17, tmp16)
+    tl.device_assert((0 <= tmp19) & (tmp19 < 57344), "index out of bounds: 0 <= tmp19 < 57344")
+    tmp21 = tl.load(in_ptr1 + (x0 + 128*tmp19), None).to(tl.float32)
+    tmp22 = tmp21.to(tl.float32)
+    tmp23 = tmp15 + tmp22
+    tmp25 = tmp24 + tmp1
+    tmp26 = tmp24 < 0
+    tmp27 = tl.where(tmp26, tmp25, tmp24)
+    tl.device_assert((0 <= tmp27) & (tmp27 < 57344), "index out of bounds: 0 <= tmp27 < 57344")
+    tmp29 = tl.load(in_ptr1 + (x0 + 128*tmp27), None).to(tl.float32)
+    tmp30 = tmp29.to(tl.float32)
+    tmp31 = tmp23 + tmp30
+    tmp33 = tmp32 + tmp1
+    tmp34 = tmp32 < 0
+    tmp35 = tl.where(tmp34, tmp33, tmp32)
+    tl.device_assert((0 <= tmp35) & (tmp35 < 57344), "index out of bounds: 0 <= tmp35 < 57344")
+    tmp37 = tl.load(in_ptr1 + (x0 + 128*tmp35), None).to(tl.float32)
+    tmp38 = tmp37.to(tl.float32)
+    tmp39 = tmp31 + tmp38
+    tmp41 = tmp40 + tmp1
+    tmp42 = tmp40 < 0
+    tmp43 = tl.where(tmp42, tmp41, tmp40)
+    tl.device_assert((0 <= tmp43) & (tmp43 < 57344), "index out of bounds: 0 <= tmp43 < 57344")
+    tmp45 = tl.load(in_ptr1 + (x0 + 128*tmp43), None).to(tl.float32)
+    tmp46 = tmp45.to(tl.float32)
+    tmp47 = tmp39 + tmp46
+    tmp49 = tmp48 + tmp1
+    tmp50 = tmp48 < 0
+    tmp51 = tl.where(tmp50, tmp49, tmp48)
+    tl.device_assert((0 <= tmp51) & (tmp51 < 57344), "index out of bounds: 0 <= tmp51 < 57344")
+    tmp53 = tl.load(in_ptr1 + (x0 + 128*tmp51), None).to(tl.float32)
+    tmp54 = tmp53.to(tl.float32)
+    tmp55 = tmp47 + tmp54
+    tmp56 = tl.full([1], 0.37796447300922725, tl.float32)
+    tmp57 = tmp55 * tmp56
+    tmp58 = tmp57.to(tl.float32)
+    tl.store(out_ptr1 + (x2), tmp58, None)
