@@ -245,6 +245,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", train_seq_len))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    export_reserve_seconds = float(os.environ.get("EXPORT_RESERVE_SECONDS", 0.0))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", os.environ.get("EMA", "0"))))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     ema_update_every = int(os.environ.get("EMA_UPDATE_EVERY", 1))
@@ -6653,6 +6654,8 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be positive, got {args.eval_stride}")
     if args.eval_max_wallclock_seconds < 0.0:
         raise ValueError(f"EVAL_MAX_WALLCLOCK_SECONDS must be non-negative, got {args.eval_max_wallclock_seconds}")
+    if args.export_reserve_seconds < 0.0:
+        raise ValueError(f"EXPORT_RESERVE_SECONDS must be non-negative, got {args.export_reserve_seconds}")
     if args.ppm_enabled and not args.sliding_window_enabled:
         raise ValueError("PPM_ENABLED=1 requires SLIDING_WINDOW_ENABLED=1")
     if args.ppm_order < 0 or args.ppm_token_order < 0:
@@ -7096,6 +7099,7 @@ def main() -> None:
         f"eval_seq_len:{args.eval_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
+        f"export_reserve_seconds:{args.export_reserve_seconds:.3f} "
         f"eval_max_wallclock_seconds:{args.eval_max_wallclock_seconds:.3f}"
     )
     log0(
@@ -7147,6 +7151,9 @@ def main() -> None:
 
     official_max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     max_wallclock_ms = official_max_wallclock_ms
+    if max_wallclock_ms is not None and args.export_reserve_seconds > 0.0:
+        max_wallclock_ms = max(max_wallclock_ms - 1000.0 * args.export_reserve_seconds, 0.0)
+        log0(f"export:reserved_wallclock:{args.export_reserve_seconds:.3f}s train_cap:{max_wallclock_ms:.0f}ms")
     if max_wallclock_ms is not None and args.gptq_enabled and args.gptq_reserve_seconds > 0.0:
         max_wallclock_ms = max(max_wallclock_ms - 1000.0 * args.gptq_reserve_seconds, 0.0)
         log0(f"gptq:reserved_wallclock:{args.gptq_reserve_seconds:.3f}s train_cap:{max_wallclock_ms:.0f}ms")
