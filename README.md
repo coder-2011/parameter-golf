@@ -26,6 +26,33 @@ The challenge runs from March 18th to April 30th.
 
 Happy training!
 
+## Naman's fork status
+
+This fork was used as a local research workspace for the Parameter Golf challenge rather than as a polished standalone model release.
+
+The fork-specific work is mostly around setting up reproducible local experimentation and trying a Parcae/JEPA-adjacent training direction:
+
+- migrated the root environment to `uv` with `pyproject.toml` and `uv.lock` as the dependency source of truth;
+- added local repository guidance in `AGENTS.md`;
+- added local model-reference modules under `models/`;
+- vendored the Parcae reference tree as `parcae`;
+- added `train_gpt_parcae.py` and `train_gpt_parcae_mlx.py` entrypoints;
+- documented a local Parcae smoke/minimal command in the remote-machine setup section;
+- tracked generated baseline artifacts `final_model.pt` and `final_model.int8.ptz` from a local run.
+
+The important caveat is that this fork does not document a leaderboard-improving submission by Naman. The strongest results in the README tables are upstream community challenge records. The fork's authored work is the experimental scaffolding and Parcae entrypoint path, not a new verified best score.
+
+For the fork-specific files, start with:
+
+```text
+AGENTS.md
+pyproject.toml
+train_gpt_parcae.py
+train_gpt_parcae_mlx.py
+models/
+parcae
+```
+
 ## Leaderboard
 
 | Run | Score | Author | Summary | Date | Info |
